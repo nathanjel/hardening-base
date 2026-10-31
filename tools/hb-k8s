@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# hb-k8s — microk8s plug-in: keep NodePorts off public addresses, and keep
-# service-account tokens out of pods that never talk to the Kubernetes API.
+# hb-k8s — microk8s plug-in: keep NodePorts off public addresses, keep
+# service-account tokens out of pods that never talk to the Kubernetes API,
+# stop certificate reissues that restart every container, and keep the
+# cluster agent (for joining nodes, unused on one box) on localhost.
 #
 #   hb k8s status        one line per item
 #   hb k8s plan          what apply would change (changes nothing)
@@ -13,8 +15,18 @@
 #   tokens         the default service account in each listed namespace doesn't mount tokens
 #   tokens_live    no running pod there still carries one (fix: recreate the pods,
 #                  only when busy.d says nothing is in progress)
+#   certs          microk8s's apiserver-kicker reissues the API server certificate
+#                  whenever the host gains an address (a WireGuard interface, a
+#                  new docker bridge, docker coming up after boot) and then
+#                  restarts every container to load it. Its no-cert-reissue lock
+#                  stops that; a certificate about to expire still needs renewing
+#                  (this item fails health.cert_warn_days before, so you can pick
+#                  the moment: sudo microk8s refresh-certs --cert server.crt).
+#   agent          --bind in the cluster agent's args file
+#   agent_live     the agent listens there (fix: restart it; pods are unaffected)
 #
-# Config ([k8s] in hb.toml): nodeport_addresses, token_off_namespaces.
+# Config ([k8s] in hb.toml): nodeport_addresses, token_off_namespaces,
+# freeze_certs, cluster_agent_bind.
 set -u
 source "$(dirname "$(readlink -f "$0")")/../lib/hb.sh"
 need_root
@@ -23,13 +35,20 @@ need_config
 [ "$(cfg k8s.flavour)" = microk8s ] || die "only microk8s is supported"
 command -v /snap/bin/microk8s >/dev/null || { echo "ok: microk8s not installed"; exit 0; }
 
-ITEMS=(nodeport nodeport_live tokens tokens_live)
-ARGS=/var/snap/microk8s/current/args/kube-proxy
+ITEMS=(nodeport nodeport_live tokens tokens_live certs agent agent_live)
+SNAPDATA=/var/snap/microk8s/current
+ARGS=$SNAPDATA/args/kube-proxy
+AGENT_ARGS=$SNAPDATA/args/cluster-agent
+NO_REISSUE=$SNAPDATA/var/lock/no-cert-reissue
+SERVER_CRT=$SNAPDATA/certs/server.crt
 k() { /snap/bin/microk8s kubectl "$@"; }
 
 mapfile -t NODEPORT_ADDRS < <(cfg k8s.nodeport_addresses)
 mapfile -t TOKEN_OFF_NS < <(cfg k8s.token_off_namespaces)
 WANT_NODEPORT="--nodeport-addresses=$(IFS=,; echo "${NODEPORT_ADDRS[*]}")"
+FREEZE="$(cfg k8s.freeze_certs)"
+AGENT_BIND="$(cfg k8s.cluster_agent_bind)"
+WARN_DAYS="$(cfg health.cert_warn_days)"
 
 # --- nodeport -------------------------------------------------------------------
 chk_nodeport() {
@@ -149,6 +168,52 @@ restart_deploy() {
     k rollout restart deploy "$d" -n "$ns" >/dev/null || return 1
   fi
   k rollout status deploy "$d" -n "$ns" --timeout=300s >/dev/null || { log "  $ns/$d did not become ready"; return 1; }
+}
+
+# --- certs ----------------------------------------------------------------------
+chk_certs() {
+  [ "$FREEZE" = true ] || { echo "not managed"; return 0; }
+  [ -e "$NO_REISSUE" ] || { echo "will stop microk8s reissuing its certificate (and restarting every container) when an address appears"; return 1; }
+  local end days
+  end="$(openssl x509 -in "$SERVER_CRT" -noout -enddate 2>/dev/null | cut -d= -f2)"
+  [ -n "$end" ] || { echo "frozen, but $SERVER_CRT is unreadable"; return 2; }
+  days=$(( ($(date -d "$end" +%s) - $(date +%s)) / 86400 ))
+  if [ "$days" -lt "$WARN_DAYS" ]; then
+    echo "API certificate expires in $days days; renew at a quiet time: sudo microk8s refresh-certs --cert server.crt (restarts every container)"
+    return 2
+  fi
+  echo "frozen; API certificate valid for $days more days"
+}
+fix_certs() {
+  : > "$NO_REISSUE" && chmod 660 "$NO_REISSUE" && { chgrp microk8s "$NO_REISSUE" 2>/dev/null || true; }
+}
+
+# --- agent ----------------------------------------------------------------------
+chk_agent() {
+  [ -z "$AGENT_BIND" ] && { echo "not managed"; return 0; }
+  grep -qxF -- "--bind $AGENT_BIND" "$AGENT_ARGS" && { echo "--bind $AGENT_BIND"; return 0; }
+  echo "$(grep -- '^--bind ' "$AGENT_ARGS" || echo 'no --bind') → --bind $AGENT_BIND"; return 1
+}
+fix_agent() {
+  keep_copy "$AGENT_ARGS"
+  sed -i '/^--bind /d' "$AGENT_ARGS" && echo "--bind $AGENT_BIND" >> "$AGENT_ARGS" || return 1
+  log "  written; takes effect when the cluster agent restarts (next item)"
+}
+
+agent_listening() { ss -ltnH "sport = :${AGENT_BIND##*:}" 2>/dev/null | awk '{print $4}' | sort -u | paste -sd' '; }
+chk_agent_live() {
+  [ -z "$AGENT_BIND" ] && { echo "not managed"; return 0; }
+  local have; have="$(agent_listening)"
+  [ -z "$have" ] && { echo "nothing listens on port ${AGENT_BIND##*:}; is the cluster agent running?"; return 2; }
+  [ "$have" = "$AGENT_BIND" ] && { echo "listening on $AGENT_BIND only"; return 0; }
+  echo "listening on $have → $AGENT_BIND"; return 1
+}
+fix_agent_live() {
+  chk_agent >/dev/null || { log "  apply agent first"; return 1; }
+  snap restart microk8s.daemon-cluster-agent >/dev/null || return 1
+  local i
+  for i in $(seq 15); do [ "$(agent_listening)" = "$AGENT_BIND" ] && return 0; sleep 2; done
+  log "  the cluster agent isn't listening on $AGENT_BIND after 30 s"; return 1
 }
 
 item_main "$@"

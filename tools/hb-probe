@@ -1,0 +1,192 @@
+#!/usr/bin/python3 -IB
+"""hb-probe — what a server shows to the internet, seen from outside.
+
+Run the scan on a machine OUTSIDE the server's network (a laptop on another
+connection, another server). It needs python3 and nothing else: no hb, no root.
+
+  python3 hb-probe scan HOST [HOST...] [--expect 22,80,443] [--ports 1-65535]
+                        [--timeout 1.5] [--workers 256]
+
+It tries a TCP connection to every port on every address HOST resolves to
+(IPv4 and IPv6), sends UDP probes that only get an answer when a service
+listens (SIP, DNS, LLMNR, mDNS, NTP), and compares the open TCP ports with
+--expect. Exit 0 when they match, 1 when they don't. WireGuard never answers
+a stranger, so it can't be seen this way; that is the point of it.
+
+On the server:
+  hb probe            prints the scan command with the values from hb.toml
+  hb probe check      always ok (the scan itself runs elsewhere)
+"""
+import argparse
+import concurrent.futures
+import errno
+import os
+import socket
+import struct
+import sys
+import time
+
+
+def resolve(hosts):
+    """[(host, address)] for every IPv4 and IPv6 address of each host."""
+    out = []
+    for h in hosts:
+        try:
+            infos = socket.getaddrinfo(h, None, proto=socket.IPPROTO_TCP)
+        except socket.gaierror as e:
+            print(f"{h}: cannot resolve ({e})", file=sys.stderr)
+            continue
+        for addr in dict.fromkeys(i[4][0] for i in sorted(infos, key=lambda i: i[0])):
+            out.append((h, addr))
+    return out
+
+
+def parse_ports(text):
+    ports = set()
+    for part in text.split(","):
+        lo, _, hi = part.strip().partition("-")
+        lo, hi = int(lo), int(hi or lo)
+        if not 1 <= lo <= hi <= 65535:
+            raise argparse.ArgumentTypeError(f"bad port range {part!r}")
+        ports.update(range(lo, hi + 1))
+    return sorted(ports)
+
+
+def tcp_state(addr, port, timeout):
+    """open, closed, filtered, or unreachable (no route from here at all)."""
+    family = socket.AF_INET6 if ":" in addr else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        try:
+            s.connect((addr, port))
+            return "open"
+        except ConnectionRefusedError:
+            return "closed"
+        except socket.timeout:
+            return "filtered"
+        except OSError as e:
+            # no route or no source address of that family here (10051: Windows)
+            if e.errno in (errno.ENETUNREACH, errno.EADDRNOTAVAIL, 10051, 10049):
+                return "unreachable"
+            return "filtered"   # rejected by a firewall (host unreachable) or dropped
+
+
+def dns_query(name, qtype=1, flags=0x0100):
+    tid = int(time.time() * 1000) & 0xFFFF
+    q = b"".join(bytes([len(p)]) + p.encode() for p in name.split(".") if p) + b"\0"
+    return struct.pack(">HHHHHH", tid, flags, 1, 0, 0, 0) + q + struct.pack(">HH", qtype, 1)
+
+
+def udp_probes(addr):
+    host = f"[{addr}]" if ":" in addr else addr
+    sip = ("OPTIONS sip:probe@{h} SIP/2.0\r\nVia: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-hbprobe\r\n"
+           "Max-Forwards: 70\r\nTo: <sip:probe@{h}>\r\nFrom: <sip:hb-probe@invalid>;tag=hbprobe\r\n"
+           "Call-ID: hbprobe@invalid\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n").format(h=host)
+    return [
+        (5060, "SIP", sip.encode()),
+        (53, "DNS", dns_query("example.com")),
+        (5355, "LLMNR", dns_query("hbprobe", flags=0)),
+        (5353, "mDNS", dns_query("_services._dns-sd._udp.local", qtype=12, flags=0)),
+        (123, "NTP", b"\x1b" + 47 * b"\0"),
+    ]
+
+
+def udp_answers(addr, timeout):
+    family = socket.AF_INET6 if ":" in addr else socket.AF_INET
+    found = []
+    for port, name, payload in udp_probes(addr):
+        with socket.socket(family, socket.SOCK_DGRAM) as s:
+            s.settimeout(timeout)
+            try:
+                s.connect((addr, port))
+                s.send(payload)
+                s.recv(2048)
+                found.append(f"{port} ({name})")
+            except OSError:
+                pass
+    return found
+
+
+def scan(args):
+    targets = resolve(args.hosts)
+    if not targets:
+        return 2
+    expect = set(args.expect)
+    worst = 0
+    for host, addr in targets:
+        print(f"{host}  {addr}")
+        if tcp_state(addr, args.ports[0], args.timeout) == "unreachable":
+            print("  no route to this address from here (no IPv6 on this network?); skipped\n")
+            continue
+        started, opened, done = time.time(), [], 0
+        with concurrent.futures.ThreadPoolExecutor(args.workers) as pool:
+            futs = {pool.submit(tcp_state, addr, p, args.timeout): p for p in args.ports}
+            for f in concurrent.futures.as_completed(futs):
+                done += 1
+                if f.result() == "open":
+                    opened.append(futs[f])
+                if sys.stderr.isatty() and done % 2000 == 0:
+                    print(f"  {done}/{len(args.ports)} ports", end="\r", file=sys.stderr, flush=True)
+        opened.sort()
+        scanned = set(args.ports)
+        print(f"  tcp open: {' '.join(map(str, opened)) or 'none'}"
+              f"   ({len(args.ports)} ports in {time.time() - started:.0f} s)")
+        udp = udp_answers(addr, args.timeout)
+        print(f"  udp answers: {', '.join(udp) or 'none'}")
+        extra = sorted(set(opened) - expect)
+        missing = sorted((expect & scanned) - set(opened))
+        if args.expect_given:
+            if extra or missing or udp:
+                worst = 1
+                if extra:
+                    print(f"  NOT EXPECTED open: {' '.join(map(str, extra))}")
+                if missing:
+                    print(f"  expected but closed: {' '.join(map(str, missing))}")
+                if udp:
+                    print("  NOT EXPECTED: something answers on UDP")
+            else:
+                print("  ok: matches --expect")
+        print()
+    return worst
+
+
+def box_command():
+    """The scan command for this server, from hb.toml."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+    from hbkit import config
+    probe = config.load()["probe"]
+    host = probe["host"] or "HOST"
+    expect = ",".join(str(p) for p in probe["expect_tcp"]) or "22,80,443"
+    print("From a machine outside this server's network, with python3:\n")
+    print("  git clone https://github.com/<you>/hardening-base   (or copy tools/hb-probe there)")
+    print(f"  python3 hardening-base/tools/hb-probe scan {host} --expect {expect}\n")
+    print("A full scan takes a minute or two per address (longer from Windows).")
+    return 0
+
+
+def main(argv):
+    if len(argv) < 2:
+        return box_command()
+    if argv[1] in ("help", "-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if argv[1] == "check":
+        print("ok: the scan runs from outside (hb probe)")
+        return 0
+    if argv[1] != "scan":
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    ap = argparse.ArgumentParser(prog="hb-probe scan")
+    ap.add_argument("hosts", nargs="+")
+    ap.add_argument("--expect", type=parse_ports, default=None, help="TCP ports that should be open")
+    ap.add_argument("--ports", type=parse_ports, default=parse_ports("1-65535"))
+    ap.add_argument("--timeout", type=float, default=1.5)
+    ap.add_argument("--workers", type=int, default=256)
+    args = ap.parse_args(argv[2:])
+    args.expect_given = args.expect is not None
+    args.expect = args.expect or []
+    return scan(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

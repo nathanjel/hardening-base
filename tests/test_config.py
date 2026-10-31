@@ -38,6 +38,11 @@ class ConfigTest(unittest.TestCase):
         data = {"harden": {"remove_acounts": []}, "extra": {}}
         self.assertEqual(sorted(config.unknown_keys(data)), ["extra", "harden.remove_acounts"])
 
+    def test_free_form_tables_hold_any_names(self):
+        data = {"fw": {"zones": {"public": {"services": []}, "my-zone": {}}, "revert_minutes": 5}}
+        self.assertEqual(config.unknown_keys(data), [])
+        self.assertEqual(config.unknown_keys({"fw": {"zone": {}}}), ["fw.zone"])
+
     def test_defaults_not_mutated_by_load(self):
         self.load_text('[harden]\nremove_accounts = ["x"]\n')
         self.assertEqual(config.DEFAULTS["harden"]["remove_accounts"], [])

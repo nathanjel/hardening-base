@@ -1,0 +1,608 @@
+#!/usr/bin/python3 -IB
+"""hb-fw — firewalld zones from hb.toml, applied with a revert timer.
+
+  hb fw status            one line per managed zone
+  hb fw plan              what apply would change (changes nothing)
+  hb fw apply [--yes]     write the zones, reload firewalld, start the revert timer
+  hb fw confirm           keep the change; run it from a NEW ssh session
+  hb fw revert            put the previous zones back now
+  hb fw export ZONE...    zones as they are today, in hb.toml form
+  hb fw check             one-line verdict (exit 0 ok, 1 pending, 2 broken)
+
+Only the zones under [fw.zones] are touched, each written whole to
+/etc/firewalld/zones/<zone>.xml; others (docker's, for one) stay as they are.
+After apply, the previous files come back by themselves after
+fw.revert_minutes unless `hb fw confirm` runs first, so a change that locks you
+out undoes itself. A zone may hold: target, interfaces, sources, services,
+ports ("8088/tcp"), rules ("10000-10200/udp from 192.0.2.0/24") and forward.
+A zone file holding anything else (masquerade, other rich rules) is left for a
+human: hb fw reports it and won't write over it.
+"""
+import ipaddress
+import json
+import os
+import re
+import shutil
+import sys
+import time
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from xml.sax.saxutils import escape, quoteattr
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+from hbkit import config, util  # noqa: E402
+
+ETC = "/etc/firewalld/zones"
+LIB = "/usr/lib/firewalld/zones"
+UNIT = "hb-fw-revert"
+ZONE_KEYS = ("target", "interfaces", "sources", "services", "ports", "rules", "forward")
+TARGETS = ("default", "ACCEPT", "DROP", "%%REJECT%%")
+NAME = re.compile(r"^[A-Za-z0-9_.+-]{1,32}$")
+PORT = re.compile(r"^(\d{1,5})(?:-(\d{1,5}))?/(tcp|udp|sctp|dccp)$")
+RULE = re.compile(r"^(\S+)\s+from\s+(\S+)$")
+
+
+class Unmanaged(Exception):
+    """A zone file holds something hb fw can't express."""
+
+
+@dataclass(frozen=True)
+class Zone:
+    target: str = "default"
+    interfaces: frozenset = frozenset()
+    sources: frozenset = frozenset()
+    services: frozenset = frozenset()
+    ports: frozenset = frozenset()
+    rules: frozenset = frozenset()   # "PORT/PROTO from NETWORK"
+    forward: bool = False
+
+
+# --- values -----------------------------------------------------------------------
+
+def norm_port(text):
+    m = PORT.match(str(text).strip())
+    if not m:
+        raise ValueError(f"{text!r} is not PORT/PROTO or LOW-HIGH/PROTO")
+    lo, hi, proto = int(m[1]), int(m[2] or m[1]), m[3]
+    if not 1 <= lo <= hi <= 65535:
+        raise ValueError(f"{text!r}: ports run from 1 to 65535, low before high")
+    return f"{lo}/{proto}" if lo == hi else f"{lo}-{hi}/{proto}"
+
+
+def norm_net(text):
+    try:
+        return str(ipaddress.ip_network(str(text).strip(), strict=True))
+    except ValueError:
+        raise ValueError(f"{text!r} is not a network such as 192.0.2.0/24") from None
+
+
+def norm_rule(text):
+    m = RULE.match(str(text).strip())
+    if not m:
+        raise ValueError(f"{text!r} is not 'PORT/PROTO from NETWORK'")
+    return f"{norm_port(m[1])} from {norm_net(m[2])}"
+
+
+def port_key(p):
+    num, proto = p.split("/")
+    return (proto, int(num.split("-")[0]))
+
+
+def net_key(n):
+    net = ipaddress.ip_network(n)
+    return (net.version, net)
+
+
+def rule_key(r):
+    port, net = r.split(" from ")
+    return (port_key(port), net_key(net))
+
+
+# --- zones from config and from files ---------------------------------------------
+
+def zone_from_config(name, d):
+    """A Zone from one [fw.zones.NAME] table; ValueError naming every problem."""
+    where = f"fw.zones.{name}"
+    if not isinstance(d, dict):
+        raise ValueError(f"{where} must be a table")
+    errors = []
+    if not NAME.match(name) or len(name) > 17:
+        errors.append(f"{name!r} is not a zone name (letters, digits, -_.+; up to 17)")
+    errors += [f"{where}.{k} is not a zone setting ({', '.join(ZONE_KEYS)})" for k in d if k not in ZONE_KEYS]
+    target = d.get("target", "default")
+    if target not in TARGETS:
+        errors.append(f"{where}.target must be one of {', '.join(TARGETS)}")
+    forward = d.get("forward", False)
+    if not isinstance(forward, bool):
+        errors.append(f"{where}.forward must be true or false")
+
+    def each(key, fn):
+        vals = d.get(key, [])
+        if not isinstance(vals, list):
+            errors.append(f"{where}.{key} must be a list")
+            return frozenset()
+        out = set()
+        for v in vals:
+            try:
+                out.add(fn(v))
+            except ValueError as e:
+                errors.append(f"{where}.{key}: {e}")
+        return frozenset(out)
+
+    def name_of(v):
+        if not NAME.match(str(v)):
+            raise ValueError(f"{v!r} is not a name")
+        return str(v)
+
+    z = Zone(target, each("interfaces", name_of), each("sources", norm_net), each("services", name_of),
+             each("ports", norm_port), each("rules", norm_rule), forward)
+    if errors:
+        raise ValueError("; ".join(errors))
+    return z
+
+
+def rule_from_xml(el):
+    """'PORT/PROTO from NETWORK' for the one rich-rule shape hb fw writes, else None."""
+    kids = list(el)
+    if set(el.attrib) - {"family"} or [k.tag for k in kids] != ["source", "port", "accept"]:
+        return None
+    src, port, acc = kids
+    if set(src.attrib) != {"address"} or set(port.attrib) != {"port", "protocol"} \
+            or acc.attrib or len(src) or len(port) or len(acc):
+        return None
+    try:
+        net = norm_net(src.get("address"))
+        p = norm_port(f"{port.get('port')}/{port.get('protocol')}")
+    except ValueError:
+        return None
+    if el.get("family") != ("ipv6" if ":" in net else "ipv4"):
+        return None
+    return f"{p} from {net}"
+
+
+def zone_from_xml(text):
+    """(Zone, short, description) from a zone file; Unmanaged when it holds more."""
+    root = ET.fromstring(text)
+    if root.tag != "zone":
+        raise Unmanaged("not a zone file")
+    odd = [f"attribute {a}" for a in root.attrib if a not in ("target", "version")]
+    short = desc = None
+    sets = {k: set() for k in ("interfaces", "sources", "services", "ports", "rules")}
+    forward = False
+    for el in root:
+        tag, at = el.tag, set(el.attrib)
+        try:
+            if tag == "short":
+                short = el.text or ""
+            elif tag == "description":
+                desc = el.text or ""
+            elif tag == "interface" and at == {"name"}:
+                sets["interfaces"].add(el.get("name"))
+            elif tag == "source" and at == {"address"}:
+                sets["sources"].add(norm_net(el.get("address")))
+            elif tag == "service" and at == {"name"}:
+                sets["services"].add(el.get("name"))
+            elif tag == "port" and at == {"port", "protocol"}:
+                sets["ports"].add(norm_port(f"{el.get('port')}/{el.get('protocol')}"))
+            elif tag == "forward" and not at:
+                forward = True
+            elif tag == "rule" and rule_from_xml(el):
+                sets["rules"].add(rule_from_xml(el))
+            else:
+                odd.append(" ".join(ET.tostring(el, encoding="unicode").split()))
+        except ValueError:
+            odd.append(" ".join(ET.tostring(el, encoding="unicode").split()))
+    if odd:
+        raise Unmanaged("; ".join(odd))
+    z = Zone(root.get("target", "default"), *(frozenset(sets[k]) for k in
+             ("interfaces", "sources", "services", "ports", "rules")), forward)
+    return z, short, desc
+
+
+def render(name, z, short=None, desc=None):
+    """The zone file for z, in the layout firewalld itself writes."""
+    attrs = "" if z.target == "default" else f" target={quoteattr(z.target)}"
+    out = ['<?xml version="1.0" encoding="utf-8"?>', f"<zone{attrs}>",
+           f"  <short>{escape(short or name)}</short>",
+           f"  <description>{escape(desc or 'Managed by hb fw from hb.toml.')}</description>"]
+    out += [f"  <interface name={quoteattr(i)}/>" for i in sorted(z.interfaces)]
+    out += [f"  <source address={quoteattr(s)}/>" for s in sorted(z.sources, key=net_key)]
+    out += [f"  <service name={quoteattr(s)}/>" for s in sorted(z.services)]
+    for p in sorted(z.ports, key=port_key):
+        num, proto = p.split("/")
+        out.append(f"  <port port={quoteattr(num)} protocol={quoteattr(proto)}/>")
+    for r in sorted(z.rules, key=rule_key):
+        port, net = r.split(" from ")
+        num, proto = port.split("/")
+        out += [f'  <rule family="{"ipv6" if ":" in net else "ipv4"}">',
+                f"    <source address={quoteattr(net)}/>",
+                f"    <port port={quoteattr(num)} protocol={quoteattr(proto)}/>",
+                "    <accept/>", "  </rule>"]
+    if z.forward:
+        out.append("  <forward/>")
+    out.append("</zone>")
+    return "\n".join(out) + "\n"
+
+
+FIELDS = (("interface", "interfaces"), ("source", "sources"), ("service", "services"),
+          ("port", "ports"), ("rule", "rules"))
+
+
+def changes(old, new):
+    """Human lines for turning zone old (None: absent) into new."""
+    old = old if old is not None else Zone()
+    out = [] if old.target == new.target else [f"target {old.target} → {new.target}"]
+    for label, attr in FIELDS:
+        a, b = getattr(old, attr), getattr(new, attr)
+        out += [f"- {label} {v}" for v in sorted(a - b)] + [f"+ {label} {v}" for v in sorted(b - a)]
+    if old.forward != new.forward:
+        out.append("forward on" if new.forward else "forward off")
+    return out
+
+
+def summary(z):
+    parts = [f"target {z.target}"] if z.target != "default" else []
+    for label, attr in FIELDS:
+        vals = getattr(z, attr)
+        if attr == "rules" and vals:
+            parts.append(f"{len(vals)} rules")
+        elif vals:
+            parts.append(f"{attr} {' '.join(sorted(vals))}")
+    return "; ".join(parts) or "empty"
+
+
+# --- the system -------------------------------------------------------------------
+
+def current(name):
+    """(Zone, short, description) as firewalld would load it, or (None, None, None)."""
+    for d in (ETC, LIB):
+        p = os.path.join(d, name + ".xml")
+        if os.path.exists(p):
+            with open(p) as f:
+                return zone_from_xml(f.read())
+    return None, None, None
+
+
+def survey(cfg):
+    """One dict per configured zone: name, want, have, short, desc, changes, error."""
+    zones = cfg["fw"]["zones"]
+    if not isinstance(zones, dict):
+        return [{"name": "fw.zones", "error": "fw.zones must hold one table per zone", "changes": []}]
+    rc, out, _ = util.run("firewall-cmd", "--get-services")
+    known = set(out.split()) if rc == 0 else None
+    entries, owner = [], {}
+    for name, d in zones.items():
+        e = {"name": name, "error": None, "changes": []}
+        entries.append(e)
+        try:
+            want = zone_from_config(name, d)
+        except ValueError as x:
+            e["error"] = str(x)
+            continue
+        problems = [f"interface {i} is also in zone {owner[i]}" for i in want.interfaces if i in owner]
+        owner.update({i: name for i in want.interfaces})
+        if known is not None:
+            problems += [f"firewalld has no service {s!r}" for s in sorted(want.services - known)]
+        try:
+            have, short, desc = current(name)
+        except (Unmanaged, ET.ParseError) as x:
+            problems.append(f"{name}.xml holds what hb fw doesn't manage ({x}); "
+                            "change it by hand or leave the zone out of fw.zones")
+            have = short = desc = None
+        if problems:
+            e["error"] = "; ".join(problems)
+            continue
+        e.update(want=want, have=have, short=short, desc=desc,
+                 changes=changes(have, want) if have != want else [])
+    return entries
+
+
+def active_bindings():
+    """{"zone if:NAME", "zone src:NET", ...} from firewalld's runtime state."""
+    rc, out, _ = util.run("firewall-cmd", "--get-active-zones")
+    found, zone = set(), None
+    for line in out.splitlines():
+        if line and not line[0].isspace():
+            zone = line.split()[0]
+        elif zone and ":" in line:
+            kind, vals = line.split(":", 1)
+            tag = "if" if kind.strip() == "interfaces" else "src"
+            found |= {f"{zone} {tag}:{v}" for v in vals.split()}
+    return found
+
+
+def busy():
+    d = os.path.join(util.HB_ROOT, "busy.d")
+    why = []
+    for s in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        p = os.path.join(d, s)
+        if os.access(p, os.X_OK):
+            rc, out, err = util.run(p)
+            if rc != 0:
+                why.append((out or err or s).strip())
+    return why
+
+
+def notify(level, key, text):
+    util.run(util.HB, "notify", "send", level, key, text, timeout=120)
+
+
+def pending_path():
+    return os.path.join(util.state_dir("fw"), "pending.json")
+
+
+def confirm(question):
+    try:
+        with open("/dev/tty") as tty:
+            print(f"{question} [y/N] ", end="", flush=True)
+            return tty.readline().strip().lower().startswith("y")
+    except OSError:
+        return False
+
+
+def restore(pend):
+    """Put back the files a pending change replaced, reload; True when firewalld took it."""
+    for path, saved in pend["files"].items():
+        if saved:
+            shutil.copy2(saved, path)
+        elif os.path.exists(path):
+            os.unlink(path)
+    rc, _, err = util.run("firewall-cmd", "--reload", timeout=120)
+    if os.path.exists(pending_path()):
+        os.unlink(pending_path())
+    if rc != 0:
+        print(f"firewall-cmd --reload failed: {err.strip()}")
+    return rc == 0
+
+
+# --- verbs ------------------------------------------------------------------------
+
+def show_plan(entries):
+    for e in entries:
+        if e["error"]:
+            print(f"cannot  {e['name']}: {e['error']}")
+        elif e["changes"]:
+            print(f"zone {e['name']}" + (" (new)" if e["have"] is None else ""))
+            for c in e["changes"]:
+                print(f"    {c}")
+
+
+def do_plan(cfg):
+    entries = survey(cfg)
+    if not entries:
+        print("not managed (no fw.zones)")
+        return 0
+    show_plan(entries)
+    if any(e["error"] for e in entries):
+        return 2
+    if not any(e["changes"] for e in entries):
+        print("nothing to change")
+        return 0
+    return 1
+
+
+def do_apply(cfg, yes):
+    entries = survey(cfg)
+    todo = [e for e in entries if e["changes"]]
+    if any(e["error"] for e in entries):
+        show_plan(entries)
+        return 2
+    if not todo:
+        print("nothing to change")
+        return 0
+    if os.path.exists(pending_path()):
+        print("a change is still waiting for confirmation: hb fw confirm, or hb fw revert")
+        return 2
+    if util.run("firewall-cmd", "--state")[0] != 0:
+        print("firewalld isn't running")
+        return 2
+    show_plan(todo)
+    minutes = int(cfg["fw"]["revert_minutes"])
+    why = busy()
+    if why:
+        print("busy: " + "; ".join(why) + "\nreloading the firewall drops packets for about a second")
+        if yes:
+            print("not applying with --yes while busy")
+            return 1
+    if not yes and not confirm(f"apply, with the old zones coming back after {minutes} minutes unless confirmed?"):
+        print("nothing changed")
+        return 1
+
+    run_id = os.environ.get("HB_RUN") or time.strftime("%Y%m%d-%H%M%S")
+    backup = os.path.join(util.STATE, "backup", run_id)
+    files = {}
+    for e in todo:
+        path = os.path.join(ETC, e["name"] + ".xml")
+        files[path] = None
+        if os.path.exists(path):
+            files[path] = backup + path
+            os.makedirs(os.path.dirname(files[path]), mode=0o700, exist_ok=True)
+            shutil.copy2(path, files[path])
+    before = active_bindings()
+
+    # The timer comes first: without it, nothing changes.
+    util.run("systemctl", "reset-failed", f"{UNIT}.timer", f"{UNIT}.service")
+    rc, _, err = util.run("systemd-run", f"--unit={UNIT}", f"--on-active={minutes}min",
+                          "--timer-property=AccuracySec=1s",
+                          "--description=hb fw: put back an unconfirmed firewall change",
+                          util.HB, "fw", "revert", "--timer")
+    if rc != 0:
+        print(f"cannot start the revert timer ({err.strip()}); nothing changed")
+        return 2
+    until = time.time() + minutes * 60
+    pend = {"run": run_id, "files": files, "until": until, "zones": [e["name"] for e in todo]}
+    util.write_json(pending_path(), pend)
+
+    os.makedirs(ETC, exist_ok=True)
+    for e in todo:
+        util.write_atomic(os.path.join(ETC, e["name"] + ".xml"),
+                          render(e["name"], e["want"], e["short"], e["desc"]), mode=0o644)
+    for step in (("--check-config",), ("--reload",)):
+        rc, out, err = util.run("firewall-cmd", *step, timeout=120)
+        if rc != 0:
+            print(f"firewall-cmd {step[0]} failed: {(out + err).strip()}\nputting the old zones back")
+            util.run("systemctl", "stop", f"{UNIT}.timer")
+            restore(pend)
+            return 2
+
+    # Runtime bindings others made (docker's bridges, NetworkManager's links)
+    # come back by themselves after a reload; give them a moment, then say so if not.
+    removed = set()
+    for e in todo:
+        for c in e["changes"]:
+            sign, label, *rest = c.split()
+            if sign == "-" and label in ("interface", "source"):
+                removed.add(f"{e['name']} {'if' if label == 'interface' else 'src'}:{rest[0]}")
+    missing = set()
+    for _ in range(10):
+        missing = before - active_bindings() - removed
+        if not missing:
+            break
+        time.sleep(2)
+    if missing:
+        print("after the reload these bindings are missing: " + ", ".join(sorted(missing)))
+        print("docker puts its own back within seconds; if not: sudo systemctl restart docker")
+
+    print(f"\napplied; the old zones come back at {time.strftime('%H:%M', time.localtime(until))} unless confirmed.")
+    print("Keep this session open. Open a NEW ssh session (and one over WireGuard, if you use it).")
+    print("If it logs in, run there:  sudo hb fw confirm")
+    return 0
+
+
+def do_confirm():
+    if not os.path.exists(pending_path()):
+        print("nothing waiting for confirmation")
+        return 0
+    pend = util.read_json(pending_path(), {})
+    rc, _, err = util.run("systemctl", "stop", f"{UNIT}.timer")
+    if rc != 0:
+        print(f"could not stop the revert timer: {err.strip()}")
+        return 2
+    os.unlink(pending_path())
+    zones = ", ".join(pend.get("zones", []))
+    notify("info", "fw.change", f"firewall change confirmed: {zones}")
+    print(f"confirmed: {zones}. The previous files stay in {util.STATE}/backup/{pend.get('run')}/")
+    return 0
+
+
+def do_revert(by_timer):
+    if not os.path.exists(pending_path()):
+        print("nothing to revert")
+        return 0
+    pend = util.read_json(pending_path(), {})
+    if not by_timer:
+        util.run("systemctl", "stop", f"{UNIT}.timer")
+    ok = restore(pend)
+    text = ("firewall change not confirmed in time: previous zones restored" if by_timer
+            else "firewall change reverted by hand")
+    notify("warn" if by_timer else "info", "fw.revert", text + ("" if ok else "; reload failed"))
+    print(text)
+    return 0 if ok else 2
+
+
+def toml_list(vals):
+    items = [json.dumps(v) for v in vals]
+    if len(", ".join(items)) < 60:
+        return "[" + ", ".join(items) + "]"
+    return "[\n" + "".join(f"  {i},\n" for i in items) + "]"
+
+
+def do_export(names):
+    rc = 0
+    for name in names:
+        try:
+            z, _, _ = current(name)
+        except (Unmanaged, ET.ParseError) as e:
+            print(f"# {name}: holds what hb fw doesn't manage ({e})\n")
+            rc = 2
+            continue
+        if z is None:
+            print(f"# {name}: no such zone\n")
+            rc = 2
+            continue
+        key = name if re.match(r"^[A-Za-z0-9_-]+$", name) else json.dumps(name)
+        print(f"[fw.zones.{key}]")
+        if z.target != "default":
+            print(f"target = {json.dumps(z.target)}")
+        for attr, sort in (("interfaces", None), ("sources", net_key), ("services", None),
+                           ("ports", port_key), ("rules", rule_key)):
+            vals = sorted(getattr(z, attr), key=sort)
+            if vals:
+                print(f"{attr} = {toml_list(vals)}")
+        if z.forward:
+            print("forward = true")
+        print()
+    return rc
+
+
+def verdict(cfg):
+    if not cfg["fw"]["zones"]:
+        return 0, "ok: not managed"
+    if util.run("firewall-cmd", "--state")[0] != 0:
+        return 2, "fail: firewalld isn't running"
+    entries = survey(cfg)
+    bad = [e["name"] for e in entries if e["error"]]
+    if bad:
+        return 2, f"fail: {', '.join(bad)} (hb fw plan)"
+    pend = util.read_json(pending_path(), None) if os.path.exists(pending_path()) else None
+    if pend:
+        at = time.strftime("%H:%M", time.localtime(pend.get("until", 0)))
+        return 1, f"warn: change waiting for confirmation; reverts at {at} (hb fw confirm)"
+    todo = [e["name"] for e in entries if e["changes"]]
+    if todo:
+        return 1, f"warn: pending {', '.join(todo)}"
+    return 0, f"ok: zones {', '.join(e['name'] for e in entries)} match hb.toml"
+
+
+def do_status(cfg):
+    entries = survey(cfg)
+    if not entries:
+        print("not managed (no fw.zones)")
+        return 0
+    worst = 0
+    for e in entries:
+        if e["error"]:
+            word, detail, worst = "FAIL", e["error"], 2
+        elif e["changes"]:
+            word, detail, worst = "todo", "; ".join(e["changes"]), max(worst, 1)
+        else:
+            word, detail = "ok", summary(e["want"])
+        print(f"{word:<5} {e['name']:<14} {detail}")
+    rc, line = verdict(cfg)
+    if "confirmation" in line:
+        print(line)
+    return max(worst, rc)
+
+
+def main(argv):
+    verb = argv[1] if len(argv) > 1 else "status"
+    if verb in ("help", "-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if os.geteuid() != 0:
+        print("error: run with sudo", file=sys.stderr)
+        return 2
+    cfg = config.load()
+    if verb == "status":
+        return do_status(cfg)
+    if verb == "plan":
+        return do_plan(cfg)
+    if verb == "check":
+        rc, line = verdict(cfg)
+        print(line)
+        return rc
+    if verb == "export" and len(argv) > 2:
+        return do_export(argv[2:])
+    if verb in ("apply", "confirm", "revert"):
+        with util.Lock(os.path.join(util.state_dir("fw"), "lock")):
+            if verb == "apply":
+                return do_apply(cfg, "--yes" in argv[2:])
+            if verb == "confirm":
+                return do_confirm()
+            return do_revert("--timer" in argv[2:])
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

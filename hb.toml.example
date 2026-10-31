@@ -7,11 +7,17 @@
 remove_accounts = []          # e.g. ["fedora"]: the cloud image's default user
 remove_files = []             # files or folders, e.g. ["/etc/sudoers.d/90-cloud-init-users"]
 permit_root_login = ""        # "no" to forbid root over SSH
+sysctl = []                   # "key = value"; * matches any one name, e.g.
+                              # ["net.ipv4.conf.*.send_redirects = 0", "kernel.yama.ptrace_scope = 1"]
+llmnr = ""                    # "no" to switch off systemd-resolved's LLMNR responder (5355)
 
 [k8s]
 flavour = "microk8s"          # the only one supported
 nodeport_addresses = []       # e.g. ["127.0.0.0/8"]: NodePorts on localhost only
 token_off_namespaces = []     # namespaces whose pods never call the Kubernetes API
+freeze_certs = false          # true: microk8s stops reissuing its API certificate (and
+                              # restarting every container) whenever the host gains an address
+cluster_agent_bind = ""       # e.g. "127.0.0.1:25000": the join agent, unused on one box
 
 [health]
 containers = []               # docker containers that must be running
@@ -70,3 +76,31 @@ docker_container_days = 7
 docker_image_days = 14
 docker_build_cache = "15GB"
 heavy_weekday = 6             # docker cleanup day once live: 1 = Monday ... 7 = Sunday
+
+[wg]
+interface = "wg0"
+address = ""                  # the server's tunnel address, e.g. "10.77.0.1/24"; empty: not managed
+port = 51820
+endpoint = ""                 # the name your PCs dial, e.g. "vpn.example.com"
+peers = []                    # "NAME ADDRESS PUBLIC-KEY", the key from the PC's WireGuard app, e.g.
+                              # ["desk 10.77.0.2 <44 characters ending in =>"]
+
+[fw]
+revert_minutes = 5            # unconfirmed changes go back after this long
+
+# One table per zone hb fw manages; zones not listed stay as they are.
+# [fw.zones.public]
+# services = ["ssh", "http", "https", "wireguard"]
+# rules = ["5060/udp from 192.0.2.0/27"]     # PORT/PROTO from NETWORK
+# forward = true
+#
+# [fw.zones.wg]
+# interfaces = ["wg0"]
+# services = ["ssh"]
+# ports = ["16443/tcp"]
+# Also: target ("default", "ACCEPT", "DROP", "%%REJECT%%") and sources.
+# `sudo hb fw export public` prints a zone as it is today, in this form.
+
+[probe]
+host = ""                     # the name to scan from outside
+expect_tcp = []               # e.g. [22, 80, 443]: what should answer

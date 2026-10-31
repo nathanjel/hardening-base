@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# hb-wg — a WireGuard endpoint for your own PCs. wg-quick's file is generated
+# from hb.toml, the server key lives in /etc/hb/secrets, and each PC makes its
+# own key pair, so its private key never leaves it. Opening the port and giving
+# the interface a firewall zone is hb fw's job.
+#
+#   hb wg status        one line per item
+#   hb wg plan          what apply would change (changes nothing)
+#   hb wg apply [--yes] make the changes, asking before each item
+#   hb wg check         one-line verdict (exit 0 ok, 1 pending, 2 broken)
+#   hb wg peer NAME     the lines NAME pastes into its WireGuard app
+#   hb wg show          handshakes and traffic, straight from wg
+#
+# Items:
+#   package  wireguard-tools installed
+#   key      the server's private key in /etc/hb/secrets/wg-<interface>.key
+#   conf     /etc/wireguard/<interface>.conf matches hb.toml (peers change live)
+#   up       wg-quick@<interface> enabled and running
+#
+# Adding a PC: in its WireGuard app choose "Add empty tunnel", copy the public
+# key it shows into wg.peers as "NAME ADDRESS KEY", run `sudo ./hb install
+# apply` and `sudo hb wg apply`, then paste what `sudo hb wg peer NAME` prints.
+#
+# Config ([wg] in hb.toml): interface, address, port, endpoint, peers.
+set -u
+source "$(dirname "$(readlink -f "$0")")/../lib/hb.sh"
+need_root
+need_config
+
+IFACE="$(cfg wg.interface)"
+ADDRESS="$(cfg wg.address)"
+KEY="/etc/hb/secrets/wg-$IFACE.key"
+CONF="/etc/wireguard/$IFACE.conf"
+UNIT="wg-quick@$IFACE"
+WGPY=(python3 -IB "$HB_ROOT/lib/hbkit/wg.py")
+ITEMS=(package key conf up)
+
+managed() { [ -n "$ADDRESS" ]; }
+
+# --- package ----------------------------------------------------------------------
+chk_package() {
+  managed || { echo "not managed"; return 0; }
+  if command -v wg >/dev/null && command -v wg-quick >/dev/null; then
+    local v; v="$(rpm -q --qf '%{VERSION}' wireguard-tools 2>/dev/null)" || v="(not from a package)"
+    echo "wireguard-tools $v"; return 0
+  fi
+  echo "will install wireguard-tools"; return 1
+}
+fix_package() { dnf install -y -q wireguard-tools; }
+
+# --- key --------------------------------------------------------------------------
+chk_key() {
+  managed || { echo "not managed"; return 0; }
+  [ -f "$KEY" ] || { echo "will create the server key in $KEY"; return 1; }
+  [ "$(stat -c '%u %a' "$KEY")" = "0 600" ] || { echo "$KEY must be root's, mode 600"; return 2; }
+  local pub
+  pub="$(wg pubkey < "$KEY" 2>/dev/null)" || { echo "$KEY is not a WireGuard key (or wg is missing)"; return 2; }
+  echo "server public key $pub"
+}
+fix_key() {
+  command -v wg >/dev/null || { log "  install wireguard-tools first (package)"; return 1; }
+  install -d -m 700 /etc/hb/secrets || return 1
+  ( umask 077; wg genkey > "$KEY.tmp" ) && mv "$KEY.tmp" "$KEY"
+}
+
+# --- conf -------------------------------------------------------------------------
+render() { "${WGPY[@]}" render "$KEY"; }
+
+chk_conf() {
+  managed || { echo "not managed"; return 0; }
+  local peers change
+  peers="$("${WGPY[@]}" validate 2>&1)" || { echo "$peers"; return 2; }
+  [ -f "$KEY" ] || { echo "$peers; written once the key exists"; return 1; }
+  if [ -f "$CONF" ] && cmp -s "$CONF" <(render); then echo "$peers"; return 0; fi
+  change="$(render | "${WGPY[@]}" diff "$CONF")"
+  echo "$CONF: $change"; return 1
+}
+fix_conf() {
+  [ -f "$KEY" ] || { log "  create the key first (key)"; return 1; }
+  install -d -m 700 /etc/wireguard || return 1
+  keep_copy "$CONF"
+  ( umask 077; render > "$CONF.tmp" ) && mv "$CONF.tmp" "$CONF" || return 1
+  ip link show "$IFACE" >/dev/null 2>&1 || return 0
+  # Peers and the port change in place; a new address needs the interface restarted.
+  if [ "$(ip -o addr show dev "$IFACE" | awk '{print $4; exit}')" = "$ADDRESS" ]; then
+    wg syncconf "$IFACE" <(wg-quick strip "$IFACE")
+  else
+    log "  address changed: restarting $UNIT"
+    systemctl restart "$UNIT"
+  fi
+}
+
+# --- up ---------------------------------------------------------------------------
+# microk8s's apiserver-kicker reissues the API server certificate whenever the
+# host gains an address, then restarts every container to load it. Its
+# no-cert-reissue lock (hb k8s, k8s.freeze_certs) stops that. Checked here
+# because bringing the interface up is what would set it off.
+kicker_would_restart() {
+  local m=/var/snap/microk8s/current
+  [ -f "$m/certs/csr.conf.template" ] && grep -q '#MOREIPS' "$m/certs/csr.conf.template" \
+    && [ ! -e "$m/var/lock/no-cert-reissue" ]
+}
+
+handshakes() {
+  local now name ip key t out=()
+  local -A last=()
+  now="$(date +%s)"
+  while read -r key t; do last[$key]=$t; done < <(wg show "$IFACE" latest-handshakes 2>/dev/null)
+  while read -r name ip key; do
+    [ -n "$name" ] || continue
+    t="${last[$key]:-0}"
+    if [ "$t" = 0 ]; then out+=("$name never"); else out+=("$name $(( (now - t) / 60 )) min ago"); fi
+  done < <(cfg wg.peers)
+  [ ${#out[@]} -eq 0 ] && { echo "no peers yet"; return; }
+  local joined
+  printf -v joined '%s, ' "${out[@]}"
+  echo "last handshake: ${joined%, }"
+}
+
+chk_up() {
+  managed || { echo "not managed"; return 0; }
+  local en act
+  en="$(systemctl is-enabled "$UNIT" 2>/dev/null)"
+  act="$(systemctl is-active "$UNIT" 2>/dev/null)"
+  if [ "$en" = enabled ] && [ "$act" = active ]; then
+    echo "$IFACE up at $ADDRESS; $(handshakes)"; return 0
+  fi
+  if ! ip link show "$IFACE" >/dev/null 2>&1 && kicker_would_restart; then
+    echo "waiting for hb k8s (freeze_certs): starting $IFACE now would make microk8s restart every container"
+    return 1
+  fi
+  echo "will enable and start $UNIT (now ${en:-unknown}, ${act:-unknown})"; return 1
+}
+fix_up() {
+  [ -f "$CONF" ] || { log "  write the config first (conf)"; return 1; }
+  if ! ip link show "$IFACE" >/dev/null 2>&1 && kicker_would_restart; then
+    log "  not starting: microk8s would reissue its certificate and restart every container."
+    log "  Set k8s.freeze_certs = true in hb.toml, then: sudo ./hb install apply && sudo hb k8s apply"
+    return 1
+  fi
+  systemctl enable --now "$UNIT"
+}
+
+case "${1:-}" in
+  peer)
+    [ -n "${2:-}" ] || die "usage: hb wg peer NAME"
+    [ -f "$KEY" ] || die "no server key yet; run hb wg apply first"
+    "${WGPY[@]}" peer "$2" "$(wg pubkey < "$KEY")"
+    exit $?
+    ;;
+  show) exec wg show "$IFACE" ;;
+esac
+item_main "$@"

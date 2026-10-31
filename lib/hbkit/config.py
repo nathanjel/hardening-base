@@ -15,11 +15,15 @@ DEFAULTS = {
         "remove_accounts": [],
         "remove_files": [],
         "permit_root_login": "",
+        "sysctl": [],
+        "llmnr": "",
     },
     "k8s": {
         "flavour": "microk8s",
         "nodeport_addresses": [],
         "token_off_namespaces": [],
+        "freeze_certs": False,
+        "cluster_agent_bind": "",
     },
     "health": {
         "containers": [],
@@ -79,6 +83,21 @@ DEFAULTS = {
         "docker_build_cache": "15GB",
         "heavy_weekday": 6,
     },
+    "wg": {
+        "interface": "wg0",
+        "address": "",
+        "port": 51820,
+        "endpoint": "",
+        "peers": [],
+    },
+    "fw": {
+        "revert_minutes": 5,
+        "zones": {},
+    },
+    "probe": {
+        "host": "",
+        "expect_tcp": [],
+    },
 }
 
 
@@ -128,11 +147,13 @@ def get(cfg, dotted):
 
 
 def unknown_keys(data, defaults=DEFAULTS, prefix=""):
-    """Dotted keys in a host file that hb doesn't know, usually typos."""
+    """Dotted keys in a host file that hb doesn't know, usually typos. A table
+    whose default is empty ({}, such as fw.zones) holds names the user picks;
+    the tool that reads it checks what's inside."""
     found = []
     for key, val in data.items():
         if key not in defaults:
             found.append(prefix + key)
-        elif isinstance(val, dict) and isinstance(defaults[key], dict):
+        elif isinstance(val, dict) and isinstance(defaults[key], dict) and defaults[key]:
             found += unknown_keys(val, defaults[key], f"{prefix}{key}.")
     return found

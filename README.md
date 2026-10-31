@@ -16,8 +16,8 @@ upgrades and cleanup jobs. They arrive in phases.
 
 ## Status
 
-Phases 1 and 2 are written (runbooks: [docs/PHASE1.md](docs/PHASE1.md),
-[docs/PHASE2.md](docs/PHASE2.md)). Start from `hb.toml.example`, which lists every
+Phases 1 to 3 are written (runbooks: [docs/PHASE1.md](docs/PHASE1.md),
+[docs/PHASE2.md](docs/PHASE2.md), [docs/PHASE3.md](docs/PHASE3.md)). Start from `hb.toml.example`, which lists every
 key, as `hb.toml` in the checkout. `sudo ./hb install apply` then copies the code
 to `/opt/hb` (root's, so nothing running as your user can change what root's
 timers run) and the config to `/etc/hb/hb.toml`.
@@ -26,8 +26,11 @@ timers run) and the config to `/etc/hb/hb.toml`.
 |---|---|
 | `hb-config` | read and validate `hb.toml` (bash tools call `hb config get KEY`) |
 | `hb-install` | root-owned copy in `/opt/hb`, `/etc/hb/hb.toml`, systemd units and timers |
-| `hb-harden` | unwanted accounts, stray files, root login over SSH, NOPASSWD audit |
-| `hb-k8s` | microk8s: NodePorts on localhost only, no service-account tokens in app pods |
+| `hb-harden` | unwanted accounts, stray files and folders, root login over SSH, NOPASSWD audit, kernel settings, LLMNR |
+| `hb-k8s` | microk8s: NodePorts on localhost only, no service-account tokens in app pods, no certificate reissue that restarts every container, cluster agent on localhost |
+| `hb-wg` | WireGuard endpoint for your PCs: config from `hb.toml`, each PC keeps its own private key |
+| `hb-fw` | firewalld zones from `hb.toml`, applied with a revert timer you cancel from a new session |
+| `hb-probe` | stdlib-only outside scan (TCP and a few UDP services) to run from another network |
 | `hb-snapshot` | read-only btrfs snapshots of `/` before risky changes |
 | `hb-health` | reboot pending, RAID, NVMe wear, btrfs, disk, mounts, containers, k8s, sites and certificates, registry, SIP trunk |
 | `hb-status` | runs every check every 15 minutes, writes the login banner, passes changes to hb-notify |
@@ -39,7 +42,7 @@ timers run) and the config to `/etc/hb/hb.toml`.
 
 ## Conventions
 
-- Item tools (`harden`, `k8s`) share four verbs: `status`, `plan` (changes nothing),
+- Item tools (`harden`, `k8s`, `wg`, `install`, `alerts`) share four verbs: `status`, `plan` (changes nothing),
   `apply [--yes]` (asks before each item) and `check` (one line; exit 0 ok, 1 pending, 2 broken).
   See `lib/hb.sh`.
 - Anything changed is first copied to `/var/lib/hb/backup/<run>/`.

@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # hb-harden — host settings that close doors: unwanted accounts, stray files
-# (root's keys, cloud-init sudo rules), root login over SSH, NOPASSWD audit.
+# (root's keys, cloud-init sudo rules), root login over SSH, NOPASSWD audit,
+# kernel settings (sysctl) and systemd-resolved's LLMNR responder.
 #
 #   hb harden status        one line per item
 #   hb harden plan          what apply would change (changes nothing)
 #   hb harden apply [--yes] make the changes, asking before each item
 #   hb harden check         one-line verdict (exit 0 ok, 1 pending, 2 broken)
 #
-# Config ([harden] in hb.toml): remove_accounts, remove_files, permit_root_login.
+# Config ([harden] in hb.toml): remove_accounts, remove_files, permit_root_login,
+# sysctl ("key = value" lines; * stands for any one name, such as an interface),
+# llmnr.
 # Every file or folder it changes or removes is copied to /var/lib/hb/backup/<run>/
 # first; a deleted account's home is kept there as a tarball.
 set -u
@@ -15,12 +18,16 @@ source "$(dirname "$(readlink -f "$0")")/../lib/hb.sh"
 need_root
 need_config
 
-ITEMS=(files accounts root_login nopasswd)
+ITEMS=(files accounts root_login nopasswd sysctl llmnr)
 SSHD_DROPIN=/etc/ssh/sshd_config.d/10-hb-harden.conf
+SYSCTL_FILE=/etc/sysctl.d/90-hb.conf
+RESOLVED_DROPIN=/etc/systemd/resolved.conf.d/90-hb.conf
 
 mapfile -t REMOVE_FILES < <(cfg harden.remove_files)
 mapfile -t REMOVE_ACCOUNTS < <(cfg harden.remove_accounts)
 ROOT_LOGIN="$(cfg harden.permit_root_login)"
+mapfile -t SYSCTL < <(cfg harden.sysctl)
+LLMNR="$(cfg harden.llmnr)"
 
 # --- files: files and folders that must not exist -------------------------------
 # Folders go too, with what's in them; a symlink is removed, never what it points to.
@@ -122,6 +129,77 @@ chk_nopasswd() {
   done
   [ ${#hits[@]} -eq 0 ] && { echo "no NOPASSWD rules outside files listed for removal"; return 0; }
   echo "NOPASSWD rules in ${hits[*]}: review by hand"; return 2
+}
+
+# --- sysctl: kernel settings, live and in one file read at boot ------------------
+# The file sorts after the distribution's, so its values win at boot. Applying
+# writes only these keys: running `sysctl --system` would also re-apply every
+# other file, undoing what Calico and kube-proxy set at runtime.
+SYSCTL_RE='^([a-z0-9_.*-]+)[[:space:]]*=[[:space:]]*(.*[^[:space:]])[[:space:]]*$'
+
+sysctl_text() {
+  echo "# Managed by hb-harden from hb.toml (harden.sysctl)."
+  local e
+  for e in "${SYSCTL[@]}"; do
+    [[ $e =~ $SYSCTL_RE ]] && echo "${BASH_REMATCH[1]} = ${BASH_REMATCH[2]}"
+  done
+}
+# sysctl_paths KEY — its files under /proc/sys; * matches any one name
+sysctl_paths() { compgen -G "/proc/sys/${1//.//}" || true; }
+
+chk_sysctl() {
+  [ ${#SYSCTL[@]} -eq 0 ] && { echo "not managed"; return 0; }
+  local e key val p have paths off diffs=()
+  for e in "${SYSCTL[@]}"; do
+    [[ $e =~ $SYSCTL_RE ]] || { echo "harden.sysctl: '$e' is not 'key = value'"; return 2; }
+    key="${BASH_REMATCH[1]}" val="${BASH_REMATCH[2]}"
+    mapfile -t paths < <(sysctl_paths "$key")
+    [ ${#paths[@]} -eq 0 ] && { echo "harden.sysctl: the kernel has no $key"; return 2; }
+    off=0
+    for p in "${paths[@]}"; do
+      have="$(tr -s '\t ' '  ' < "$p" 2>/dev/null)"
+      [ "$have" = "$val" ] || { off=$((off + 1)); [ ${#paths[@]} -eq 1 ] && diffs+=("$key $have→$val"); }
+    done
+    [ $off -gt 0 ] && [ ${#paths[@]} -gt 1 ] && diffs+=("$key ($off of ${#paths[@]} →$val)")
+  done
+  cmp -s "$SYSCTL_FILE" <(sysctl_text) || diffs+=("file $SYSCTL_FILE")
+  [ ${#diffs[@]} -eq 0 ] && { echo "${#SYSCTL[@]} settings as configured"; return 0; }
+  local joined; printf -v joined '%s, ' "${diffs[@]}"
+  echo "${joined%, }"; return 1
+}
+fix_sysctl() {
+  keep_copy "$SYSCTL_FILE"
+  ( umask 022; sysctl_text > "$SYSCTL_FILE" ) || return 1
+  local e key val p failed=0
+  for e in "${SYSCTL[@]}"; do
+    [[ $e =~ $SYSCTL_RE ]] || continue
+    key="${BASH_REMATCH[1]}" val="${BASH_REMATCH[2]}"
+    for p in $(sysctl_paths "$key"); do
+      [ -e "$p" ] || continue   # an interface that went away meanwhile
+      { printf '%s' "$val" > "$p"; } 2>/dev/null || { log "  cannot set ${p#/proc/sys/}"; failed=1; }
+    done
+  done
+  return $failed
+}
+
+# --- llmnr: systemd-resolved's LLMNR responder (5355/tcp+udp) -------------------
+llmnr_text() { printf '# Managed by hb-harden from hb.toml (harden.llmnr).\n[Resolve]\nLLMNR=%s\n' "$LLMNR"; }
+chk_llmnr() {
+  [ -z "$LLMNR" ] && { echo "not managed"; return 0; }
+  case "$LLMNR" in yes|no|resolve) ;; *) echo "harden.llmnr must be yes, no or resolve"; return 2 ;; esac
+  local listening
+  listening="$(ss -lnH 'sport = :5355' 2>/dev/null | wc -l)"
+  if cmp -s "$RESOLVED_DROPIN" <(llmnr_text); then
+    [ "$LLMNR" = no ] && [ "$listening" -gt 0 ] && { echo "LLMNR=no is set, yet $listening sockets listen on 5355"; return 1; }
+    echo "LLMNR=$LLMNR"; return 0
+  fi
+  echo "LLMNR=$LLMNR via $RESOLVED_DROPIN (now $listening sockets on 5355)"; return 1
+}
+fix_llmnr() {
+  keep_copy "$RESOLVED_DROPIN"
+  mkdir -p "${RESOLVED_DROPIN%/*}" && ( umask 022; llmnr_text > "$RESOLVED_DROPIN" ) || return 1
+  log "  restarting systemd-resolved (name lookups on this host pause for a moment)"
+  systemctl restart systemd-resolved
 }
 
 item_main "$@"
