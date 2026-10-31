@@ -5,7 +5,7 @@
 
 [harden]
 remove_accounts = []          # e.g. ["fedora"]: the cloud image's default user
-remove_files = []             # e.g. ["/etc/sudoers.d/90-cloud-init-users"]
+remove_files = []             # files or folders, e.g. ["/etc/sudoers.d/90-cloud-init-users"]
 permit_root_login = ""        # "no" to forbid root over SSH
 
 [k8s]

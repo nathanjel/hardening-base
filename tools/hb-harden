@@ -8,8 +8,8 @@
 #   hb harden check         one-line verdict (exit 0 ok, 1 pending, 2 broken)
 #
 # Config ([harden] in hb.toml): remove_accounts, remove_files, permit_root_login.
-# Every file it changes or removes is copied to /var/lib/hb/backup/<run>/ first;
-# a deleted account's home is kept there as a tarball.
+# Every file or folder it changes or removes is copied to /var/lib/hb/backup/<run>/
+# first; a deleted account's home is kept there as a tarball.
 set -u
 source "$(dirname "$(readlink -f "$0")")/../lib/hb.sh"
 need_root
@@ -22,18 +22,29 @@ mapfile -t REMOVE_FILES < <(cfg harden.remove_files)
 mapfile -t REMOVE_ACCOUNTS < <(cfg harden.remove_accounts)
 ROOT_LOGIN="$(cfg harden.permit_root_login)"
 
-# --- files: paths that must not exist -------------------------------------------
+# --- files: files and folders that must not exist -------------------------------
+# Folders go too, with what's in them; a symlink is removed, never what it points to.
+# Paths must be absolute, already normalised and at least two levels deep: never /,
+# /etc or a relative a/b.
+exists() { [ -e "$1" ] || [ -L "$1" ]; }
+safe_path() { [[ $1 == /?*/?* ]] && [ "$(realpath -ms -- "$1")" = "$1" ]; }
 chk_files() {
   local f present=()
-  for f in "${REMOVE_FILES[@]}"; do [ -e "$f" ] && present+=("$f"); done
-  [ ${#present[@]} -eq 0 ] && { echo "none of ${#REMOVE_FILES[@]} listed files present"; return 0; }
+  for f in "${REMOVE_FILES[@]}"; do
+    safe_path "$f" || { echo "harden.remove_files: $f is not a normalised path two levels deep"; return 2; }
+    exists "$f" || continue
+    if [ -d "$f" ] && [ ! -L "$f" ]; then present+=("$f ($(du -sh "$f" 2>/dev/null | cut -f1))")
+    else present+=("$f"); fi
+  done
+  [ ${#present[@]} -eq 0 ] && { echo "none of ${#REMOVE_FILES[@]} listed paths present"; return 0; }
   echo "will move away: ${present[*]}"; return 1
 }
 fix_files() {
   local f sudoers=0
   for f in "${REMOVE_FILES[@]}"; do
-    [ -e "$f" ] || continue
-    keep_copy "$f" && rm -f -- "$f" || return 1
+    exists "$f" || continue
+    safe_path "$f" || return 1
+    keep_copy "$f" && rm -rf --one-file-system -- "$f" || return 1
     [[ $f == /etc/sudoers* ]] && sudoers=1
   done
   if [ $sudoers = 1 ] && ! visudo -cq; then

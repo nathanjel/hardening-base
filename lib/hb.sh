@@ -31,7 +31,7 @@ cfg() { "$HB_ROOT/tools/hb-config" get "$1"; }
 # keep_copy FILE — save FILE under /var/lib/hb/backup/<run>/ before changing it.
 keep_copy() {
   local f="$1" d="$HB_STATE/backup/$HB_RUN"
-  [ -e "$f" ] || return 0
+  [ -e "$f" ] || [ -L "$f" ] || return 0
   mkdir -p "$d$(dirname "$f")" && cp -a "$f" "$d$f"
 }
 
