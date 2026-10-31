@@ -53,18 +53,30 @@ chk_accounts() {
   [ ${#present[@]} -eq 0 ] && { echo "none of ${#REMOVE_ACCOUNTS[@]} listed accounts exist"; return 0; }
   echo "will delete: ${present[*]}"; return 1
 }
+# host_procs USER — the user's processes that share the host's root directory.
+# Containers running under the same numeric uid have their own root and don't
+# count; userdel skips them the same way.
+host_procs() {
+  local pid root
+  root="$(stat -c %d:%i /)"
+  for pid in $(pgrep -u "$1"); do
+    [ "$(stat -L -c %d:%i "/proc/$pid/root" 2>/dev/null)" = "$root" ] && echo "$pid"
+  done
+}
 fix_accounts() {
-  local u home d="$HB_STATE/backup/$HB_RUN"
+  local u home procs failed=0 d="$HB_STATE/backup/$HB_RUN"
   for u in "${REMOVE_ACCOUNTS[@]}"; do
     getent passwd "$u" >/dev/null || continue
-    if pgrep -u "$u" >/dev/null; then log "$u still has running processes; not deleting"; return 1; fi
+    procs="$(host_procs "$u" | tr '\n' ' ')"
+    if [ -n "$procs" ]; then log "  $u still has processes on the host (pids $procs); not deleting"; failed=1; continue; fi
     home="$(getent passwd "$u" | cut -d: -f6)"
     mkdir -p "$d"
     [ -d "$home" ] && tar -C / -czf "$d/home-$u.tar.gz" "${home#/}"
     userdel -r "$u" 2>&1 | grep -v 'mail spool' >&2
-    getent passwd "$u" >/dev/null && { log "userdel failed for $u"; return 1; }
+    if getent passwd "$u" >/dev/null; then log "  userdel failed for $u"; failed=1; continue; fi
     log "  deleted $u; home kept in $d/home-$u.tar.gz"
   done
+  return $failed
 }
 
 # --- root_login: sshd PermitRootLogin ------------------------------------------
