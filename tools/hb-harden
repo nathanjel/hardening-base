@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# hb-harden — host settings that close doors: unwanted accounts, stray files
+# (root's keys, cloud-init sudo rules), root login over SSH, NOPASSWD audit.
+#
+#   hb harden status        one line per item
+#   hb harden plan          what apply would change (changes nothing)
+#   hb harden apply [--yes] make the changes, asking before each item
+#   hb harden check         one-line verdict (exit 0 ok, 1 pending, 2 broken)
+#
+# Config ([harden] in hb.toml): remove_accounts, remove_files, permit_root_login.
+# Every file it changes or removes is copied to /var/lib/hb/backup/<run>/ first;
+# a deleted account's home is kept there as a tarball.
+set -u
+source "$(dirname "$(readlink -f "$0")")/../lib/hb.sh"
+need_root
+need_config
+
+ITEMS=(files accounts root_login nopasswd)
+SSHD_DROPIN=/etc/ssh/sshd_config.d/10-hb-harden.conf
+
+mapfile -t REMOVE_FILES < <(cfg harden.remove_files)
+mapfile -t REMOVE_ACCOUNTS < <(cfg harden.remove_accounts)
+ROOT_LOGIN="$(cfg harden.permit_root_login)"
+
+# --- files: paths that must not exist -------------------------------------------
+chk_files() {
+  local f present=()
+  for f in "${REMOVE_FILES[@]}"; do [ -e "$f" ] && present+=("$f"); done
+  [ ${#present[@]} -eq 0 ] && { echo "none of ${#REMOVE_FILES[@]} listed files present"; return 0; }
+  echo "will move away: ${present[*]}"; return 1
+}
+fix_files() {
+  local f sudoers=0
+  for f in "${REMOVE_FILES[@]}"; do
+    [ -e "$f" ] || continue
+    keep_copy "$f" && rm -f -- "$f" || return 1
+    [[ $f == /etc/sudoers* ]] && sudoers=1
+  done
+  if [ $sudoers = 1 ] && ! visudo -cq; then
+    log "visudo reports an error after the change; restore from $HB_STATE/backup/$HB_RUN"
+    return 1
+  fi
+}
+
+# --- accounts: login accounts that must not exist -------------------------------
+chk_accounts() {
+  local u home present=()
+  for u in "${REMOVE_ACCOUNTS[@]}"; do
+    getent passwd "$u" >/dev/null || continue
+    home="$(getent passwd "$u" | cut -d: -f6)"
+    present+=("$u ($home, $(du -sh "$home" 2>/dev/null | cut -f1))")
+  done
+  [ ${#present[@]} -eq 0 ] && { echo "none of ${#REMOVE_ACCOUNTS[@]} listed accounts exist"; return 0; }
+  echo "will delete: ${present[*]}"; return 1
+}
+fix_accounts() {
+  local u home d="$HB_STATE/backup/$HB_RUN"
+  for u in "${REMOVE_ACCOUNTS[@]}"; do
+    getent passwd "$u" >/dev/null || continue
+    if pgrep -u "$u" >/dev/null; then log "$u still has running processes; not deleting"; return 1; fi
+    home="$(getent passwd "$u" | cut -d: -f6)"
+    mkdir -p "$d"
+    [ -d "$home" ] && tar -C / -czf "$d/home-$u.tar.gz" "${home#/}"
+    userdel -r "$u" 2>&1 | grep -v 'mail spool' >&2
+    getent passwd "$u" >/dev/null && { log "userdel failed for $u"; return 1; }
+    log "  deleted $u; home kept in $d/home-$u.tar.gz"
+  done
+}
+
+# --- root_login: sshd PermitRootLogin ------------------------------------------
+chk_root_login() {
+  [ -z "$ROOT_LOGIN" ] && { echo "not managed"; return 0; }
+  local have
+  have="$(sshd -T 2>/dev/null | awk '$1 == "permitrootlogin" {print $2}')"
+  [ "$have" = "$ROOT_LOGIN" ] && { echo "PermitRootLogin $have"; return 0; }
+  echo "PermitRootLogin $have → $ROOT_LOGIN (via $SSHD_DROPIN)"; return 1
+}
+fix_root_login() {
+  keep_copy "$SSHD_DROPIN"
+  printf '# Managed by hb-harden. Files here are read in name order and the first\n# value wins, so this one sorts before the distribution defaults.\nPermitRootLogin %s\n' \
+    "$ROOT_LOGIN" > "$SSHD_DROPIN"
+  chmod 600 "$SSHD_DROPIN"
+  if ! sshd -t; then
+    log "sshd -t rejected the config; removing $SSHD_DROPIN"
+    rm -f "$SSHD_DROPIN"
+    return 1
+  fi
+  systemctl reload sshd
+}
+
+# --- nopasswd: report sudo rules without a password -----------------------------
+chk_nopasswd() {
+  local f hits=() listed
+  for f in /etc/sudoers /etc/sudoers.d/*; do
+    [ -f "$f" ] && grep -qE '^[^#]*NOPASSWD' "$f" || continue
+    listed=0
+    for r in "${REMOVE_FILES[@]}"; do [ "$f" = "$r" ] && listed=1; done
+    [ $listed = 0 ] && hits+=("$f")
+  done
+  [ ${#hits[@]} -eq 0 ] && { echo "no NOPASSWD rules outside files listed for removal"; return 0; }
+  echo "NOPASSWD rules in ${hits[*]}: review by hand"; return 2
+}
+
+item_main "$@"

@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# hb-k8s — microk8s plug-in: keep NodePorts off public addresses, and keep
+# service-account tokens out of pods that never talk to the Kubernetes API.
+#
+#   hb k8s status        one line per item
+#   hb k8s plan          what apply would change (changes nothing)
+#   hb k8s apply [--yes] make the changes, asking before each item
+#   hb k8s check         one-line verdict (exit 0 ok, 1 pending, 2 broken)
+#
+# Items come in pairs: the setting, then whether it is live.
+#   nodeport       --nodeport-addresses in kube-proxy's args file
+#   nodeport_live  kube-proxy's rules match it (fix: restart kubelite, or reboot)
+#   tokens         the default service account in each listed namespace doesn't mount tokens
+#   tokens_live    no running pod there still carries one (fix: recreate the pods,
+#                  only when busy.d says nothing is in progress)
+#
+# Config ([k8s] in hb.toml): nodeport_addresses, token_off_namespaces.
+set -u
+source "$(dirname "$(readlink -f "$0")")/../lib/hb.sh"
+need_root
+need_config
+
+[ "$(cfg k8s.flavour)" = microk8s ] || die "only microk8s is supported"
+command -v /snap/bin/microk8s >/dev/null || { echo "ok: microk8s not installed"; exit 0; }
+
+ITEMS=(nodeport nodeport_live tokens tokens_live)
+ARGS=/var/snap/microk8s/current/args/kube-proxy
+k() { /snap/bin/microk8s kubectl "$@"; }
+
+mapfile -t NODEPORT_ADDRS < <(cfg k8s.nodeport_addresses)
+mapfile -t TOKEN_OFF_NS < <(cfg k8s.token_off_namespaces)
+WANT_NODEPORT="--nodeport-addresses=$(IFS=,; echo "${NODEPORT_ADDRS[*]}")"
+
+# --- nodeport -------------------------------------------------------------------
+chk_nodeport() {
+  [ ${#NODEPORT_ADDRS[@]} -eq 0 ] && { echo "not managed"; return 0; }
+  grep -qxF -- "$WANT_NODEPORT" "$ARGS" && { echo "$WANT_NODEPORT"; return 0; }
+  local now
+  now="$(grep -- '^--nodeport-addresses=' "$ARGS" || echo "not set (every local address)")"
+  echo "$now → $WANT_NODEPORT"; return 1
+}
+fix_nodeport() {
+  keep_copy "$ARGS"
+  sed -i '/^--nodeport-addresses=/d' "$ARGS" && echo "$WANT_NODEPORT" >> "$ARGS"
+  log "  written; takes effect when kubelite restarts (next item) or at reboot"
+}
+
+chk_nodeport_live() {
+  [ ${#NODEPORT_ADDRS[@]} -eq 0 ] && { echo "not managed"; return 0; }
+  local jump
+  jump="$(iptables-save -t nat 2>/dev/null | grep -E -- '^-A KUBE-SERVICES .*-j KUBE-NODEPORTS')"
+  [ -z "$jump" ] && { echo "no NodePort rules found; is kube-proxy running?"; return 2; }
+  if grep -q -- '--dst-type LOCAL' <<<"$jump"; then
+    echo "NodePorts answer on every local address, the public IP included"; return 1
+  fi
+  echo "NodePorts only on: $(grep -oE -- '-d [0-9./]+' <<<"$jump" | cut -d' ' -f2 | tr '\n' ' ')"
+}
+fix_nodeport_live() {
+  chk_nodeport >/dev/null || { log "apply nodeport first"; return 1; }
+  log "  restarting kubelite (API down for about a minute; running pods keep running)"
+  snap restart microk8s.daemon-kubelite || return 1
+  wait_node_ready
+}
+
+wait_node_ready() {
+  local i
+  for i in $(seq 60); do
+    k get nodes --no-headers 2>/dev/null | grep -qw Ready && return 0
+    sleep 3
+  done
+  log "  node not Ready after 3 minutes"; return 1
+}
+
+# --- tokens ---------------------------------------------------------------------
+chk_tokens() {
+  [ ${#TOKEN_OFF_NS[@]} -eq 0 ] && { echo "not managed"; return 0; }
+  local ns val pending=()
+  for ns in "${TOKEN_OFF_NS[@]}"; do
+    val="$(k get serviceaccount default -n "$ns" -o jsonpath='{.automountServiceAccountToken}' 2>/dev/null)" \
+      || { echo "namespace $ns: cannot read its default service account"; return 2; }
+    [ "$val" = false ] || pending+=("$ns")
+  done
+  [ ${#pending[@]} -eq 0 ] && { echo "token mounting off in: ${TOKEN_OFF_NS[*]}"; return 0; }
+  echo "default service account mounts tokens in: ${pending[*]}"; return 1
+}
+fix_tokens() {
+  local ns
+  for ns in "${TOKEN_OFF_NS[@]}"; do
+    k patch serviceaccount default -n "$ns" -p '{"automountServiceAccountToken": false}' >/dev/null || return 1
+  done
+  log "  pods pick this up when they are recreated (next item)"
+}
+
+# pods_with_token NS — running pods in NS that have a service-account token volume
+pods_with_token() {
+  k get pods -n "$1" --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.volumes[*].projected.sources[*].serviceAccountToken.path}{"\n"}{end}' \
+    | awk 'NF > 1 {print $1}'
+}
+
+chk_tokens_live() {
+  [ ${#TOKEN_OFF_NS[@]} -eq 0 ] && { echo "not managed"; return 0; }
+  local ns n total=0 where=()
+  for ns in "${TOKEN_OFF_NS[@]}"; do
+    n="$(pods_with_token "$ns" | wc -l)"
+    [ "$n" -gt 0 ] && { where+=("$ns:$n"); total=$((total + n)); }
+  done
+  [ $total -eq 0 ] && { echo "no running pod carries a token in: ${TOKEN_OFF_NS[*]}"; return 0; }
+  echo "$total running pods still carry a token (${where[*]})"; return 1
+}
+fix_tokens_live() {
+  chk_tokens >/dev/null || { log "apply tokens first"; return 1; }
+  local why ns d
+  if ! why="$(hb_busy)"; then log "  not now: $why"; return 1; fi
+  for ns in "${TOKEN_OFF_NS[@]}"; do
+    [ -n "$(pods_with_token "$ns")" ] || continue
+    for d in $(k get deploy -n "$ns" -o jsonpath='{.items[*].metadata.name}'); do
+      restart_deploy "$ns" "$d" || return 1
+    done
+  done
+  # old pods count as Running until they finish terminating
+  local i
+  for i in $(seq 30); do
+    chk_tokens_live >/dev/null && return 0
+    sleep 2
+  done
+}
+
+# restart_deploy NS NAME — recreate a deployment's pods without ever running two
+# copies against a ReadWriteOnce volume: those get scaled to 0 and back unless
+# the deployment already uses the Recreate strategy.
+restart_deploy() {
+  local ns="$1" d="$2" strategy replicas claim rwo=0 sel i
+  strategy="$(k get deploy "$d" -n "$ns" -o jsonpath='{.spec.strategy.type}')"
+  for claim in $(k get deploy "$d" -n "$ns" -o jsonpath='{.spec.template.spec.volumes[*].persistentVolumeClaim.claimName}'); do
+    k get pvc "$claim" -n "$ns" -o jsonpath='{.spec.accessModes[*]}' | grep -qw ReadWriteOnce && rwo=1
+  done
+  if [ "$strategy" != Recreate ] && [ $rwo = 1 ]; then
+    log "  $ns/$d: ReadWriteOnce volume with $strategy, so scaling to 0 and back"
+    replicas="$(k get deploy "$d" -n "$ns" -o jsonpath='{.spec.replicas}')"
+    sel="$(k get deploy "$d" -n "$ns" -o go-template='{{range $k, $v := .spec.selector.matchLabels}}{{$k}}={{$v}},{{end}}')"
+    k scale deploy "$d" -n "$ns" --replicas=0 >/dev/null || return 1
+    for i in $(seq 90); do
+      [ -z "$(k get pods -n "$ns" -l "${sel%,}" -o name 2>/dev/null)" ] && break
+      sleep 2
+    done
+    k scale deploy "$d" -n "$ns" --replicas="$replicas" >/dev/null || return 1
+  else
+    log "  $ns/$d: rollout restart ($strategy)"
+    k rollout restart deploy "$d" -n "$ns" >/dev/null || return 1
+  fi
+  k rollout status deploy "$d" -n "$ns" --timeout=300s >/dev/null || { log "  $ns/$d did not become ready"; return 1; }
+}
+
+item_main "$@"

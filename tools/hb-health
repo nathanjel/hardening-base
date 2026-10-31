@@ -1,0 +1,214 @@
+#!/usr/bin/python3 -IB
+"""hb-health — is the box healthy right now?
+
+  hb health status   one line per check
+  hb health check    one-line verdict (exit 0 ok, 1 warn, 2 fail)
+
+Run with sudo: btrfs device errors are root-only (skipped otherwise).
+Config ([health] in hb.toml): containers, urls, mounts, registry,
+asterisk_container, disk_warn_pct, disk_fail_pct.
+"""
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+from hbkit import config  # noqa: E402
+
+OK, WARN, FAIL, SKIP = 0, 1, 2, -1
+WORDS = {OK: "ok", WARN: "warn", FAIL: "FAIL", SKIP: "skip"}
+KUBECTL = ["/snap/bin/microk8s", "kubectl"]
+
+
+def run(*cmd, timeout=30):
+    """(exit code, stdout) of a command; 127 when missing, 124 on timeout."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout
+    except FileNotFoundError:
+        return 127, ""
+    except subprocess.TimeoutExpired:
+        return 124, ""
+
+
+def check_reboot(cfg):
+    running = os.uname().release
+    rc, out = run("rpm", "-q", "--last", "kernel-core")
+    newest = out.split()[0].removeprefix("kernel-core-") if rc == 0 and out else running
+    rc, _ = run("dnf", "needs-restarting", "-r", timeout=60)
+    if newest != running:
+        return WARN, f"running kernel {running}, newest installed {newest}"
+    if rc == 1:
+        return WARN, "updated system libraries need a reboot"
+    return OK, f"kernel {running}"
+
+
+def check_raid(cfg):
+    try:
+        mdstat = open("/proc/mdstat").read()
+    except OSError:
+        return SKIP, "no /proc/mdstat"
+    arrays = re.findall(r"^(md\d+) : .*?\[([U_]+)\]", mdstat, re.M | re.S)
+    if not arrays:
+        return OK, "no md arrays"
+    bad = [name for name, state in arrays if "_" in state]
+    if bad:
+        return FAIL, "degraded: " + " ".join(bad)
+    return OK, " ".join(f"{name}[{state}]" for name, state in arrays)
+
+
+def check_btrfs(cfg):
+    if os.geteuid() != 0:
+        return SKIP, "needs root"
+    rc, out = run("btrfs", "device", "stats", "-c", "/")
+    if rc == 127:
+        return SKIP, "btrfs-progs not installed"
+    if rc == 0:
+        return OK, "no device errors"
+    errors = [ln.strip() for ln in out.splitlines() if not ln.rstrip().endswith(" 0")]
+    return FAIL, "; ".join(errors) or "btrfs device stats reported errors"
+
+
+def check_disk(cfg):
+    du = shutil.disk_usage("/")
+    pct = round(du.used * 100 / du.total)
+    detail = f"/ {pct}% used, {du.free // 2**30} GiB free"
+    if pct >= cfg["disk_fail_pct"]:
+        return FAIL, detail
+    if pct >= cfg["disk_warn_pct"]:
+        return WARN, detail
+    return OK, detail
+
+
+def check_mounts(cfg):
+    if not cfg["mounts"]:
+        return SKIP, "none configured"
+    # Read the mount table instead of stat()ing: a dead hard NFS mount would hang us.
+    mounted = {line.split()[1] for line in open("/proc/self/mounts")}
+    missing = [m for m in cfg["mounts"] if m not in mounted]
+    if missing:
+        return FAIL, "not mounted: " + " ".join(missing)
+    return OK, " ".join(cfg["mounts"])
+
+
+def check_containers(cfg):
+    if not cfg["containers"]:
+        return SKIP, "none configured"
+    rc, out = run("docker", "inspect", "-f", "{{.Name}} {{.State.Running}}", *cfg["containers"])
+    running = {ln.split()[0].lstrip("/") for ln in out.splitlines() if ln.endswith(" true")}
+    down = [c for c in cfg["containers"] if c not in running]
+    if down:
+        return FAIL, "not running: " + " ".join(down)
+    return OK, " ".join(cfg["containers"])
+
+
+def check_k8s(cfg):
+    if not os.path.exists(KUBECTL[0]):
+        return SKIP, "microk8s not installed"
+    rc, out = run(*KUBECTL, "get", "nodes", "--no-headers")
+    if rc != 0:
+        return FAIL, "API not answering"
+    if any(ln.split()[1] != "Ready" for ln in out.splitlines()):
+        return FAIL, "node not Ready"
+    rc, out = run(*KUBECTL, "get", "pods", "-A", "--no-headers")
+    bad = []
+    for ln in out.splitlines():
+        ns, name, ready, status = ln.split()[:4]
+        have, want = ready.split("/")
+        if status == "Completed":
+            continue
+        if status != "Running" or have != want:
+            bad.append(f"{ns}/{name} {status} {ready}")
+    if bad:
+        return FAIL, "; ".join(bad)
+    return OK, f"node Ready, {len(out.splitlines())} pods fine"
+
+
+def http_status(url):
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            return r.status, ""
+    except urllib.error.HTTPError as e:
+        return e.code, ""
+    except (urllib.error.URLError, OSError) as e:
+        return 0, str(getattr(e, "reason", e))
+
+
+def check_urls(cfg):
+    if not cfg["urls"]:
+        return SKIP, "none configured"
+    bad = []
+    for url in cfg["urls"]:
+        code, why = http_status(url)
+        if code == 0 or code >= 500:
+            bad.append(f"{url} {code or why}")
+    if bad:
+        return FAIL, "; ".join(bad)
+    return OK, f"{len(cfg['urls'])} sites answer (TLS verified)"
+
+
+def check_registry(cfg):
+    if not cfg["registry"]:
+        return SKIP, "none configured"
+    code, why = http_status(cfg["registry"])
+    if code == 200:
+        return OK, cfg["registry"]
+    return FAIL, f"{cfg['registry']} {code or why}"
+
+
+def check_asterisk(cfg):
+    c = cfg["asterisk_container"]
+    if not c:
+        return SKIP, "none configured"
+    rc, out = run("docker", "exec", c, "asterisk", "-rx", "pjsip show registrations")
+    if rc != 0:
+        return FAIL, f"cannot reach Asterisk in {c}"
+    rows = [ln for ln in out.splitlines() if re.search(r"\b(Registered|Unregistered|Rejected|Failed|Stopped)\b", ln)]
+    down = [ln.split()[0] for ln in rows if " Registered " not in f" {ln} "]
+    if down:
+        return FAIL, "trunk not registered: " + " ".join(down)
+    return OK, f"{len(rows)} trunk registration(s) up"
+
+
+CHECKS = [
+    ("reboot", check_reboot),
+    ("raid", check_raid),
+    ("btrfs", check_btrfs),
+    ("disk", check_disk),
+    ("mounts", check_mounts),
+    ("containers", check_containers),
+    ("k8s", check_k8s),
+    ("sites", check_urls),
+    ("registry", check_registry),
+    ("asterisk", check_asterisk),
+]
+
+
+def main(argv):
+    verb = argv[1] if len(argv) > 1 else "status"
+    if verb not in ("status", "check"):
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    cfg = config.load()["health"]
+    results = []
+    for name, fn in CHECKS:
+        try:
+            sev, detail = fn(cfg)
+        except Exception as e:  # a broken check must not hide the others
+            sev, detail = FAIL, f"check crashed: {e.__class__.__name__}: {e}"
+        results.append((name, sev, detail))
+        if verb == "status":
+            print(f"{WORDS[sev]:5} {name:11} {detail}", flush=True)
+    worst = max([sev for _, sev, _ in results] + [OK])
+    if verb == "check":
+        names = lambda s: " ".join(n for n, sev, _ in results if sev == s)  # noqa: E731
+        print("fail: " + names(FAIL) if worst == FAIL else "warn: " + names(WARN) if worst == WARN else "ok")
+    return worst
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

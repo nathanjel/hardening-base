@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# hb-snapshot — read-only btrfs snapshots of / to take before risky changes.
+# A snapshot costs almost nothing at first and grows as files change after it.
+#
+#   hb snapshot create LABEL   e.g. hb snapshot create phase1
+#   hb snapshot list
+#   hb snapshot prune [--yes]  delete snapshots older than snapshot.keep_days
+#   hb snapshot check          warn when old snapshots are waiting to be pruned
+#
+# Snapshots live in snapshot.dir (default /.hb-snapshots), named LABEL-YYYYmmdd-HHMM.
+# To get a file back: cp -a /.hb-snapshots/<name>/etc/whatever /etc/whatever
+set -u
+source "$(dirname "$(readlink -f "$0")")/../lib/hb.sh"
+need_root
+need_config
+
+DIR="$(cfg snapshot.dir)"
+KEEP_DAYS="$(cfg snapshot.keep_days)"
+
+# Age comes from the name: a snapshot's own mtime is that of / when it was taken.
+old_snapshots() {
+  [ -d "$DIR" ] || return 0
+  local cutoff s stamp
+  cutoff="$(date -d "-$KEEP_DAYS days" +%Y%m%d%H%M)"
+  for s in "$DIR"/*-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]; do
+    [ -d "$s" ] || continue
+    stamp="${s: -13}"; stamp="${stamp/-/}"
+    [ "$stamp" -lt "$cutoff" ] && printf '%s\n' "$s"
+  done
+}
+
+case "${1:-list}" in
+  create)
+    label="${2:-}"
+    [[ $label =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "usage: hb snapshot create LABEL (lowercase letters, digits, dashes)"
+    [ "$(stat -f -c %T /)" = btrfs ] || die "/ is not btrfs"
+    mkdir -p "$DIR"
+    btrfs subvolume snapshot -r / "$DIR/$label-$(date +%Y%m%d-%H%M)"
+    ;;
+  list)
+    [ -d "$DIR" ] || { echo "no snapshots"; exit 0; }
+    find "$DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
+    ;;
+  prune)
+    [ "${2:-}" = --yes ] && HB_YES=1
+    mapfile -t old < <(old_snapshots)
+    [ ${#old[@]} -eq 0 ] && { echo "nothing older than $KEEP_DAYS days"; exit 0; }
+    printf '  %s\n' "${old[@]}"
+    confirm "delete these ${#old[@]} snapshots?" || exit 1
+    for s in "${old[@]}"; do btrfs subvolume delete "$s"; done
+    ;;
+  check)
+    n="$(old_snapshots | wc -l)"
+    if [ "$n" -gt 0 ]; then echo "warn: $n snapshots older than $KEEP_DAYS days (hb snapshot prune)"; exit 1; fi
+    echo "ok: $(find "$DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l) snapshots"
+    ;;
+  help|-h|--help) sed -n '2,/^$/s/^# \{0,1\}//p' "$0" ;;
+  *) die "unknown verb '$1' (create, list, prune, check)" ;;
+esac

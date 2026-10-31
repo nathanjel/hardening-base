@@ -1,0 +1,5 @@
+# host-specific config, notes and inventory output never go into git
+/hb.toml
+/local/
+/phase0/out/
+__pycache__/

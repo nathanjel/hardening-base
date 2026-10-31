@@ -1,0 +1,26 @@
+# hb configuration. Copy to /etc/hb/hb.toml (owned by root) or, while trying
+# things out, to hb.toml in the checkout. Anything left out keeps its default,
+# and every default means "don't touch": empty lists, "" for not managed.
+
+[harden]
+remove_accounts = []          # e.g. ["fedora"]: the cloud image's default user
+remove_files = []             # e.g. ["/etc/sudoers.d/90-cloud-init-users"]
+permit_root_login = ""        # "no" to forbid root over SSH
+
+[k8s]
+flavour = "microk8s"          # the only one supported
+nodeport_addresses = []       # e.g. ["127.0.0.0/8"]: NodePorts on localhost only
+token_off_namespaces = []     # namespaces whose pods never call the Kubernetes API
+
+[health]
+containers = []               # docker containers that must be running
+urls = []                     # sites that must answer over verified TLS (status < 500)
+mounts = []                   # mount points that must be mounted
+registry = ""                 # e.g. "http://localhost:32000/v2/"
+asterisk_container = ""       # checks trunk registrations; busy.d checks calls
+disk_warn_pct = 80
+disk_fail_pct = 90
+
+[snapshot]
+dir = "/.hb-snapshots"
+keep_days = 14

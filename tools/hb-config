@@ -1,0 +1,80 @@
+#!/usr/bin/python3 -IB
+"""hb-config — show and read hb's configuration.
+
+  hb config get KEY   print a value; lists print one item per line (exit 1 if unknown)
+  hb config path      print the host file in use
+  hb config show      print the merged configuration
+  hb config check     parse the host file and flag unknown keys (exit 0 ok, 1 warn, 2 fail)
+"""
+import os
+import sys
+import tomllib
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+from hbkit import config  # noqa: E402
+
+
+def emit(val):
+    if isinstance(val, list):
+        for item in val:
+            print(item)
+    elif isinstance(val, bool):
+        print("true" if val else "false")
+    else:
+        print(val)
+
+
+def show(cfg, prefix=""):
+    for key, val in cfg.items():
+        if isinstance(val, dict):
+            show(val, f"{prefix}{key}.")
+        else:
+            print(f"{prefix}{key} = {val!r}")
+
+
+def check():
+    p = config.path()
+    if not p:
+        print("warn: no host file; defaults only, which manage nothing")
+        return 1
+    try:
+        data = config.read_host_file()
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        print(f"fail: {p}: {e}")
+        return 2
+    notes = []
+    unknown = config.unknown_keys(data)
+    if unknown:
+        notes.append("unknown keys " + ", ".join(unknown))
+    if os.geteuid() == 0 and os.stat(p).st_uid != 0:
+        notes.append(f"{p} isn't owned by root, yet root acts on it")
+    if notes:
+        print(f"warn: {'; '.join(notes)}")
+        return 1
+    print(f"ok: {p}")
+    return 0
+
+
+def main(argv):
+    verb = argv[1] if len(argv) > 1 else "show"
+    if verb == "get" and len(argv) == 3:
+        try:
+            emit(config.get(config.load(), argv[2]))
+        except KeyError:
+            print(f"hb-config: unknown key {argv[2]}", file=sys.stderr)
+            return 1
+        return 0
+    if verb == "path":
+        print(config.path() or "(none: defaults only)")
+        return 0
+    if verb == "show":
+        show(config.load())
+        return 0
+    if verb == "check":
+        return check()
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
