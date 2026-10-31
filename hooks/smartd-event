@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# smartd runs this (-M exec in smartd.conf) with the details in its environment;
+# see SMARTD_* under -M exec in smartd.conf(5). Temperature is a warn (banner);
+# anything else smartd reports about a drive is a fail (SMS).
+type="${SMARTD_FAILTYPE:-unknown}"
+dev="${SMARTD_DEVICESTRING:-${SMARTD_DEVICE:-?}}"
+case "$type" in
+  EmailTest) level=info ;;
+  Temperature) level=warn ;;
+  *) level=fail ;;
+esac
+exec "$(dirname "$(readlink -f "$0")")/../hb" notify send "$level" "smartd.$type" \
+  "$dev: ${SMARTD_MESSAGE:-no details}"

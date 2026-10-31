@@ -1,6 +1,7 @@
-# hb configuration. Copy to /etc/hb/hb.toml (owned by root) or, while trying
-# things out, to hb.toml in the checkout. Anything left out keeps its default,
-# and every default means "don't touch": empty lists, "" for not managed.
+# hb configuration. Copy to hb.toml in the checkout; `hb install apply` then
+# copies it to /etc/hb/hb.toml (root's, mode 600), which every tool reads from
+# then on. Anything left out keeps its default, and every default means "don't
+# touch": empty lists, false, and "" for not managed.
 
 [harden]
 remove_accounts = []          # e.g. ["fedora"]: the cloud image's default user
@@ -20,7 +21,52 @@ registry = ""                 # e.g. "http://localhost:32000/v2/"
 asterisk_container = ""       # checks trunk registrations; busy.d checks calls
 disk_warn_pct = 80
 disk_fail_pct = 90
+reboot_fail_days = 7          # a newer kernel waiting this long counts as a failure
+cert_warn_days = 14           # warn when a site's certificate expires sooner
+nvme_wear_warn_pct = 80       # warn when an NVMe drive reports this much wear
 
 [snapshot]
 dir = "/.hb-snapshots"
 keep_days = 14
+
+[install]
+timers = []                   # e.g. ["hb-status", "hb-backup", "hb-backup-maintain", "hb-clean"]
+
+[notify]
+sms_command = []              # argv that gets the text on stdin and exits 0 once queued,
+                              # e.g. ["/usr/local/bin/send-sms", "<your number>"]; empty: banner only
+sms_per_day = 5               # at most this many SMS in 24 hours
+repeat_hours = 24             # the same alert again only after this long
+retry_minutes = 60            # keep retrying an SMS that can't go out for this long
+
+[alerts]
+mdadm = false                 # true: mdmonitor reports RAID events through hb-notify
+smartd = false                # true: install smartd and have it report through hb-notify
+
+[backup]
+repo = ""                     # e.g. "/mnt/backup/restic"; nothing runs while empty
+password_file = "/etc/hb/secrets/restic-password"   # created by hb backup init
+require_mount = ""            # e.g. "/mnt/backup": refuse to run unless this is mounted
+paths = []                    # e.g. ["/etc", "/root", "/home", "/usr/local", "/var/lib/hb"]
+exclude = []                  # restic patterns, e.g. ["/home/*/.cache", "node_modules"]
+exclude_if_present = [".hb-nobackup"]   # skip the contents of folders holding this file
+keep_daily = 7
+keep_weekly = 5
+keep_monthly = 12
+warn_hours = 26               # warn when the last good backup is older
+fail_hours = 50               # fail (SMS) when it is older: two nights missed
+read_data_percent = 10        # share of the data read back in the first week of each month
+
+[clean]
+dry_run = true                # report only; set false once the reports look right
+users = []                    # whose ~/.cache to clean
+project_roots = []            # where to look for idle git repos
+idle_days = 14
+venv_idle_days = 90
+build_dirs = ["target", "build", "dist", "__pycache__", ".pytest_cache", ".mypy_cache", "cmake-build-*", "node_modules"]
+cache_idle_days = 30
+docker = false                # true: prune stopped containers, old unused images, build cache
+docker_container_days = 7
+docker_image_days = 14
+docker_build_cache = "15GB"
+heavy_weekday = 6             # docker cleanup day once live: 1 = Monday ... 7 = Sunday

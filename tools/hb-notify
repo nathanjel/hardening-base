@@ -1,0 +1,180 @@
+#!/usr/bin/python3 -IB
+"""hb-notify — tell the owner something happened: the login banner always,
+an SMS for failures.
+
+  hb notify send LEVEL KEY TEXT   LEVEL is info, warn or fail; KEY names the
+                                  source, e.g. health.raid or mdadm.Fail
+  hb notify flush                 retry SMS that couldn't go out yet
+  hb notify test                  send a test SMS now
+  hb notify events [N]            the last N events (default 20)
+  hb notify check                 one-line verdict
+
+Only fail sends an SMS: the same KEY at most once per notify.repeat_hours, and
+no more than notify.sms_per_day in 24 hours. An SMS that can't go out is
+retried (hb-status flushes every 15 minutes) for notify.retry_minutes, then
+dropped with an event saying so. Texts are short ASCII status lines built
+from check results; they never carry message, call or file content.
+
+Config ([notify] in hb.toml): sms_command, sms_per_day, repeat_hours,
+retry_minutes. sms_command is an argv list that gets the text on stdin and
+exits 0 once the SMS is queued or sent. Empty means banner only.
+"""
+import json
+import os
+import socket
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+from hbkit import config, util  # noqa: E402
+
+LEVELS = ("info", "warn", "fail")
+KEEP_EVENTS = 500
+SMS_CHARS = 160  # one GSM-7 segment
+
+
+def paths():
+    d = util.state_dir("notify")
+    return {"dir": d, "lock": os.path.join(d, "lock"), "outbox": os.path.join(d, "outbox.json"),
+            "sent": os.path.join(d, "sent.json")}
+
+
+def sms_text(level, key, text):
+    host = socket.gethostname().split(".")[0]
+    line = f"{host} {level.upper()} {key}: {' '.join(text.split())}"
+    line = line.encode("ascii", "replace").decode()
+    return line if len(line) <= SMS_CHARS else line[:SMS_CHARS - 3] + "..."
+
+
+def record(level, key, text):
+    path = util.events_path()
+    events = util.read_events()[-(KEEP_EVENTS - 1):]
+    events.append({"ts": int(time.time()), "level": level, "key": key, "text": text})
+    util.write_atomic(path, "".join(json.dumps(e) + "\n" for e in events))
+
+
+def queue(p, cfg, key, text, force=False):
+    """Put an SMS in the outbox unless KEY was sent or queued within repeat_hours."""
+    now = time.time()
+    outbox = util.read_json(p["outbox"], [])
+    sent = util.read_json(p["sent"], [])
+    window = cfg["repeat_hours"] * 3600
+    recent = [s for s in sent if s["key"] == key and now - s["ts"] < window]
+    if not force and (recent or any(m["key"] == key for m in outbox)):
+        return False
+    outbox.append({"ts": int(now), "key": key, "text": text, "tries": 0, "error": ""})
+    util.write_json(p["outbox"], outbox)
+    return True
+
+
+def flush(p, cfg):
+    """Try every queued SMS once. Returns how many went out."""
+    outbox = util.read_json(p["outbox"], [])
+    if not outbox:
+        return 0
+    now = time.time()
+    sent = [s for s in util.read_json(p["sent"], []) if now - s["ts"] < 7 * 86400]
+    keep, delivered = [], 0
+    for m in outbox:
+        if now - m["ts"] > cfg["retry_minutes"] * 60:
+            record("warn", "notify", f"gave up on the SMS for {m['key']} after {m['tries']} tries: {m['error']}")
+            continue
+        if sum(1 for s in sent if now - s["ts"] < 86400) >= cfg["sms_per_day"]:
+            record("warn", "notify", f"no SMS for {m['key']}: {cfg['sms_per_day']} already sent in 24 h")
+            continue
+        m["tries"] += 1
+        rc, out, err = util.run(*cfg["sms_command"], input=m["text"] + "\n", timeout=60)
+        if rc == 0:
+            sent.append({"ts": int(now), "key": m["key"]})
+            delivered += 1
+        else:
+            m["error"] = (err.strip().splitlines() or [f"exit {rc}"])[-1][:200]
+            keep.append(m)
+    util.write_json(p["outbox"], keep)
+    util.write_json(p["sent"], sent)
+    return delivered
+
+
+def refresh_banner():
+    util.run(util.HB, "status", "banner", timeout=30)
+
+
+def cmd_send(cfg, level, key, text):
+    if level not in LEVELS:
+        print(f"hb-notify: LEVEL must be one of {', '.join(LEVELS)}", file=sys.stderr)
+        return 2
+    p = paths()
+    with util.Lock(p["lock"]):
+        record(level, key, text)
+        if level == "fail" and cfg["sms_command"]:
+            queue(p, cfg, key, sms_text(level, key, text))
+            flush(p, cfg)
+    refresh_banner()
+    return 0
+
+
+def cmd_test(cfg):
+    if not cfg["sms_command"]:
+        print("notify.sms_command is empty: banner only, nothing to test")
+        return 1
+    p = paths()
+    with util.Lock(p["lock"]):
+        record("info", "notify.test", "test SMS requested")
+        queue(p, cfg, "notify.test", sms_text("info", "notify", "test message from hb"), force=True)
+        flush(p, cfg)
+        left = util.read_json(p["outbox"], [])
+    stuck = [m for m in left if m["key"] == "notify.test"]
+    if stuck:
+        print(f"not sent yet ({stuck[-1]['error']}); retried for {cfg['retry_minutes']} minutes")
+        return 1
+    print("sent")
+    return 0
+
+
+def cmd_events(n):
+    for e in util.read_events(n):
+        stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(e["ts"]))
+        print(f"{stamp}  {e['level']:4}  {e['key']:18} {e['text']}")
+    return 0
+
+
+def cmd_check(cfg):
+    if not cfg["sms_command"]:
+        print("ok: banner only (notify.sms_command is empty)")
+        return 0
+    outbox = util.read_json(os.path.join(util.STATE, "notify", "outbox.json"), [])
+    if outbox:
+        print(f"warn: {len(outbox)} SMS waiting to go out (last error: {outbox[-1]['error'] or 'none yet'})")
+        return 1
+    print("ok: SMS for failures, banner for everything")
+    return 0
+
+
+def main(argv):
+    verb = argv[1] if len(argv) > 1 else "events"
+    if verb in ("help", "-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if os.geteuid() != 0:
+        print("error: run with sudo", file=sys.stderr)
+        return 2
+    cfg = config.load()["notify"]
+    if verb == "send" and len(argv) >= 5:
+        return cmd_send(cfg, argv[2], argv[3], " ".join(argv[4:]))
+    if verb == "check":
+        return cmd_check(cfg)
+    if verb == "events":
+        return cmd_events(int(argv[2]) if len(argv) > 2 else 20)
+    if verb == "flush":
+        p = paths()
+        with util.Lock(p["lock"]):
+            flush(p, cfg)
+        return 0
+    if verb == "test":
+        return cmd_test(cfg)
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

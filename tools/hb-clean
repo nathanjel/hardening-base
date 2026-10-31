@@ -1,0 +1,445 @@
+#!/usr/bin/python3 -IB
+"""hb-clean — free disk space from things that can be rebuilt: build output in
+idle projects, stale caches, Docker leftovers.
+
+  hb clean [plan] [TARGET...]        what would go and how much (changes nothing)
+  hb clean apply [--yes] [TARGET...] remove it, asking before each action
+  hb clean auto                      the daily timer: a plan while clean.dry_run is
+                                     true, apply --yes once it is false (docker then
+                                     only on clean.heavy_weekday or when the disk
+                                     passes health.disk_warn_pct)
+  hb clean report                    the last report auto wrote
+  hb clean check                     one line from the last report
+
+Targets:
+  projects  git repos under clean.project_roots untouched for idle_days: run the
+            repo's executable .hb-clean if it has one, else `make clean` if the
+            Makefile has that target (both as the repo's owner), else delete its
+            git-ignored build folders (clean.build_dirs; .venv after venv_idle_days).
+            Only git-ignored folders count, never tracked files, .env* or data/.
+  caches    entries in ~/.cache (and ~/.npm/_cacache) untouched for cache_idle_days,
+            for each of clean.users
+  docker    stopped containers older than docker_container_days, unused images
+            older than docker_image_days, build cache above docker_build_cache.
+            Volumes are listed, never removed. Only with clean.docker = true.
+
+Config ([clean] in hb.toml): dry_run, users, project_roots, idle_days,
+venv_idle_days, build_dirs, cache_idle_days, docker, docker_container_days,
+docker_image_days, docker_build_cache, heavy_weekday (1 = Monday ... 7 = Sunday).
+"""
+import datetime
+import fnmatch
+import json
+import os
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+from hbkit import config, util  # noqa: E402
+
+TARGETS = ("projects", "caches", "docker")
+DAY = 86400
+
+
+class Action:
+    def __init__(self, target, desc, size, fn):
+        self.target, self.desc, self.size, self.fn = target, desc, size, fn
+
+
+def human(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1000:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1000
+    return f"{n:.1f} TB"
+
+
+def walk_stats(path):
+    """(bytes on disk, newest mtime) of everything under path, symlinks not followed."""
+    total, newest, stack = 0, 0, [path]
+    while stack:
+        p = stack.pop()
+        try:
+            st = os.lstat(p)
+        except OSError:
+            continue
+        total += st.st_blocks * 512
+        newest = max(newest, st.st_mtime)
+        if stat.S_ISDIR(st.st_mode):
+            try:
+                with os.scandir(p) as it:
+                    stack.extend(e.path for e in it)
+            except OSError:
+                pass
+    return total, newest
+
+
+def inside(path, parent):
+    return os.path.realpath(path).startswith(os.path.realpath(parent) + os.sep) and not os.path.islink(path)
+
+
+def remove(paths, parent):
+    def fn():
+        for p in paths:
+            if inside(p, parent):
+                shutil.rmtree(p) if os.path.isdir(p) else os.unlink(p)
+        return "removed"
+    return fn
+
+
+def as_owner(path):
+    """subprocess options that run a command as path's owner, in their home."""
+    st = os.stat(path)
+    pw = pwd.getpwuid(st.st_uid)
+    env = {"HOME": pw.pw_dir, "USER": pw.pw_name, "LOGNAME": pw.pw_name,
+           "PATH": f"{pw.pw_dir}/.local/bin:{pw.pw_dir}/.cargo/bin:/usr/local/bin:/usr/bin",
+           "GIT_OPTIONAL_LOCKS": "0"}
+    opts = {"env": env, "errors": "surrogateescape"}
+    if os.geteuid() == 0 and st.st_uid != 0:
+        opts.update(user=pw.pw_uid, group=pw.pw_gid, extra_groups=os.getgrouplist(pw.pw_name, pw.pw_gid))
+    return opts
+
+
+# --- projects ----------------------------------------------------------------------
+
+def find_repos(roots, skip):
+    seen = set()
+    for root in roots:
+        for dirpath, dirs, files in os.walk(root):
+            if ".git" in dirs or ".git" in files:
+                if dirpath not in seen:
+                    seen.add(dirpath)
+                    yield dirpath
+                dirs[:] = []
+                continue
+            depth = dirpath[len(root):].count(os.sep)
+            dirs[:] = [d for d in dirs if depth < 4 and not d.startswith(".") and d not in skip]
+
+
+def git_lines(repo, *args):
+    rc, out, _ = util.run("git", "-C", repo, *args, "-z", timeout=300, **as_owner(repo))
+    return [p for p in out.split("\0") if p] if rc == 0 else None
+
+
+def last_activity(repo):
+    files = git_lines(repo, "ls-files", "-co", "--exclude-standard")
+    if files is None:
+        return None
+    newest = 0
+    for rel in files + [".git/index", ".git/HEAD", ".git/logs/HEAD"]:
+        try:
+            newest = max(newest, os.lstat(os.path.join(repo, rel)).st_mtime)
+        except OSError:
+            pass
+    return newest
+
+
+def build_output(repo, cfg, idle_days):
+    """Git-ignored folders in repo that clean.build_dirs (or .venv) names."""
+    found = []
+    for rel in git_lines(repo, "ls-files", "-o", "-i", "--exclude-standard", "--directory") or []:
+        rel = rel.rstrip("/")
+        parts = rel.split("/")
+        full = os.path.join(repo, rel)
+        if any(p == "data" or p.startswith(".env") for p in parts) or not os.path.isdir(full) or os.path.islink(full):
+            continue
+        name = parts[-1]
+        if name == ".venv":
+            if idle_days >= cfg["venv_idle_days"]:
+                found.append(full)
+        elif any(fnmatch.fnmatch(name, pat) for pat in cfg["build_dirs"]):
+            found.append(full)
+    return found
+
+
+def has_make_clean(repo):
+    for name in ("GNUmakefile", "makefile", "Makefile"):
+        try:
+            with open(os.path.join(repo, name), errors="replace") as f:
+                if re.search(r"^clean\s*:", f.read(), re.M):
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def run_in(repo, *cmd):
+    def fn():
+        rc, out, err = util.run(*cmd, cwd=repo, timeout=900, stdin=subprocess.DEVNULL, **as_owner(repo))
+        if rc != 0:
+            raise RuntimeError(f"{' '.join(cmd)} exited {rc}: {(err.strip().splitlines() or [''])[-1][:200]}")
+        return f"ran {' '.join(cmd)}"
+    return fn
+
+
+def plan_projects(cfg, now):
+    actions, notes = [], []
+    skip = set(cfg["build_dirs"]) | {"node_modules", ".venv"}
+    for repo in find_repos(cfg["project_roots"], skip):
+        last = last_activity(repo)
+        if last is None:
+            notes.append(f"{repo}: git can't read it, skipped")
+            continue
+        idle = (now - last) / DAY
+        if idle < cfg["idle_days"]:
+            continue
+        dirs = build_output(repo, cfg, idle)
+        if not dirs:
+            continue
+        size = sum(walk_stats(d)[0] for d in dirs)
+        names = sorted({os.path.basename(d) for d in dirs})
+        if os.access(os.path.join(repo, ".hb-clean"), os.X_OK):
+            how, fn = "run .hb-clean", run_in(repo, os.path.join(repo, ".hb-clean"))
+        elif has_make_clean(repo):
+            how, fn = "make clean", run_in(repo, "make", "clean")
+        else:
+            how, fn = f"delete {', '.join(names)}", remove(dirs, repo)
+        actions.append(Action("projects", f"{repo}: {how} (idle {idle:.0f} days, {len(dirs)} build folders)", size, fn))
+    return actions, notes
+
+
+# --- caches ------------------------------------------------------------------------
+
+def plan_caches(cfg, now):
+    actions, notes = [], []
+    for user in cfg["users"]:
+        try:
+            home = pwd.getpwnam(user).pw_dir
+        except KeyError:
+            notes.append(f"no user {user}")
+            continue
+        base = os.path.join(home, ".cache")
+        entries = []
+        try:
+            entries = [e.path for e in os.scandir(base) if not e.is_symlink()]
+        except OSError:
+            pass
+        npm = os.path.join(home, ".npm", "_cacache")
+        if os.path.isdir(npm) and not os.path.islink(npm):
+            entries.append(npm)
+        for path in sorted(entries):
+            size, newest = walk_stats(path)
+            idle = (now - newest) / DAY
+            if idle >= cfg["cache_idle_days"] and size > 0:
+                actions.append(Action("caches", f"{path} (untouched {idle:.0f} days)", size, remove([path], home)))
+            elif size >= 10**9:
+                notes.append(f"kept {path}: {human(size)}, used {idle:.0f} days ago")
+    return actions, notes
+
+
+# --- docker ------------------------------------------------------------------------
+
+def docker(*args):
+    rc, out, err = util.run("docker", *args, timeout=600)
+    if rc != 0:
+        raise RuntimeError(f"docker {args[0]} {args[1] if len(args) > 1 else ''}: {err.strip()[:200]}")
+    return out
+
+
+def docker_fn(*args):
+    def fn():
+        docker(*args)
+        return "docker " + " ".join(args)
+    return fn
+
+
+def parse_size(text):
+    m = re.match(r"([\d.]+)\s*([kKMGT]?)B", text.strip())
+    if not m:
+        return 0
+    return int(float(m.group(1)) * 1000 ** " kMGT".index(m.group(2).replace("K", "k") or " "))
+
+
+def created_age(text, now):
+    try:
+        return (now - datetime.datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S").timestamp()) / DAY
+    except ValueError:
+        return 0
+
+
+def plan_docker(cfg, now):
+    if not cfg["docker"]:
+        return [], ["docker: not managed (clean.docker = false)"]
+    actions, notes = [], []
+    cdays, idays = cfg["docker_container_days"], cfg["docker_image_days"]
+
+    old = []
+    for line in docker("ps", "-a", "--filter", "status=exited", "--filter", "status=created",
+                       "--filter", "status=dead", "--format", "{{.Names}}\t{{.CreatedAt}}").splitlines():
+        name, created = line.split("\t", 1)
+        if created_age(created, now) >= cdays:
+            old.append(name)
+    if old:
+        actions.append(Action("docker", f"stopped containers older than {cdays} days: {' '.join(old)}", 0,
+                              docker_fn("container", "prune", "-f", "--filter", f"until={cdays * 24}h")))
+
+    ids = docker("ps", "-aq").split()
+    used = set(docker("inspect", "--format", "{{.Image}}", *ids).split()) if ids else set()
+    unused, size = [], 0
+    for line in docker("image", "ls", "--no-trunc", "--format",
+                       "{{.ID}}\t{{.Repository}}:{{.Tag}}\t{{.CreatedAt}}\t{{.Size}}").splitlines():
+        iid, name, created, sz = line.split("\t")
+        if iid not in used and created_age(created, now) >= idays:
+            unused.append(name)
+            size += parse_size(sz)
+    if unused:
+        shown = ", ".join(sorted(set(unused))[:8]) + (", ..." if len(set(unused)) > 8 else "")
+        actions.append(Action("docker", f"{len(unused)} unused images older than {idays} days ({shown}); "
+                              "layers are shared, so less than the sum may come back", size,
+                              docker_fn("image", "prune", "-a", "-f", "--filter", f"until={idays * 24}h")))
+
+    cap = parse_size(cfg["docker_build_cache"])
+    for line in docker("system", "df", "--format", "{{json .}}").splitlines():
+        row = json.loads(line)
+        if row.get("Type") == "Build Cache" and parse_size(row.get("Size", "")) > cap:
+            have = parse_size(row["Size"])
+            actions.append(Action("docker", f"build cache {human(have)}, trimmed to {cfg['docker_build_cache']}",
+                                  have - cap, docker_fn("builder", "prune", "-f", "-a",
+                                                        "--max-used-space", cfg["docker_build_cache"])))
+    dangling = docker("volume", "ls", "-q", "--filter", "dangling=true").split()
+    if dangling:
+        notes.append(f"docker: {len(dangling)} volumes no container uses (never removed): {' '.join(dangling)}")
+    return actions, notes
+
+
+PLANNERS = {"projects": plan_projects, "caches": plan_caches, "docker": plan_docker}
+
+
+def make_plan(cfg, targets):
+    now, actions, notes = time.time(), [], []
+    for t in targets:
+        try:
+            a, n = PLANNERS[t](cfg, now)
+        except Exception as e:  # one broken target must not hide the others
+            a, n = [], [f"{t}: ERROR {e.__class__.__name__}: {e}"]
+        actions += a
+        notes += n
+    return actions, notes
+
+
+def format_plan(actions, notes, heading):
+    lines = [heading]
+    for t in TARGETS:
+        mine = [a for a in actions if a.target == t]
+        if mine:
+            lines.append(f"\n{t}: {human(sum(a.size for a in mine))}")
+            lines += [f"  {human(a.size):>9}  {a.desc}" for a in sorted(mine, key=lambda a: -a.size)]
+    if notes:
+        lines.append("\nnotes:")
+        lines += [f"  {n}" for n in notes]
+    lines.append(f"\ntotal: {human(sum(a.size for a in actions))} in {len(actions)} actions")
+    return "\n".join(lines) + "\n"
+
+
+def confirm(question):
+    try:
+        with open("/dev/tty") as tty:
+            print(f"{question} [y/N] ", end="", flush=True)
+            return tty.readline().strip().lower().startswith("y")
+    except OSError:
+        return False
+
+
+def apply(actions, yes):
+    errors = []
+    for a in actions:
+        print(f"\n{human(a.size):>9}  {a.desc}")
+        if not yes and not confirm("  remove?"):
+            print("  skipped")
+            continue
+        try:
+            print(f"  {a.fn()}")
+        except Exception as e:
+            errors.append(f"{a.desc}: {e}")
+            print(f"  FAILED: {e}")
+    return errors
+
+
+def report_paths():
+    d = util.state_dir("clean")
+    return os.path.join(d, "last.json"), os.path.join(d, "last.txt")
+
+
+def disk_pct():
+    du = shutil.disk_usage("/")
+    return du.used * 100 / du.total
+
+
+def cmd_auto(full):
+    cfg = full["clean"]
+    dry = cfg["dry_run"]
+    heavy = (datetime.date.today().isoweekday() == cfg["heavy_weekday"]
+             or disk_pct() >= full["health"]["disk_warn_pct"])
+    targets = ["projects", "caches"] + (["docker"] if dry or heavy else [])
+    actions, notes = make_plan(cfg, targets)
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    text = format_plan(actions, notes, f"hb clean {'DRY RUN, nothing removed' if dry else 'run'}, {stamp}")
+    errors = [] if dry else apply(actions, yes=True)
+    if errors:
+        text += "\nerrors:\n" + "".join(f"  {e}\n" for e in errors)
+    print(text, end="")
+    jpath, tpath = report_paths()
+    util.write_atomic(tpath, text)
+    util.write_json(jpath, {"ts": int(time.time()), "dry_run": dry, "bytes": sum(a.size for a in actions),
+                            "actions": len(actions), "errors": errors})
+    return 1 if errors else 0
+
+
+def cmd_check():
+    jpath, _ = report_paths()
+    rep = util.read_json(jpath, None)
+    if not rep:
+        print("ok: no report yet (hb-clean.timer writes one daily)")
+        return 0
+    when = time.strftime("%d %b %H:%M", time.localtime(rep["ts"]))
+    if rep["errors"]:
+        print(f"warn: {len(rep['errors'])} cleanup actions failed on {when} (hb clean report)")
+        return 1
+    verb = "reclaimable (dry run)" if rep["dry_run"] else "removed"
+    print(f"ok: {human(rep['bytes'])} {verb} on {when}")
+    return 0
+
+
+def main(argv):
+    args = argv[1:]
+    verb = args.pop(0) if args and args[0] in ("plan", "apply", "auto", "report", "check", "help", "-h", "--help") else "plan"
+    if verb in ("help", "-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if os.geteuid() != 0:
+        print("error: run with sudo", file=sys.stderr)
+        return 2
+    full = config.load()
+    if verb == "auto":
+        return cmd_auto(full)
+    if verb == "check":
+        return cmd_check()
+    if verb == "report":
+        try:
+            with open(report_paths()[1]) as f:
+                print(f.read(), end="")
+            return 0
+        except OSError:
+            print("no report yet")
+            return 1
+    yes = "--yes" in args
+    targets = [a for a in args if a != "--yes"] or list(TARGETS)
+    bad = [t for t in targets if t not in TARGETS]
+    if bad:
+        print(f"hb-clean: unknown target {' '.join(bad)} (targets: {' '.join(TARGETS)})", file=sys.stderr)
+        return 2
+    actions, notes = make_plan(full["clean"], targets)
+    if verb == "plan":
+        print(format_plan(actions, notes, "hb clean plan (nothing removed)"), end="")
+        return 0
+    errors = apply(actions, yes)
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

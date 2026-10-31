@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# hb-alerts — make the system's own disk monitors report through hb-notify, so a
+# failing RAID member or NVMe drive reaches you without a mail server.
+#
+#   hb alerts status        one line per item
+#   hb alerts plan          what apply would change (changes nothing)
+#   hb alerts apply [--yes] make the changes, asking before each item
+#   hb alerts check         one-line verdict (exit 0 ok, 1 pending, 2 broken)
+#
+# Items:
+#   mdadm_program  /etc/mdadm.conf names hooks/mdadm-event as its PROGRAM, and
+#                  mdmonitor runs with it
+#   smartmontools  the package is installed
+#   smartd_conf    smartd watches every drive's health and temperature and calls
+#                  hooks/smartd-event
+#   smartd         smartd is enabled and running with that config
+#
+# Config ([alerts] in hb.toml): mdadm, smartd (true to manage). The hooks are run
+# from the installed copy in /opt/hb, so run `hb install apply` first.
+# Test afterwards: sudo mdadm --monitor --scan --oneshot --test, then hb notify events.
+set -u
+source "$(dirname "$(readlink -f "$0")")/../lib/hb.sh"
+need_root
+need_config
+
+ITEMS=(mdadm_program smartmontools smartd_conf smartd)
+HOOKS=/opt/hb/hooks
+MDADM_CONF=/etc/mdadm.conf
+SMARTD_CONF=/etc/smartmontools/smartd.conf
+MDADM="$(cfg alerts.mdadm)"
+SMARTD="$(cfg alerts.smartd)"
+
+smartd_wanted() {
+  cat <<EOF
+# Managed by hb-alerts; the previous file is kept under /var/lib/hb/backup/.
+# Every drive: overall health (for NVMe that includes the critical-warning bits)
+# and temperature above 75 C. Problems run the hook once per kind of problem.
+DEVICESCAN -H -W 0,0,75 -n standby,q -m <nomailer> -M exec $HOOKS/smartd-event
+EOF
+}
+
+need_hook() { [ -x "$HOOKS/$1" ] || { echo "$HOOKS/$1 missing: run hb install apply first"; return 2; }; }
+
+# --- mdadm ------------------------------------------------------------------------
+chk_mdadm_program() {
+  [ "$MDADM" = true ] || { echo "not managed"; return 0; }
+  [ -f "$MDADM_CONF" ] || { echo "no $MDADM_CONF: no md arrays to watch"; return 0; }
+  need_hook mdadm-event || return 2
+  local have
+  have="$(awk '$1 == "PROGRAM" {print $2}' "$MDADM_CONF")"
+  [ "$have" = "$HOOKS/mdadm-event" ] || { echo "PROGRAM ${have:-not set} → $HOOKS/mdadm-event"; return 1; }
+  systemctl is-active -q mdmonitor || { echo "PROGRAM set, but mdmonitor isn't running"; return 1; }
+  echo "mdmonitor reports to $HOOKS/mdadm-event"
+}
+fix_mdadm_program() {
+  keep_copy "$MDADM_CONF"
+  sed -i '/^PROGRAM[[:space:]]/d' "$MDADM_CONF" && echo "PROGRAM $HOOKS/mdadm-event" >> "$MDADM_CONF"
+  systemctl enable -q mdmonitor && systemctl restart mdmonitor
+}
+
+# --- smartd -----------------------------------------------------------------------
+chk_smartmontools() {
+  [ "$SMARTD" = true ] || { echo "not managed"; return 0; }
+  rpm -q smartmontools >/dev/null && { echo "$(rpm -q smartmontools)"; return 0; }
+  echo "will install smartmontools"; return 1
+}
+fix_smartmontools() { dnf install -y -q smartmontools; }
+
+chk_smartd_conf() {
+  [ "$SMARTD" = true ] || { echo "not managed"; return 0; }
+  need_hook smartd-event || return 2
+  [ -f "$SMARTD_CONF" ] || { echo "install smartmontools first"; return 1; }
+  cmp -s <(smartd_wanted) "$SMARTD_CONF" && { echo "$SMARTD_CONF reports to $HOOKS/smartd-event"; return 0; }
+  echo "$SMARTD_CONF will be replaced (DEVICESCAN reporting to $HOOKS/smartd-event)"; return 1
+}
+fix_smartd_conf() {
+  [ -f "$SMARTD_CONF" ] || { log "  install smartmontools first"; return 1; }
+  keep_copy "$SMARTD_CONF"
+  smartd_wanted > "$SMARTD_CONF"
+  chmod 644 "$SMARTD_CONF"
+  systemctl is-active -q smartd && systemctl restart smartd
+  return 0
+}
+
+chk_smartd() {
+  [ "$SMARTD" = true ] || { echo "not managed"; return 0; }
+  rpm -q smartmontools >/dev/null || { echo "install smartmontools first"; return 1; }
+  if systemctl is-enabled -q smartd && systemctl is-active -q smartd; then
+    echo "smartd running, watching $(smartctl --scan | wc -l) devices"; return 0
+  fi
+  echo "smartd will be enabled and started"; return 1
+}
+fix_smartd() {
+  systemctl enable --now smartd || return 1
+  sleep 2
+  systemctl is-active -q smartd || { log "  smartd didn't stay up: journalctl -u smartd"; return 1; }
+}
+
+item_main "$@"

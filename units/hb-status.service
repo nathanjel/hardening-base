@@ -1,0 +1,9 @@
+[Unit]
+Description=hb: run every check, refresh the login banner, notify on changes
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+ExecStart=/opt/hb/hb status refresh
+Nice=5
+TimeoutStartSec=20min

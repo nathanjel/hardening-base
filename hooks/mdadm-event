@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# mdadm's monitor runs this (PROGRAM in /etc/mdadm.conf) as: EVENT MD-DEVICE [MEMBER]
+# A failed or missing member is a fail (SMS); rebuilds and tests are info (banner).
+# One key per event kind, so one dying drive that sits in three arrays sends one SMS.
+event="${1:-unknown}" md="${2:-?}" member="${3:-}"
+case "$event" in
+  Fail|FailSpare|DegradedArray) level=fail ;;
+  DeviceDisappeared|SparesMissing) level=warn ;;
+  *) level=info ;;   # TestMessage, NewArray, Rebuild*, SpareActive, MoveSpare
+esac
+exec "$(dirname "$(readlink -f "$0")")/../hb" notify send "$level" "mdadm.$event" \
+  "$event on $md${member:+ (member $member)}"

@@ -1,0 +1,9 @@
+[Unit]
+Description=hb: restic prune and check, Saturdays at 01:30
+
+[Timer]
+OnCalendar=Sat *-*-* 01:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

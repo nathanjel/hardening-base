@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# hb-backup — encrypted, deduplicated backups with restic, read from a read-only
+# btrfs snapshot so that every file comes from the same instant.
+#
+#   hb backup init        create the repository and its password (once)
+#   hb backup run         state dump, snapshot, backup, forget old snapshots
+#   hb backup dry-run     the same, but restic writes nothing: shows the size
+#   hb backup maintain    prune, then check the repository; in the first week of
+#                         a month also read back backup.read_data_percent of the data
+#   hb backup status      recent runs and the newest restic snapshots
+#   hb backup check       one-line verdict on the last good backup's age
+#   hb backup restic ...  any restic command against the repository, e.g.
+#                           hb backup restic snapshots
+#                           hb backup restic restore latest --target /tmp/r --include /etc/hb
+#
+# Before the backup, the state dump writes what a rebuild needs to know into
+# /var/lib/hb/state: installed packages, snaps, firewall zones, enabled units,
+# disks, Docker containers and, with microk8s, its add-ons and objects
+# (secrets included; the repository is encrypted).
+#
+# Config ([backup] in hb.toml): repo, password_file, require_mount, paths,
+# exclude, exclude_if_present, keep_daily, keep_weekly, keep_monthly,
+# warn_hours, fail_hours, read_data_percent. Nothing happens while repo is "".
+#
+# The password file is the only key to the repository. Keep a copy away from
+# this box: without it nobody, you included, can read the backup.
+set -u
+source "$(dirname "$(readlink -f "$0")")/../lib/hb.sh"
+need_root
+need_config
+
+REPO="$(cfg backup.repo)"
+PWFILE="$(cfg backup.password_file)"
+MOUNT="$(cfg backup.require_mount)"
+mapfile -t PATHS < <(cfg backup.paths)
+mapfile -t EXCLUDE < <(cfg backup.exclude)
+mapfile -t IF_PRESENT < <(cfg backup.exclude_if_present)
+SNAP="$(cfg snapshot.dir)/backup-run"
+STATUS="$HB_STATE/hb-backup"     # last-ok, last-run, last-check: read by `check`
+DUMP="$HB_STATE/state"           # the state dump; /var/lib/hb is backed up with it
+CACHE="${HB_CACHE:-/var/cache}/hb-restic"   # not under /var/lib/hb, so not backed up
+HOST="$(hostname -s)"
+KEEP=(--keep-daily "$(cfg backup.keep_daily)" --keep-weekly "$(cfg backup.keep_weekly)"
+      --keep-monthly "$(cfg backup.keep_monthly)")
+export RESTIC_REPOSITORY="$REPO" RESTIC_PASSWORD_FILE="$PWFILE"
+
+r() { restic --cache-dir "$CACHE" "$@"; }
+
+# need_repo — configured, restic present, and the share mounted. Writing the
+# repository to the local disk because the share was missing would fill it.
+need_repo() {
+  [ -n "$REPO" ] || die "backup.repo is not set"
+  command -v restic >/dev/null || die "restic is not installed (dnf install restic)"
+  if [ -n "$MOUNT" ]; then
+    awk -v m="$MOUNT" '$2 == m {found=1} END {exit !found}' /proc/self/mounts \
+      || die "$MOUNT is not mounted; refusing to write the backup anywhere else"
+    case "$REPO" in "$MOUNT"/*) ;; *) die "backup.repo must be inside $MOUNT" ;; esac
+  fi
+  mkdir -p "$STATUS" "$CACHE"
+}
+need_init() { [ -f "$REPO/config" ] || die "no repository at $REPO yet: hb backup init"; }
+take_lock() { exec 9>"$STATUS/lock"; flock -n 9 || die "another hb backup run or maintain is in progress"; }
+
+# --- state dump -------------------------------------------------------------------
+dump() {  # dump FILE COMMAND... — one piece of the state dump; a failure is noted, not fatal
+  local f="$DUMP/$1"; shift
+  "$@" > "$f" 2>&1 || log "state dump: '$*' failed (see $f)"
+}
+dump_state() {
+  rm -rf "$DUMP" && mkdir -p "$DUMP/k8s"
+  { date -Is; uname -a; cat /etc/os-release; } > "$DUMP/system.txt"
+  dump packages.txt dnf repoquery --userinstalled --queryformat '%{name}\n'
+  dump repos.txt dnf repolist --enabled
+  dump units-enabled.txt systemctl list-unit-files --state=enabled --no-legend
+  dump disks.txt sh -c 'lsblk -f; echo; cat /proc/mdstat; echo; btrfs filesystem show 2>/dev/null; echo; cat /etc/fstab'
+  dump network.txt sh -c 'ip -br address; echo; ip route; echo; ip -6 route'
+  command -v firewall-cmd >/dev/null && dump firewalld.txt firewall-cmd --list-all-zones
+  command -v docker >/dev/null && dump docker.txt docker ps -a --format '{{.Names}}\t{{.Image}}\t{{.Status}}'
+  command -v snap >/dev/null && dump snaps.txt snap list
+  if [ -x /snap/bin/microk8s ]; then
+    dump k8s/status.yaml /snap/bin/microk8s status --format yaml
+    local t
+    for t in namespaces deployments statefulsets daemonsets services configmaps secrets \
+             persistentvolumeclaims persistentvolumes ingresses cronjobs serviceaccounts \
+             certificates.cert-manager.io issuers.cert-manager.io clusterissuers.cert-manager.io; do
+      dump "k8s/$t.yaml" /snap/bin/microk8s kubectl get "$t" -A -o yaml
+    done
+  fi
+  chmod -R go= "$DUMP"
+}
+
+# --- snapshot -----------------------------------------------------------------------
+take_snapshot() {
+  if [ "$(stat -f -c %T /)" != btrfs ]; then SNAP=""; log "/ is not btrfs: backing up the live files"; return; fi
+  [ -e "$SNAP" ] && btrfs subvolume delete "$SNAP" >/dev/null   # left by an interrupted run
+  mkdir -p "$(dirname "$SNAP")"
+  btrfs subvolume snapshot -r / "$SNAP" >/dev/null || die "cannot snapshot /"
+}
+drop_snapshot() { [ -n "$SNAP" ] && [ -e "$SNAP" ] && btrfs subvolume delete "$SNAP" >/dev/null; }
+
+# backup_paths [restic flags] — restic sees the snapshot's files at their real paths:
+# in a private mount namespace, every path on the root filesystem gets the
+# snapshot's copy bind-mounted over it. Paths on other filesystems are read live.
+backup_paths() {
+  local p rootdev have=() binds=() args=(backup --host "$HOST" --tag hb --one-file-system --exclude-caches)
+  rootdev="$(stat -c %d /)"
+  for p in "${IF_PRESENT[@]}"; do args+=(--exclude-if-present "$p"); done
+  for p in "${EXCLUDE[@]}"; do args+=(--exclude "$p"); done
+  for p in "${PATHS[@]}"; do
+    [ -e "$p" ] || { log "skipping $p: it doesn't exist"; continue; }
+    have+=("$p")
+    [ -n "$SNAP" ] && [ "$(stat -c %d "$p")" = "$rootdev" ] && [ -d "$SNAP$p" ] && binds+=("$p")
+  done
+  [ ${#have[@]} -gt 0 ] || die "none of backup.paths exist"
+  unshare --mount --propagation private -- bash -c '
+    snap="$1"; shift
+    while [ "$1" != -- ]; do mount --bind "$snap$1" "$1" || exit 1; shift; done; shift
+    exec "$@"' _ "$SNAP" "${binds[@]}" -- restic --cache-dir "$CACHE" "${args[@]}" "$@" "${have[@]}"
+}
+
+cmd_run() {
+  local dry="${1:-0}" rc start
+  need_repo; need_init; take_lock
+  [ ${#PATHS[@]} -gt 0 ] || die "backup.paths is empty"
+  start="$(date +%s)"
+  dump_state
+  take_snapshot
+  trap drop_snapshot EXIT
+  if [ "$dry" = 1 ]; then
+    backup_paths --dry-run
+    return
+  fi
+  backup_paths 2>&1 | tee "$STATUS/last-run.log"
+  rc=${PIPESTATUS[0]}
+  echo "$start $(date +%s) $rc" > "$STATUS/last-run"
+  # 3: the snapshot was made, but some files couldn't be read (listed in the log)
+  if [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]; then
+    date +%s > "$STATUS/last-ok"
+    r forget --host "$HOST" --tag hb "${KEEP[@]}" | tail -n 3
+  fi
+  return "$rc"
+}
+
+cmd_maintain() {
+  local check=(check)
+  need_repo; need_init; take_lock
+  r forget --host "$HOST" --tag hb "${KEEP[@]}" --prune || return 1
+  [ "$(date +%-d)" -le 7 ] && check+=(--read-data-subset "$(cfg backup.read_data_percent)%")
+  if r "${check[@]}"; then
+    date +%s > "$STATUS/last-check"
+  else
+    echo "failed $(date +%s)" > "$STATUS/last-check"
+    return 1
+  fi
+}
+
+cmd_init() {
+  need_repo
+  [ -f "$REPO/config" ] && die "a repository already exists at $REPO"
+  if [ ! -s "$PWFILE" ]; then
+    install -d -m 700 "$(dirname "$PWFILE")"
+    head -c 20 /dev/urandom | base32 | fold -w4 | paste -sd- > "$PWFILE"
+    chmod 600 "$PWFILE"
+  fi
+  r init || return 1
+  printf '\nThe repository password is in %s:\n\n    %s\n\n' "$PWFILE" "$(cat "$PWFILE")"
+  echo "Write it down and keep it away from this box. Without it the backup can't be read."
+}
+
+hours_since() { echo $(( ($(date +%s) - $1) / 3600 )); }
+
+cmd_check() {
+  [ -n "$REPO" ] || { echo "ok: not configured"; return 0; }
+  local ok last rc warn fail h chk
+  warn="$(cfg backup.warn_hours)"; fail="$(cfg backup.fail_hours)"
+  ok="$(cat "$STATUS/last-ok" 2>/dev/null)"
+  [ -n "$ok" ] || { echo "warn: no backup yet (hb backup init, then hb backup run)"; return 1; }
+  h="$(hours_since "$ok")"
+  [ "$h" -ge "$fail" ] && { echo "fail: last good backup $h h ago"; return 2; }
+  [ "$h" -ge "$warn" ] && { echo "warn: last good backup $h h ago"; return 1; }
+  read -r _ _ rc 2>/dev/null < "$STATUS/last-run"
+  [ "${rc:-0}" -eq 3 ] && { echo "warn: last backup $h h ago skipped unreadable files (see $STATUS/last-run.log)"; return 1; }
+  chk="$(cat "$STATUS/last-check" 2>/dev/null)"
+  case "$chk" in
+    failed*) echo "warn: last backup $h h ago, but the repository check failed (hb backup maintain)"; return 1 ;;
+    "") ;;
+    *) [ "$(hours_since "$chk")" -gt 192 ] && { echo "warn: last backup $h h ago; repository not checked for 8 days"; return 1; } ;;
+  esac
+  echo "ok: last backup $h h ago"
+}
+
+cmd_status() {
+  local start end rc
+  if read -r start end rc 2>/dev/null < "$STATUS/last-run"; then
+    echo "last run:   $(date -d "@$start" '+%F %H:%M'), $(( (end - start) / 60 )) min, exit $rc"
+    grep -E '^(Added to the repository|processed|snapshot .* saved)' "$STATUS/last-run.log" | sed 's/^/            /'
+  else
+    echo "last run:   never"
+  fi
+  local a b
+  if read -r a b 2>/dev/null < "$STATUS/last-check"; then
+    if [ "$a" = failed ]; then echo "last check: FAILED $(date -d "@$b" '+%F %H:%M')"
+    else echo "last check: $(date -d "@$a" '+%F %H:%M')"; fi
+  fi
+  need_repo; need_init
+  echo; r snapshots --compact --latest 5
+}
+
+case "${1:-check}" in
+  init) cmd_init ;;
+  run) cmd_run 0 ;;
+  dry-run) cmd_run 1 ;;
+  maintain) cmd_maintain ;;
+  check) cmd_check ;;
+  status) cmd_status ;;
+  restic) shift; need_repo; exec restic --cache-dir "$CACHE" "$@" ;;
+  help|-h|--help) sed -n '2,/^$/s/^# \{0,1\}//p' "$0" ;;
+  *) die "unknown verb '$1' (init, run, dry-run, maintain, status, check, restic)" ;;
+esac

@@ -1,0 +1,168 @@
+#!/usr/bin/python3 -IB
+"""hb-status — the box at a glance: every tool's check, cached, shown at login.
+
+  hb status            print the login banner (any user)
+  hb status refresh    run every check, update the cache and the banner, and tell
+                       hb-notify what changed (root; hb-status.timer, every 15 min)
+  hb status banner     rewrite the banner from the cache (root)
+  hb status check      one-line verdict: is the cache recent?
+
+hb-health's checks count one by one (health.raid, health.disk, ...); every
+other tool counts as one line. What gets passed to hb-notify:
+  fail  when a check fails on two refreshes in a row (so a pod restarting during
+        a deploy doesn't page anyone); hb-notify turns it into an SMS
+  warn  when a check that was ok starts warning (banner only)
+  info  when a check that warned or failed is ok again
+The banner lives in /run/motd.d/hb, which sshd shows at login (pam_motd).
+"""
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+from hbkit import util  # noqa: E402
+
+BANNER = os.environ.get("HB_BANNER", "/run/motd.d/hb")
+LEVEL_OF = {"ok": "ok", "warn": "warn", "fail": "fail", "FAIL": "fail", "skip": "skip"}
+STALE_MINUTES = 60
+EVENT_HOURS = 72
+
+
+def cache_path():
+    return os.path.join(util.STATE, "status.json")
+
+
+def tools():
+    d = os.path.join(util.HB_ROOT, "tools")
+    names = sorted(n[3:] for n in os.listdir(d) if n.startswith("hb-") and os.access(os.path.join(d, n), os.X_OK))
+    return [n for n in names if n not in ("status", "health")]
+
+
+def strip_word(line):
+    for word in ("ok", "warn", "fail", "pending"):
+        if line.startswith(word + ": "):
+            return line[len(word) + 2:]
+    return "" if line in ("ok", "warn", "fail") else line
+
+
+def collect():
+    """{key: (level, detail)} from hb-health's lines and every other tool's check."""
+    results = {}
+    rc, out, err = util.run(util.HB, "health", "status", timeout=300)
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 2 and parts[0] in LEVEL_OF:
+            results[f"health.{parts[1]}"] = (LEVEL_OF[parts[0]], parts[2] if len(parts) > 2 else "")
+    if not results:
+        results["health"] = ("fail", (err.strip().splitlines() or [f"exit {rc}"])[-1])
+    for t in tools():
+        rc, out, err = util.run(util.HB, t, "check", timeout=300)
+        lines = (out.strip() or err.strip()).splitlines()
+        last = lines[-1] if lines else f"exit {rc}"
+        level = "ok" if rc == 0 else "warn" if rc == 1 else "fail"
+        results[t] = (level, strip_word(last))
+    return results
+
+
+def notify(level, key, text):
+    util.run(util.HB, "notify", "send", level, key, text, timeout=120)
+
+
+def refresh():
+    now = int(time.time())
+    old = util.read_json(cache_path(), {}).get("checks", {})
+    new = {}
+    for key, (level, detail) in collect().items():
+        prev = old.get(key, {"level": "ok", "since": now, "notified": False})
+        same = prev["level"] == level
+        entry = {"level": level, "detail": detail, "since": prev["since"] if same else now,
+                 "notified": prev.get("notified", False) if same else False}
+        if level == "fail" and same and not entry["notified"]:
+            notify("fail", key, detail)
+            entry["notified"] = True
+        elif level == "warn" and prev["level"] == "ok":
+            notify("warn", key, detail)
+        elif level == "ok" and prev["level"] in ("warn", "fail"):
+            notify("info", key, f"ok again: {detail}" if detail else "ok again")
+        new[key] = entry
+    util.write_json(cache_path(), {"ts": now, "checks": new})
+    util.run(util.HB, "notify", "flush", timeout=300)
+    write_banner()
+    return 0
+
+
+def render(cache, events):
+    host = os.uname().nodename.split(".")[0]
+    when = time.strftime("%d %b %H:%M", time.localtime(cache["ts"]))
+    checks = cache["checks"]
+    bad = {k: v for k, v in checks.items() if v["level"] in ("warn", "fail")}
+    counted = sum(1 for v in checks.values() if v["level"] != "skip")
+    lines = []
+    if bad:
+        lines.append(f"hb on {host}, checked {when}: {len(bad)} of {counted} need attention")
+        for key in sorted(bad, key=lambda k: (bad[k]["level"] != "fail", k)):
+            v = bad[key]
+            lines.append(f"  {v['level'].upper():4}  {key:18} {v['detail']}")
+    else:
+        extra = [checks[k]["detail"] for k in ("backup", "health.disk") if k in checks and checks[k]["detail"]]
+        lines.append(" · ".join([f"hb on {host}, checked {when}: all {counted} checks ok"] + extra))
+    cutoff = time.time() - EVENT_HOURS * 3600
+    recent = [e for e in events if e["ts"] >= cutoff][-5:]
+    if recent:
+        lines.append("recent events (hb notify events for more):")
+        for e in recent:
+            stamp = time.strftime("%d %b %H:%M", time.localtime(e["ts"]))
+            lines.append(f"  {stamp}  {e['level']:4}  {e['key']}: {e['text']}")
+    return "\n".join(lines) + "\n"
+
+
+def write_banner():
+    cache = util.read_json(cache_path(), None)
+    if not cache:
+        return 1
+    os.makedirs(os.path.dirname(BANNER), mode=0o755, exist_ok=True)
+    util.write_atomic(BANNER, render(cache, util.read_events()), mode=0o644)
+    return 0
+
+
+def check():
+    cache = util.read_json(cache_path(), None)
+    if not cache:
+        print("warn: no status yet (hb status refresh, or enable hb-status.timer)")
+        return 1
+    age = (time.time() - cache["ts"]) / 60
+    if age > STALE_MINUTES:
+        print(f"warn: last refresh {age:.0f} minutes ago; is hb-status.timer running?")
+        return 1
+    print(f"ok: refreshed {age:.0f} minutes ago")
+    return 0
+
+
+def main(argv):
+    verb = argv[1] if len(argv) > 1 else "show"
+    if verb == "show":
+        try:
+            with open(BANNER) as f:
+                print(f.read(), end="")
+        except OSError:
+            print("no banner yet: hb-status.timer writes it every 15 minutes")
+            return 1
+        return 0
+    if verb in ("help", "-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if os.geteuid() != 0:
+        print("error: run with sudo", file=sys.stderr)
+        return 2
+    if verb == "refresh":
+        return refresh()
+    if verb == "banner":
+        return write_banner()
+    if verb == "check":
+        return check()
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

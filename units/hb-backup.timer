@@ -1,0 +1,10 @@
+[Unit]
+Description=hb: nightly restic backup at 04:00
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

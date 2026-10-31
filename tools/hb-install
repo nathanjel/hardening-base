@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# hb-install — run hb from a root-owned copy, so nothing running as your user
+# can change the code root's timers run.
+#
+#   hb install status        one line per item
+#   hb install plan          what apply would change (changes nothing)
+#   hb install apply [--yes] make the changes, asking before each item
+#   hb install check         one-line verdict (exit 0 ok, 1 pending, 2 broken)
+#
+# Items:
+#   code    /opt/hb holds the checkout's files (git-tracked and new, never ignored
+#           ones such as hb.toml or local/)
+#   link    /usr/local/bin/hb points at /opt/hb/hb
+#   config  /etc/hb/hb.toml is root's and matches the checkout's hb.toml, if any
+#   units   units/* are installed in /etc/systemd/system
+#   timers  the timers in install.timers are enabled, other hb timers are not
+#
+# Run apply from the checkout: sudo ./hb install apply. Run it again after
+# changing code or hb.toml. The installed copy remembers the checkout, so its
+# check (and the login banner) says when the two differ.
+# Config ([install] in hb.toml): timers, e.g. ["hb-status", "hb-backup"].
+set -u
+source "$(dirname "$(readlink -f "$0")")/../lib/hb.sh"
+need_root
+need_config
+
+ITEMS=(code link config units timers)
+PREFIX=/opt/hb
+ETC=/etc/hb
+UNITDIR=/etc/systemd/system
+mapfile -t TIMERS < <(cfg install.timers)
+
+# The checkout to install from: this one, unless we are the installed copy.
+if [ "$HB_ROOT" = "$PREFIX" ]; then
+  SRC="$(cat "$PREFIX/.source" 2>/dev/null)"
+else
+  SRC="$HB_ROOT"
+fi
+
+# stage DIR — copy the checkout's files into DIR. git and tar run as the
+# checkout's owner, so root never runs git hooks or reads past that user's rights.
+stage() {
+  local owner
+  owner="$(stat -c %U "$SRC")"
+  if [ -d "$SRC/.git" ]; then
+    runuser -u "$owner" -- git -C "$SRC" ls-files -z -co --exclude-standard \
+      | runuser -u "$owner" -- tar -C "$SRC" --null -T - -cf -
+  else
+    runuser -u "$owner" -- tar -C "$SRC" --exclude=./hb.toml --exclude=./local \
+      --exclude=./phase0/out --exclude=__pycache__ -cf - .
+  fi | tar -C "$1" --no-same-owner -xf - || return 1
+  printf '%s\n' "$SRC" > "$1/.source"
+  chmod -R u=rwX,go=rX "$1"
+}
+
+# --- code -----------------------------------------------------------------------
+chk_code() {
+  [ -n "$SRC" ] && [ -d "$SRC" ] || { echo "installed copy; checkout unknown"; return 0; }
+  [ -d "$PREFIX" ] || { echo "will copy $SRC to $PREFIX"; return 1; }
+  local tmp n
+  tmp="$(mktemp -d)"
+  stage "$tmp" || { rm -rf "$tmp"; echo "cannot read $SRC"; return 2; }
+  n="$(diff -rq --no-dereference "$tmp" "$PREFIX" 2>&1 | wc -l)"
+  rm -rf "$tmp"
+  [ "$n" -eq 0 ] && { echo "$PREFIX matches $SRC"; return 0; }
+  echo "$n files differ between $SRC and $PREFIX"; return 1
+}
+fix_code() {
+  local new="$PREFIX.new"
+  rm -rf "$new" && mkdir -p "$new" && stage "$new" || return 1
+  chmod 755 "$new"
+  rm -rf "$PREFIX.old"
+  [ -d "$PREFIX" ] && mv "$PREFIX" "$PREFIX.old"
+  mv "$new" "$PREFIX" && rm -rf "$PREFIX.old"
+}
+
+# --- link -----------------------------------------------------------------------
+chk_link() {
+  [ "$(readlink /usr/local/bin/hb)" = "$PREFIX/hb" ] && { echo "/usr/local/bin/hb → $PREFIX/hb"; return 0; }
+  echo "will link /usr/local/bin/hb → $PREFIX/hb"; return 1
+}
+fix_link() { ln -sfn "$PREFIX/hb" /usr/local/bin/hb; }
+
+# --- config ---------------------------------------------------------------------
+chk_config() {
+  local etc="$ETC/hb.toml" src=""
+  [ -n "$SRC" ] && [ -f "$SRC/hb.toml" ] && src="$SRC/hb.toml"
+  if [ ! -f "$etc" ]; then
+    [ -n "$src" ] && { echo "will copy $src → $etc"; return 1; }
+    echo "no $etc, and no hb.toml in the checkout to copy"; return 2
+  fi
+  if [ "$(stat -c %u:%a "$etc")" != 0:600 ]; then echo "$etc will be made root's, mode 600"; return 1; fi
+  if [ -n "$src" ] && ! cmp -s "$src" "$etc"; then
+    echo "$src differs from $etc (diff them; apply copies the checkout's)"; return 1
+  fi
+  echo "$etc"
+}
+fix_config() {
+  local etc="$ETC/hb.toml" src=""
+  [ -n "$SRC" ] && [ -f "$SRC/hb.toml" ] && src="$SRC/hb.toml"
+  install -d -m 700 "$ETC"
+  if [ -n "$src" ] && ! cmp -s "$src" "$etc" 2>/dev/null; then
+    keep_copy "$etc"
+    install -m 600 "$src" "$etc" || return 1
+  fi
+  chown root:root "$etc" && chmod 600 "$etc"
+}
+
+# --- units ----------------------------------------------------------------------
+unit_files() { local f; for f in "$PREFIX"/units/hb-*.service "$PREFIX"/units/hb-*.timer; do [ -f "$f" ] && echo "$f"; done; }
+stale_units() {
+  local f
+  for f in "$UNITDIR"/hb-*.service "$UNITDIR"/hb-*.timer; do
+    [ -f "$f" ] && [ ! -f "$PREFIX/units/${f##*/}" ] && echo "$f"
+  done
+}
+chk_units() {
+  [ -d "$PREFIX/units" ] || { echo "install code first"; return 1; }
+  local f differ=() stale
+  for f in $(unit_files); do cmp -s "$f" "$UNITDIR/${f##*/}" || differ+=("${f##*/}"); done
+  stale="$(stale_units | xargs -r -n1 basename | tr '\n' ' ')"
+  [ ${#differ[@]} -eq 0 ] && [ -z "$stale" ] && { echo "$(unit_files | wc -l) units installed"; return 0; }
+  echo "will install: ${differ[*]:-none}; will remove: ${stale:-none}"; return 1
+}
+fix_units() {
+  local f
+  for f in $(stale_units); do systemctl disable --now -q "${f##*/}" 2>/dev/null; rm -f "$f"; done
+  for f in $(unit_files); do install -m 644 "$f" "$UNITDIR/${f##*/}"; done
+  systemctl daemon-reload
+}
+
+# --- timers ---------------------------------------------------------------------
+chk_timers() {
+  local t want on=() off=() missing=()
+  for t in "${TIMERS[@]}"; do
+    [ -f "$UNITDIR/$t.timer" ] || { missing+=("$t"); continue; }
+    systemctl is-enabled -q "$t.timer" && systemctl is-active -q "$t.timer" || on+=("$t")
+  done
+  for t in $(systemctl list-unit-files 'hb-*.timer' --state=enabled --no-legend 2>/dev/null | awk '{print $1}'); do
+    want=0
+    for w in "${TIMERS[@]}"; do [ "$w.timer" = "$t" ] && want=1; done
+    [ $want = 0 ] && off+=("${t%.timer}")
+  done
+  [ ${#missing[@]} -gt 0 ] && { echo "no such timer: ${missing[*]} (install units first, or check install.timers)"; return 1; }
+  [ ${#on[@]} -eq 0 ] && [ ${#off[@]} -eq 0 ] && { echo "enabled: ${TIMERS[*]:-none}"; return 0; }
+  echo "will enable: ${on[*]:-none}; will disable: ${off[*]:-none}"; return 1
+}
+fix_timers() {
+  local t want
+  for t in "${TIMERS[@]}"; do systemctl enable --now -q "$t.timer" || return 1; done
+  for t in $(systemctl list-unit-files 'hb-*.timer' --state=enabled --no-legend | awk '{print $1}'); do
+    want=0
+    for w in "${TIMERS[@]}"; do [ "$w.timer" = "$t" ] && want=1; done
+    [ $want = 0 ] && systemctl disable --now -q "$t"
+  done
+  return 0
+}
+
+item_main "$@"

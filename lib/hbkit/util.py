@@ -1,0 +1,85 @@
+"""Small helpers shared by hb's Python tools: running commands, state files, locks."""
+import fcntl
+import json
+import os
+import subprocess
+
+HB_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+HB = os.path.join(HB_ROOT, "hb")
+STATE = os.environ.get("HB_STATE", "/var/lib/hb")
+
+
+def run(*cmd, timeout=30, input=None, **kw):
+    """(exit code, stdout, stderr) of a command; 127 when missing, 124 on timeout."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=input, **kw)
+        return p.returncode, p.stdout, p.stderr
+    except FileNotFoundError:
+        return 127, "", f"{cmd[0]}: not found"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"{cmd[0]}: timed out after {timeout}s"
+
+
+def state_dir(name):
+    """/var/lib/hb/<name>, created root-only."""
+    d = os.path.join(STATE, name)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    return d
+
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_atomic(path, text, mode=0o600):
+    """Replace path with text in one step, so readers never see half a file."""
+    tmp = f"{path}.tmp{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def write_json(path, data, mode=0o600):
+    write_atomic(path, json.dumps(data, indent=1) + "\n", mode)
+
+
+class Lock:
+    """An exclusive flock on a file, held for the duration of a with-block."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        os.close(self.fd)
+
+
+# --- events: what hb-notify records and hb-status shows in the login banner ---
+
+def events_path():
+    return os.path.join(STATE, "notify", "events.jsonl")
+
+
+def read_events(limit=None):
+    """Recorded events, oldest first: dicts with ts, level, key, text."""
+    out = []
+    try:
+        with open(events_path()) as f:
+            for line in f:
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return out[-limit:] if limit else out

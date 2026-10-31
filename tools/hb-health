@@ -4,16 +4,22 @@
   hb health status   one line per check
   hb health check    one-line verdict (exit 0 ok, 1 warn, 2 fail)
 
-Run with sudo: btrfs device errors are root-only (skipped otherwise).
+Run with sudo: btrfs device errors and NVMe health are root-only (skipped otherwise).
 Config ([health] in hb.toml): containers, urls, mounts, registry,
-asterisk_container, disk_warn_pct, disk_fail_pct.
+asterisk_container, disk_warn_pct, disk_fail_pct, reboot_fail_days,
+cert_warn_days, nvme_wear_warn_pct.
 """
+import json
 import os
 import re
 import shutil
+import socket
+import ssl
 import subprocess
 import sys
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
@@ -37,11 +43,14 @@ def run(*cmd, timeout=30):
 
 def check_reboot(cfg):
     running = os.uname().release
-    rc, out = run("rpm", "-q", "--last", "kernel-core")
-    newest = out.split()[0].removeprefix("kernel-core-") if rc == 0 and out else running
+    rc, out = run("rpm", "-q", "--qf", "%{INSTALLTIME} %{VERSION}-%{RELEASE}.%{ARCH}\n", "kernel-core")
+    rows = sorted((int(t), v) for t, v in (ln.split() for ln in out.splitlines() if ln.strip())) if rc == 0 else []
+    installed, newest = rows[-1] if rows else (0, running)
     rc, _ = run("dnf", "needs-restarting", "-r", timeout=60)
     if newest != running:
-        return WARN, f"running kernel {running}, newest installed {newest}"
+        days = (time.time() - installed) / 86400
+        detail = f"running kernel {running}, {newest} installed {days:.0f} days ago"
+        return (FAIL if days >= cfg["reboot_fail_days"] else WARN), detail
     if rc == 1:
         return WARN, "updated system libraries need a reboot"
     return OK, f"kernel {running}"
@@ -59,6 +68,42 @@ def check_raid(cfg):
     if bad:
         return FAIL, "degraded: " + " ".join(bad)
     return OK, " ".join(f"{name}[{state}]" for name, state in arrays)
+
+
+def check_nvme(cfg):
+    if os.geteuid() != 0:
+        return SKIP, "needs root"
+    rc, out = run("smartctl", "--scan", "-j")
+    if rc == 127:
+        return SKIP, "smartmontools not installed"
+    devices = [d["name"] for d in json.loads(out or "{}").get("devices", []) if d.get("type") == "nvme"]
+    if not devices:
+        return SKIP, "no NVMe devices"
+    sev, notes = OK, []
+    for dev in devices:
+        rc, out = run("smartctl", "-j", "-H", "-A", dev)
+        data = json.loads(out or "{}")
+        log = data.get("nvme_smart_health_information_log")
+        name = dev.removeprefix("/dev/")
+        if not log:
+            sev = max(sev, WARN)
+            notes.append(f"{name} unreadable")
+            continue
+        if data.get("smart_status", {}).get("passed") is False or log.get("critical_warning"):
+            sev = FAIL
+            notes.append(f"{name} critical warning {log.get('critical_warning')}")
+        elif log.get("available_spare", 100) < log.get("available_spare_threshold", 0):
+            sev = FAIL
+            notes.append(f"{name} spare {log['available_spare']}% below threshold")
+        elif log.get("media_errors"):
+            sev = max(sev, WARN)
+            notes.append(f"{name} {log['media_errors']} media errors")
+        elif log.get("percentage_used", 0) >= cfg["nvme_wear_warn_pct"]:
+            sev = max(sev, WARN)
+            notes.append(f"{name} worn {log['percentage_used']}%")
+        else:
+            notes.append(f"{name} wear {log.get('percentage_used', '?')}%")
+    return sev, ", ".join(notes)
 
 
 def check_btrfs(cfg):
@@ -138,17 +183,35 @@ def http_status(url):
         return 0, str(getattr(e, "reason", e))
 
 
+def cert_days_left(url):
+    """Days until the TLS certificate of an https URL expires (None if not https)."""
+    u = urllib.parse.urlsplit(url)
+    if u.scheme != "https":
+        return None
+    ctx = ssl.create_default_context()
+    with socket.create_connection((u.hostname, u.port or 443), timeout=10) as sock:
+        with ctx.wrap_socket(sock, server_hostname=u.hostname) as tls:
+            not_after = ssl.cert_time_to_seconds(tls.getpeercert()["notAfter"])
+    return (not_after - time.time()) / 86400
+
+
 def check_urls(cfg):
     if not cfg["urls"]:
         return SKIP, "none configured"
-    bad = []
+    bad, expiring = [], []
     for url in cfg["urls"]:
         code, why = http_status(url)
         if code == 0 or code >= 500:
             bad.append(f"{url} {code or why}")
+            continue
+        days = cert_days_left(url)
+        if days is not None and days < cfg["cert_warn_days"]:
+            expiring.append(f"{urllib.parse.urlsplit(url).hostname} certificate expires in {days:.0f} days")
     if bad:
-        return FAIL, "; ".join(bad)
-    return OK, f"{len(cfg['urls'])} sites answer (TLS verified)"
+        return FAIL, "; ".join(bad + expiring)
+    if expiring:
+        return WARN, "; ".join(expiring)
+    return OK, f"{len(cfg['urls'])} sites answer (TLS verified, certificates good for {cfg['cert_warn_days']}+ days)"
 
 
 def check_registry(cfg):
@@ -177,6 +240,7 @@ def check_asterisk(cfg):
 CHECKS = [
     ("reboot", check_reboot),
     ("raid", check_raid),
+    ("nvme", check_nvme),
     ("btrfs", check_btrfs),
     ("disk", check_disk),
     ("mounts", check_mounts),

@@ -1,0 +1,12 @@
+[Unit]
+Description=hb: weekly restic prune and repository check
+Wants=network-online.target
+After=network-online.target remote-fs.target
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+ExecStart=/opt/hb/hb backup maintain
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=8h
