@@ -24,54 +24,29 @@ address that keeps failing.
 Config ([totp] in hb.toml): issuer, the name the authenticator app shows
 (default: this host's short name).
 """
-import base64
 import datetime
-import hashlib
-import hmac
 import json
 import os
 import pwd
 import re
 import secrets
 import socket
-import struct
 import subprocess
 import sys
 import time
-import urllib.parse
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
-from hbkit import util  # noqa: E402
+from hbkit import otp, util  # noqa: E402
 
 DIR = "/etc/hb/secrets/totp"
 USER = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
-STEP, DIGITS, DRIFT = 30, 6, 1
 ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"   # Crockford's base32: no I, L, O or U
 N_CODES, LOW_CODES = 10, 3
-SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 14, 8, 1
 PATH_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}
 
-
-# --- RFC 4226 / 6238 ---------------------------------------------------------------
-
-def hotp(key, counter, digits=DIGITS):
-    mac = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
-    off = mac[-1] & 0x0F
-    return str((struct.unpack(">I", mac[off:off + 4])[0] & 0x7FFFFFFF) % 10 ** digits).zfill(digits)
-
-
-def b32key(secret):
-    s = secret.upper().replace(" ", "")
-    return base64.b32decode(s + "=" * (-len(s) % 8))
-
-
-def match_totp(secret, code, last_step, now):
-    """The time step code belongs to, if it is within the drift and newer than last_step."""
-    key, cur = b32key(secret), int(now // STEP)
-    for step in range(cur - DRIFT, cur + DRIFT + 1):
-        if step > last_step and hmac.compare_digest(hotp(key, step), code):
-            return step
-    return None
+# RFC 4226 / 6238 and the scrypt hashes live in lib/hbkit/otp.py, shared with the web shell.
+STEP, DIGITS, DRIFT = otp.STEP, otp.DIGITS, otp.DRIFT
+hotp, b32key, match_totp = otp.hotp, otp.b32key, otp.match_totp
 
 
 # --- recovery codes -----------------------------------------------------------------
@@ -87,18 +62,12 @@ def norm_code(text):
     return t if len(t) == 10 and all(c in ALPHABET for c in t) else None
 
 
-def _scrypt(code, salt, n, r, p):
-    return hashlib.scrypt(code.encode(), salt=salt, n=n, r=r, p=p, dklen=32)
-
-
 def hash_code(code):
-    salt = secrets.token_bytes(16)
-    return f"scrypt${SCRYPT_N}${SCRYPT_R}${SCRYPT_P}${salt.hex()}${_scrypt(code, salt, SCRYPT_N, SCRYPT_R, SCRYPT_P).hex()}"
+    return otp.scrypt_hash(code)
 
 
 def code_matches(code, stored):
-    _, n, r, p, salt, want = stored.split("$")
-    return hmac.compare_digest(_scrypt(code, bytes.fromhex(salt), int(n), int(r), int(p)).hex(), want)
+    return otp.scrypt_matches(code, stored)
 
 
 # --- files ----------------------------------------------------------------------------
@@ -210,18 +179,6 @@ def new_codes():
     return codes, [hash_code(norm_code(c)) for c in codes]
 
 
-def show_qr(uri):
-    try:
-        p = subprocess.run(["qrencode", "-t", "ANSIUTF8", "-m", "2"], input=uri, text=True,
-                           capture_output=True, timeout=10)
-        if p.returncode == 0:
-            print(p.stdout)
-            return
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    print("(no QR code: qrencode isn't installed; `sudo dnf install qrencode` shows one)\n")
-
-
 def issuer(cfg):
     return cfg["totp"]["issuer"] or socket.gethostname().split(".")[0]
 
@@ -236,28 +193,8 @@ def do_enrol(user, cfg):
     if old and old.get("secret") and not util.ask(f"{user} already has a secret; replace it (the old one stops working)?"):
         print("nothing changed")
         return 1
-    secret = base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
-    iss = issuer(cfg)
-    uri = ("otpauth://totp/" + urllib.parse.quote(f"{iss}:{user}") + "?"
-           + urllib.parse.urlencode({"secret": secret, "issuer": iss, "algorithm": "SHA1",
-                                     "digits": DIGITS, "period": STEP}))
-    print("In your authenticator app, add an account by scanning this, or by typing the key.\n")
-    show_qr(uri)
-    print(f"    account  {iss}:{user}")
-    print(f"    key      {' '.join(secret[i:i + 4] for i in range(0, len(secret), 4))}")
-    print("    type     time-based, 6 digits, 30 seconds\n")
-    for _ in range(3):
-        try:
-            code = input("The code the app shows now: ").strip().replace(" ", "")
-        except EOFError:
-            break
-        step = match_totp(secret, code, 0, time.time()) if re.fullmatch(r"\d{6}", code) else None
-        if step is not None:
-            break
-        print("that doesn't match; check the phone's clock and try the next code")
-    else:
-        step = None
-    if step is None:
+    secret, step = otp.enrol(issuer(cfg), user)
+    if secret is None:
         print("nothing saved")
         return 1
     codes, hashes = new_codes()

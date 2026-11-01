@@ -118,6 +118,17 @@ DEFAULTS = {
         "user": "",
         "shares": [],
     },
+    "webshell": {
+        "user": "",
+        "port": 7681,
+        "host": "",
+        "ingress_from": [],
+        "ingress_class": "public",
+        "namespace": "default",
+        "issuer": "",
+        "middlewares": "",
+        "max_hours": 12,
+    },
 }
 
 

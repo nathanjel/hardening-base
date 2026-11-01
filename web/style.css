@@ -1,0 +1,38 @@
+/* hb web shell */
+:root {
+  color-scheme: dark;
+  --bg: #111418;
+  --panel: #1b2027;
+  --line: #2c333d;
+  --text: #e6e9ee;
+  --muted: #9aa4b2;
+  --accent: #6cb6ff;
+  --warn: #ffb86b;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text);
+             font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+button { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line);
+         border-radius: 6px; padding: 6px 14px; cursor: pointer; }
+button:hover, button:focus-visible { border-color: var(--accent); }
+
+/* login */
+body.login { display: grid; place-items: center; padding: 16px; }
+body.login main { width: 100%; max-width: 340px; }
+body.login h1 { font-size: 20px; font-weight: 600; margin: 0 0 20px; }
+body.login label { display: block; margin-bottom: 14px; color: var(--muted); font-size: 14px; }
+body.login input { display: block; width: 100%; margin-top: 4px; padding: 9px 10px; font: inherit;
+                   color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+body.login input:focus { outline: none; border-color: var(--accent); }
+body.login button { width: 100%; padding: 9px; }
+body.login .msg { min-height: 1.4em; color: var(--warn); font-size: 14px; margin-top: 14px; }
+
+/* terminal */
+body.term { display: flex; flex-direction: column; }
+body.term header { display: flex; align-items: center; gap: 12px; padding: 6px 12px;
+                   background: var(--panel); border-bottom: 1px solid var(--line); font-size: 13px; }
+body.term header .host { font-weight: 600; }
+body.term header #status { flex: 1; color: var(--warn); }
+body.term header form { margin: 0; }
+body.term header button { padding: 3px 10px; font-size: 13px; }
+#term { flex: 1; min-height: 0; padding: 4px 0 0 6px; }

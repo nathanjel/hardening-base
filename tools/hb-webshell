@@ -1,0 +1,529 @@
+#!/usr/bin/python3 -IB
+"""hb-webshell — your shell in a browser: over WireGuard always, from the internet
+only for a window you open.
+
+  hb webshell status          one line per item, the public window, sessions
+  hb webshell plan            what apply would change (changes nothing)
+  hb webshell apply [--yes]   make the changes, asking before each item
+  hb webshell check           one-line verdict (exit 0 ok, 1 pending, 2 broken)
+  hb webshell password        a new password and a new authenticator entry
+  hb webshell open [2h]       publish webshell.host through the ingress for that
+                              long (30m, 2h, ...; at most webshell.max_hours)
+  hb webshell close           unpublish now (the window's timer does it itself)
+  hb webshell unlock          let logins in again after 20 failures in an hour
+  hb-webshell serve ...       the daemon (lib/hbkit/webshell.py), run by the unit
+
+Items:
+  login     /etc/hb/webshell.json: the password's scrypt hash and the code's
+            secret, root-only (the unit hands them to the daemon)
+  unit      /etc/systemd/system/hb-webshell.service: the daemon as
+            webshell.user, settings from hb.toml on its command line
+  service   enabled, running, listening on the WireGuard address
+  firewall  webshell.port open in the WireGuard zone and in no other (hb fw's
+            job; checked here)
+
+Over WireGuard: http://<wg address>:<port>, plain HTTP inside the tunnel. Public:
+`hb webshell open` applies a Service, an EndpointSlice pointing at the WireGuard
+address, a Certificate and an Ingress for webshell.host (needs a DNS record),
+writes the window's end where the daemon reads it, and starts a timer that runs
+`hb webshell close`. The daemon itself refuses the ingress once the window has
+passed, timer or not. Restarting the daemon leaves the tmux session "web"
+running (KillMode=process).
+
+Config ([webshell] in hb.toml): user, port, host, ingress_from, ingress_class,
+namespace, issuer, middlewares, max_hours. The tunnel comes from [wg].
+"""
+import datetime
+import getpass
+import grp
+import ipaddress
+import json
+import os
+import pwd
+import re
+import socket
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+from hbkit import util  # noqa: E402
+
+AUTH = "/etc/hb/webshell.json"
+UNIT = "/etc/systemd/system/hb-webshell.service"
+STATE_DIR = "/var/lib/hb-webshell"          # the daemon's (StateDirectory); root writes "public", removes "lock"
+NAME = "hb-webshell"                        # the unit, and the Kubernetes objects
+TIMER = "hb-webshell-close"
+KUBECTL = ("/snap/bin/microk8s", "kubectl")
+MIN_PASSWORD = 12
+
+
+def settings(cfg):
+    w, wg = cfg["webshell"], cfg["wg"]
+    if not w["user"]:
+        return None
+    iface = ipaddress.ip_interface(wg["address"]) if wg["address"] else None
+    return {"user": w["user"], "port": int(w["port"]), "host": w["host"].lower(), "iface": wg["interface"],
+            "addr": str(iface.ip) if iface else "", "net": str(iface.network) if iface else "",
+            "ingress_from": list(w["ingress_from"]), "class": w["ingress_class"], "ns": w["namespace"],
+            "issuer": w["issuer"], "middlewares": w["middlewares"], "max_hours": int(w["max_hours"])}
+
+
+def prereq(s):
+    try:
+        pwd.getpwnam(s["user"])
+    except KeyError:
+        return f"webshell.user {s['user']}: no such user"
+    if not s["addr"]:
+        return "needs WireGuard: wg.address is empty (hb wg)"
+    return None
+
+
+# --- login ------------------------------------------------------------------------------
+
+def chk_login(s):
+    try:
+        st = os.stat(AUTH)
+    except FileNotFoundError:
+        return 1, "needs a password and an authenticator entry (apply asks for both)"
+    if st.st_uid != 0 or st.st_mode & 0o077:
+        return 2, f"{AUTH} must be root's, mode 600"
+    auth = util.read_json(AUTH, {})
+    if not isinstance(auth, dict) or not auth.get("password") or not auth.get("secret"):
+        return 1, f"{AUTH} lacks the password or the code's secret"
+    return 0, f"password and code set {auth.get('made', '')}".rstrip()
+
+
+def fix_login(s, cfg):
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return "needs a terminal: sudo hb webshell password"
+    from hbkit import otp
+    print(f"\nThe web shell's own password (at least {MIN_PASSWORD} characters; not your login or Samba password).")
+    for _ in range(3):
+        p1 = getpass.getpass("New password: ")
+        if len(p1) < MIN_PASSWORD:
+            print(f"too short: at least {MIN_PASSWORD} characters")
+            continue
+        if getpass.getpass("Again: ") == p1:
+            break
+        print("they differ")
+    else:
+        return "no password set"
+    issuer = cfg["totp"]["issuer"] or socket.gethostname().split(".")[0]
+    print("\nAnd its own entry in your authenticator app, separate from SSH's.")
+    secret, _ = otp.enrol(issuer, f"{s['user']}-web")
+    if secret is None:
+        return "no code matched; nothing saved"
+    util.write_json(AUTH, {"password": otp.scrypt_hash(p1), "secret": secret,
+                           "made": datetime.date.today().isoformat()}, mode=0o600)
+    util.run("systemctl", "try-restart", NAME)
+    return None
+
+
+# --- unit -------------------------------------------------------------------------------
+
+def unit_wanted(s):
+    args = ["serve", "--listen", f"{s['addr']}:{s['port']}", "--tunnel", s["net"]]
+    if s["host"] and s["ingress_from"]:
+        args += ["--host", s["host"]]
+        for n in s["ingress_from"]:
+            args += ["--ingress-from", n]
+    return f"""# Managed by hb-webshell from hb.toml [webshell]; changes made here are overwritten.
+# The daemon runs as {s['user']}, because the shell it opens is {s['user']}'s (and may sudo).
+# It reads no config: settings below, the password hash and code secret through LoadCredential.
+[Unit]
+Description=hb web shell (WireGuard; public only while hb webshell open)
+After=network-online.target wg-quick@{s['iface']}.service
+Wants=network-online.target
+
+[Service]
+User={s['user']}
+Group={grp.getgrgid(pwd.getpwnam(s['user']).pw_gid).gr_name}
+ExecStart={os.path.join(util.HB_ROOT, 'tools', 'hb-webshell')} {' '.join(args)}
+LoadCredential=auth:{AUTH}
+StateDirectory=hb-webshell
+StateDirectoryMode=0700
+UMask=0077
+Environment=LANG=C.UTF-8
+Restart=on-failure
+RestartSec=5
+# Stopping or restarting the daemon leaves the tmux session "web" (and what runs in it) alone.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def chk_unit(s):
+    if os.stat(util.HB_ROOT).st_uid != 0:
+        return 2, f"run from the installed copy (sudo hb webshell ...), not {util.HB_ROOT}"
+    try:
+        with open(UNIT) as f:
+            have = f.read()
+    except FileNotFoundError:
+        return 1, f"will write {UNIT}"
+    if have != unit_wanted(s):
+        return 1, f"{UNIT} will be rewritten from hb.toml"
+    return 0, f"runs as {s['user']}, listens on {s['addr']}:{s['port']}" + (
+        f", public name {s['host']}" if s["host"] and s["ingress_from"] else "")
+
+
+def fix_unit(s, cfg):
+    util.write_atomic(UNIT, unit_wanted(s), mode=0o644)
+    rc, _, err = util.run("systemctl", "daemon-reload")
+    if rc:
+        return err.strip()
+    util.run("systemctl", "try-restart", NAME)
+    return None
+
+
+# --- service ----------------------------------------------------------------------------
+
+def listening(s):
+    rc, out, _ = util.run("ss", "-lntH", f"sport = :{s['port']}")
+    return [line.split()[3] for line in out.splitlines() if len(line.split()) > 3]
+
+
+CODE = ("lib/hbkit/webshell.py", "lib/hbkit/otp.py", "lib/hbkit/util.py", "tools/hb-webshell", "web")
+
+
+def code_changed_since(started):
+    """True when the daemon's code or pages on disk are newer than the running daemon."""
+    newest = 0.0
+    for rel in CODE:
+        path = os.path.join(util.HB_ROOT, rel)
+        for root, _, files in os.walk(path) if os.path.isdir(path) else [(os.path.dirname(path), [], [path])]:
+            for f in files:
+                try:
+                    newest = max(newest, os.stat(os.path.join(root, f)).st_mtime)
+                except OSError:
+                    pass
+    return newest > started
+
+
+def started_at():
+    """When the daemon started (wall clock), or None."""
+    rc, out, _ = util.run("systemctl", "show", NAME, "-p", "ActiveEnterTimestampMonotonic", "--value")
+    try:
+        mono = int(out.strip()) / 1e6
+    except ValueError:
+        return None
+    return time.time() - (time.monotonic() - mono) if mono else None
+
+
+def chk_service(s):
+    if not os.path.exists(UNIT):
+        return 1, "write the unit first"
+    enabled = util.run("systemctl", "is-enabled", "-q", NAME)[0] == 0
+    active = util.run("systemctl", "is-active", "-q", NAME)[0] == 0
+    if not (enabled and active):
+        return 1, "will enable and start " + NAME
+    started = started_at()
+    if started and code_changed_since(started):
+        return 1, "runs older code than is installed; apply restarts it (the tmux session stays)"
+    want = f"{s['addr']}:{s['port']}"
+    where = listening(s)
+    if where and where != [want]:
+        return 2, f"something listens on {', '.join(where)}, not only {want}"
+    if not where:
+        return 1, f"{NAME} runs but nothing listens on {want}: journalctl -u {NAME}"
+    return 0, f"http://{want}"
+
+
+def fix_service(s, cfg):
+    rc, _, err = util.run("systemctl", "enable", "--now", NAME)
+    if rc:
+        return err.strip()
+    started = started_at()
+    if started and code_changed_since(started):
+        rc, _, err = util.run("systemctl", "restart", NAME)
+        if rc:
+            return err.strip()
+    time.sleep(2)
+    if util.run("systemctl", "is-active", "-q", NAME)[0]:
+        return f"{NAME} didn't stay up: journalctl -u {NAME}"
+    return None
+
+
+# --- firewall ---------------------------------------------------------------------------
+
+def zones_opening(port):
+    """The firewalld zones whose ports open port/tcp."""
+    rc, out, _ = util.run("firewall-cmd", "--list-all-zones")
+    zones, zone = set(), None
+    for line in out.splitlines():
+        if line and not line[0].isspace():
+            zone = line.split()[0]
+        elif line.strip().startswith("ports:") and f"{port}/tcp" in line.split()[1:]:
+            zones.add(zone)
+    return zones
+
+
+def chk_firewall(s):
+    rc, zone, _ = util.run("firewall-cmd", f"--get-zone-of-interface={s['iface']}")
+    zone = zone.strip()
+    if rc or not zone:
+        return 2, f"{s['iface']} has no firewalld zone: hb fw"
+    zones = zones_opening(s["port"])
+    others = sorted(zones - {zone})
+    if others:
+        return 2, f"{s['port']}/tcp is open in zone {' '.join(others)}, not only {zone}: remove it there (hb fw)"
+    if zone not in zones:
+        return 2, f"{s['port']}/tcp isn't open in zone {zone}: add \"{s['port']}/tcp\" to fw.zones.{zone}.ports, then hb fw apply"
+    return 0, f"{s['port']}/tcp open in zone {zone} only"
+
+
+ITEMS = (("login", chk_login, fix_login), ("unit", chk_unit, fix_unit),
+         ("service", chk_service, fix_service), ("firewall", chk_firewall, None))
+
+
+# --- the public window ----------------------------------------------------------------------
+
+def kubectl(*args, input=None, timeout=60):
+    return util.run(*KUBECTL, *args, input=input, timeout=timeout)
+
+
+def manifests(s):
+    meta = {"name": NAME, "namespace": s["ns"], "labels": {"app.kubernetes.io/managed-by": "hb"}}
+    svc = {"apiVersion": "v1", "kind": "Service", "metadata": meta,
+           "spec": {"ports": [{"name": "http", "port": s["port"], "targetPort": s["port"], "protocol": "TCP"}]}}
+    eps = {"apiVersion": "discovery.k8s.io/v1", "kind": "EndpointSlice", "addressType": "IPv4",
+           "metadata": {**meta, "labels": {**meta["labels"], "kubernetes.io/service-name": NAME,
+                                           "endpointslice.kubernetes.io/managed-by": "hb"}},
+           "ports": [{"name": "http", "port": s["port"], "protocol": "TCP"}],
+           "endpoints": [{"addresses": [s["addr"]], "conditions": {"ready": True}}]}
+    cert = {"apiVersion": "cert-manager.io/v1", "kind": "Certificate", "metadata": meta,
+            "spec": {"secretName": f"{NAME}-tls", "dnsNames": [s["host"]],
+                     "issuerRef": {"name": s["issuer"], "kind": "ClusterIssuer"}}}
+    ann = {"traefik.ingress.kubernetes.io/router.middlewares": s["middlewares"]} if s["middlewares"] else {}
+    ing = {"apiVersion": "networking.k8s.io/v1", "kind": "Ingress", "metadata": {**meta, "annotations": ann},
+           "spec": {"ingressClassName": s["class"], "tls": [{"hosts": [s["host"]], "secretName": f"{NAME}-tls"}],
+                    "rules": [{"host": s["host"], "http": {"paths": [{"path": "/", "pathType": "Prefix", "backend": {
+                        "service": {"name": NAME, "port": {"number": s["port"]}}}}]}}]}}
+    return [svc, eps, cert], ing
+
+
+def window():
+    """(until, host) of the public window, or (0, "") when closed."""
+    data = util.read_json(os.path.join(STATE_DIR, "public"), {})
+    try:
+        return float(data.get("until", 0)), str(data.get("host", ""))
+    except (AttributeError, TypeError, ValueError):
+        return 0.0, ""
+
+
+def ingress_exists(s):
+    rc, _, _ = kubectl("get", "ingress", NAME, "-n", s["ns"], "-o", "name")
+    return rc == 0
+
+
+def parse_duration(text, max_hours):
+    m = re.fullmatch(r"(\d+)\s*([mh])", text.strip().lower())
+    if not m:
+        return None
+    secs = int(m.group(1)) * (3600 if m.group(2) == "h" else 60)
+    return secs if 0 < secs <= max_hours * 3600 else None
+
+
+def stop_timer():
+    util.run("systemctl", "stop", f"{TIMER}.timer")
+    util.run("systemctl", "reset-failed", f"{TIMER}.timer", f"{TIMER}.service")
+
+
+def do_open(s, arg):
+    for need, why in ((s["host"], "webshell.host"), (s["ingress_from"], "webshell.ingress_from"),
+                      (s["issuer"], "webshell.issuer")):
+        if not need:
+            print(f"public mode needs {why} in hb.toml")
+            return 2
+    secs = parse_duration(arg or "2h", s["max_hours"])
+    if secs is None:
+        print(f"duration like 30m or 2h, at most {s['max_hours']}h")
+        return 2
+    if chk_service(s)[0]:
+        print(f"the daemon isn't serving: sudo hb webshell apply first ({chk_service(s)[1]})")
+        return 2
+    try:
+        socket.getaddrinfo(s["host"], 443)
+    except OSError:
+        print(f"{s['host']} doesn't resolve: add its DNS record first")
+        return 2
+    keep, ing = manifests(s)
+    for obj in keep + [ing]:
+        rc, out, err = kubectl("apply", "-f", "-", input=json.dumps(obj))
+        if rc:
+            print(f"kubectl apply {obj['kind']} failed: {err.strip()}")
+            return 2
+    until = time.time() + secs
+    util.write_json(os.path.join(STATE_DIR, "public"), {"until": until, "host": s["host"],
+                                                       "opened": int(time.time())}, mode=0o644)
+    stop_timer()
+    rc, _, err = util.run("systemd-run", f"--unit={TIMER}", f"--on-active={secs}", "--timer-property=AccuracySec=10s",
+                          "--description=hb webshell: close the public window", util.HB, "webshell", "close", "--timer")
+    if rc:
+        print(f"warning: no close timer ({err.strip()}); the daemon still refuses the ingress after the window")
+    at = datetime.datetime.fromtimestamp(until)
+    util.notify("warn", "webshell.public", f"web shell public at {s['host']} until {at:%H:%M}")
+    print(f"open until {at:%d %b %H:%M}: https://{s['host']}/")
+    for i in range(36):                          # the first open waits for the certificate
+        rc, out, _ = kubectl("get", "certificate", NAME, "-n", s["ns"], "-o",
+                             'jsonpath={.status.conditions[?(@.type=="Ready")].status}')
+        if out.strip() == "True":
+            print("certificate ready")
+            break
+        if i == 0:
+            print("waiting for the certificate (HTTP-01 through the ingress, usually under a minute)...")
+        time.sleep(5)
+    else:
+        print(f"the certificate isn't ready yet: kubectl describe certificate {NAME} -n {s['ns']}")
+    return 0
+
+
+def do_close(s, by_timer):
+    rc, _, err = kubectl("delete", "ingress", NAME, "-n", s["ns"], "--ignore-not-found")
+    try:
+        os.remove(os.path.join(STATE_DIR, "public"))
+    except FileNotFoundError:
+        pass
+    if not by_timer:
+        stop_timer()
+    if rc:
+        print(f"kubectl delete ingress failed: {err.strip()}")
+        util.notify("fail", "webshell.close", f"couldn't remove the web shell's ingress: {err.strip()[:120]}")
+        return 2
+    util.notify("info", "webshell.public", "web shell closed to the internet")
+    print("closed: WireGuard only")
+    return 0
+
+
+def do_unlock():
+    try:
+        os.remove(os.path.join(STATE_DIR, "lock"))
+        print("logins open again")
+    except FileNotFoundError:
+        print("not locked")
+    return 0
+
+
+# --- verdicts ---------------------------------------------------------------------------------
+
+def extra_checks(s):
+    """(rc, line) for the lock and the window, beyond the items."""
+    lock = util.read_json(os.path.join(STATE_DIR, "lock"), None)
+    if lock is not None:
+        since = datetime.datetime.fromtimestamp(lock.get("since", 0)) if isinstance(lock, dict) else None
+        return 2, f"logins locked after {lock.get('failures', '?')} failures" + (
+            f" since {since:%d %b %H:%M}" if since else "") + ": sudo hb webshell unlock"
+    until, host = window()
+    if until > time.time():
+        return 0, f"public at {host} until {datetime.datetime.fromtimestamp(until):%H:%M}"
+    if s["host"] and ingress_exists(s):
+        return 2, "the public window has passed but the Ingress is still there: sudo hb webshell close"
+    return 0, "WireGuard only"
+
+
+def verdict(s):
+    worst, parts = 0, []
+    for name, chk, _ in ITEMS:
+        rc, line = chk(s)
+        if rc:
+            worst = max(worst, rc)
+            parts.append(f"{name}: {line}")
+    rc, line = extra_checks(s)
+    worst = max(worst, rc)
+    if rc or not parts:
+        parts.append(line)
+    return worst, f"{['ok', 'warn', 'fail'][worst]}: " + "; ".join(parts)
+
+
+def do_status(s):
+    worst = 0
+    for name, chk, _ in ITEMS:
+        rc, line = chk(s)
+        worst = max(worst, rc)
+        print(f"{['ok', 'todo', 'FAIL'][rc]:<5} {name:<9} {line}")
+    rc, line = extra_checks(s)
+    print(f"{['ok', 'todo', 'FAIL'][rc]:<5} {'window':<9} {line}")
+    st = util.read_json(os.path.join(STATE_DIR, "status.json"), {})
+    if isinstance(st, dict) and st:
+        last = st.get("last_login") or {}
+        print(f"      {st.get('sessions', 0)} sessions, {st.get('terminals', 0)} terminals"
+              + (f"; last login {datetime.datetime.fromtimestamp(last['at']):%d %b %H:%M} from {last.get('client')}"
+                 f" via {last.get('via')}" if last.get("at") else ""))
+    return max(worst, rc)
+
+
+def do_plan(s, cfg, apply=False, yes=False):
+    worst, todo = 0, 0
+    for name, chk, fix in ITEMS:
+        rc, line = chk(s)
+        if rc == 0:
+            continue
+        todo += 1
+        print(f"{name}: {line}")
+        if rc == 2 or not apply or fix is None:
+            worst = max(worst, rc)
+            continue
+        if not yes and not util.ask(f"  apply {name}?"):
+            worst = max(worst, 1)
+            continue
+        err = fix(s, cfg)
+        rc, line = chk(s)
+        print(f"  now: {line}" if not err else f"  failed: {err}")
+        worst = max(worst, rc if not err else 2)
+    if not todo:
+        print("nothing to change")
+    return worst
+
+
+def main(argv):
+    verb = argv[1] if len(argv) > 1 else "status"
+    if verb in ("help", "-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if verb == "serve":                          # the daemon, as webshell.user; reads no config
+        from hbkit import webshell
+        return webshell.main(argv[2:])
+    if os.geteuid() != 0:
+        print("error: run with sudo", file=sys.stderr)
+        return 2
+    from hbkit import config
+    cfg = config.load()
+    s = settings(cfg)
+    if s is None:
+        if verb == "check":
+            print("ok: not managed")
+        else:
+            print("not managed (no webshell.user)")
+        return 0
+    why = prereq(s)
+    if why:
+        print(f"fail: {why}" if verb == "check" else why)
+        return 2
+    if verb == "check":
+        rc, line = verdict(s)
+        print(line)
+        return rc
+    if verb == "status":
+        return do_status(s)
+    with util.Lock(os.path.join(util.state_dir("webshell"), "lock")):
+        if verb == "plan":
+            return do_plan(s, cfg)
+        if verb == "apply":
+            return do_plan(s, cfg, apply=True, yes="--yes" in argv[2:])
+        if verb == "password":
+            err = fix_login(s, cfg)
+            print(err or "saved; the daemon restarted with it (the tmux session stays)")
+            return 2 if err else 0
+        if verb == "open":
+            return do_open(s, argv[2] if len(argv) > 2 else "")
+        if verb == "close":
+            return do_close(s, "--timer" in argv[2:])
+        if verb == "unlock":
+            return do_unlock()
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

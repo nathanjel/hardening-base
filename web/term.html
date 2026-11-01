@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>{{TITLE}} shell</title>
+<link rel="stylesheet" href="/static/xterm.css">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="term">
+<header>
+  <span class="host">{{TITLE}}</span>
+  <span id="status" role="status"></span>
+  <button type="button" id="reconnect" hidden>Reconnect</button>
+  <form method="post" action="/logout"><button type="submit">Log out</button></form>
+</header>
+<div id="term"></div>
+<script src="/static/xterm.js"></script>
+<script src="/static/addon-fit.js"></script>
+<script src="/static/term.js"></script>
+</body>
+</html>

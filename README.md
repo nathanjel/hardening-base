@@ -36,6 +36,7 @@ timers run) and the config to `/etc/hb/hb.toml`.
 | `hb-probe` | stdlib-only outside scan (TCP and a few UDP services) to run from another network |
 | `hb-ssh` | who may log in and how: root-owned keys from `hb.toml`, one allowed group, key plus code from the internet and key only over WireGuard; applied with a revert timer |
 | `hb-totp` | the code behind the key: RFC 6238 codes from an authenticator app and single-use recovery codes, checked by PAM through `pam_exec` |
+| `hb-webshell` | your shell (tmux) in a browser: over WireGuard always, from the internet only for a window you open (`hb webshell open 2h`); own password and code, rate limits, stdlib daemon, pinned xterm.js |
 | `hb-share` | Windows drive letters over WireGuard: Samba on the tunnel interface only, SMB 3.1.1 with signing, one user |
 | `hb-breakglass` | a rescue account and a printable kit for one trusted person: passphrase-protected key, recovery codes, console password, its own restic key; logging in to it sends an SMS |
 | `hb-snapshot` | read-only btrfs snapshots of `/` before risky changes |

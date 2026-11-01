@@ -1,14 +1,16 @@
 # Phase 5: comfort
 
-Phase 5 makes the box pleasant to work with from your PCs, without opening
-anything new to the internet: drive letters over WireGuard (`hb share`), then
-a web shell (`hb webshell`, still being written). Keep a filled-in copy of this
-runbook in `local/`.
+Phase 5 makes the box pleasant to work with from your PCs: drive letters over
+WireGuard (`hb share`), and your shell in a browser (`hb webshell`), over
+WireGuard always and from the internet only for a window you open. Keep a
+filled-in copy of this runbook in `local/`.
 
 | Piece | Tool | What changes on the system |
 |---|---|---|
 | Port 445 in the tunnel's zone | `hb fw apply` | one port in the WireGuard zone |
 | Windows shares | `hb share apply` | the samba package; missing share folders in the user's home; `/etc/samba/smb.conf`; `/etc/systemd/system/smb.service.d/hb-share.conf` (IPAddressAllow); smb running, nmb off; the user's Samba password |
+| Web shell | `hb webshell apply` | `/etc/hb/webshell.json` (password hash, code secret); `/etc/systemd/system/hb-webshell.service`, running as the user |
+| Its public window | `hb webshell open` | a Service, EndpointSlice, Certificate and Ingress in the cluster; a timer that closes it |
 
 **How the shares work.** Samba can't bind to a WireGuard interface: the
 interface has no broadcast or peer address, and Samba's interface probe skips
@@ -87,7 +89,86 @@ Fedora's sample `smb.conf` is kept under `/var/lib/hb/backup/<run>/`. Take 445
 out of the zone's `ports` and run `hb fw apply`; `sudo dnf remove samba` if you
 want the package gone too.
 
-## The web shell
+# Part 2: the web shell
 
-Not written yet. See the design page: WireGuard-only by default, opened to the
-internet for a set time with `hb webshell open 2h`.
+**How it works.** A small daemon (`lib/hbkit/webshell.py`, standard library
+only) runs as you and listens on the WireGuard address only. After a login it
+opens your shell in tmux (session `web`, shared with SSH's tmux if one runs),
+shown by vendored xterm.js (sha256-pinned, same origin). Over the tunnel it is
+plain HTTP at `http://<wg address>:7681`, encrypted by WireGuard.
+
+The public window doesn't open a port. `hb webshell open 2h` applies an
+Ingress for `webshell.host` (with a cert-manager certificate) whose
+EndpointSlice points at the WireGuard address, so the existing ingress on 443
+carries it. Pods already reach the host through the trusted zone. The daemon
+answers the ingress only while the window lasts, only for that name, and only
+over HTTPS. A timer runs `hb webshell close` at the end.
+
+**Guards.** A password of its own (scrypt) plus a 6-digit code from its own
+authenticator entry, each code used once. 5 failed logins per address in 15
+minutes; after 20 in an hour, logins stop for everyone until `hb webshell
+unlock`, and `hb check` fails (an SMS). Sessions last 12 hours at most and end
+after 30 idle minutes; the cookie is HttpOnly and SameSite=Strict (`__Host-`
+and Secure over HTTPS). Every POST and the WebSocket must come from the site's
+own Origin. No inline script, no framing. Request, body and frame sizes are
+capped, and at most 3 terminals can be open. The log names who logged in or
+failed and from where, never what was typed or shown.
+
+The daemon reads no config: root writes its settings into the unit, and
+systemd hands it the password hash and code secret (`LoadCredential`), so
+those stay root-only on disk. It isn't sandboxed, because the shell it opens
+is yours and may run sudo; its protection is the login and the window.
+
+**Risk.** Over WireGuard, low. The public window puts your shell one password
+and one code away from anyone, so keep it short.
+
+## 5. Port 7681 in the tunnel's zone
+
+Add `"7681/tcp"` to the WireGuard zone's `ports` in `hb.toml`, then:
+
+    sudo ./hb install apply
+    sudo hb fw apply              # and hb fw confirm from a new session
+
+## 6. The web shell
+
+In `hb.toml`: `webshell.user` (and, for the public window, `host`,
+`ingress_from`, `issuer`, `middlewares`). Then:
+
+    sudo hb webshell plan
+    sudo hb webshell apply        # asks for the password, then shows a QR code for the app
+
+Use a new password (12 characters or more). The app gets a second entry,
+`<host>:<you>-web`, separate from SSH's. On a PC with the tunnel up, open
+`http://<wg address>:7681`, log in, and you're in tmux session `web`.
+
+## 7. The public window (optional)
+
+It needs a DNS name for `webshell.host` pointing at the server.
+
+    sudo hb webshell open 30m     # the first time also waits for the certificate
+
+Open `https://<host>/` from another network (a phone on mobile data), log in,
+then `sudo hb webshell close`, or let the timer do it. `sudo hb webshell
+status` shows the window, sessions and the last login.
+
+Then:
+
+    sudo hb check
+
+## Living with the web shell
+
+- Closing the tab leaves tmux running; the next login attaches to it again.
+  `exit` in the shell ends the tmux session.
+- A new phone: `sudo hb webshell password` (a new password and a new app entry).
+- Locked out after failed attempts: `sudo hb webshell unlock`.
+- Restarting the daemon (or `hb install apply` plus a restart) leaves the tmux
+  session alone (KillMode=process).
+
+## Rolling back the web shell
+
+    sudo hb webshell close
+    sudo systemctl disable --now hb-webshell
+    sudo rm /etc/systemd/system/hb-webshell.service /etc/hb/webshell.json && sudo systemctl daemon-reload
+    sudo /snap/bin/microk8s kubectl delete service,endpointslice,certificate hb-webshell -n <namespace>
+
+Take 7681 out of the zone's `ports` and run `hb fw apply`.

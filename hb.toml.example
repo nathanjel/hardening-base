@@ -127,3 +127,17 @@ note = ""                     # top of the kit page: where the provider login is
 # Open 445/tcp in the WireGuard zone first: add "445/tcp" to fw.zones.<zone>.ports.
 user = ""                     # e.g. "you"; empty: hb share manages nothing
 shares = []                   # "NAME PATH", e.g. "workspaces ~/workspaces"; ~ is the user's home
+
+[webshell]
+# Your shell in a browser, over WireGuard (http://<wg address>:<port>). Open 7681/tcp in the
+# WireGuard zone first. Public mode is optional: `hb webshell open 2h` publishes host through
+# the cluster's ingress for that long, then closes by itself.
+user = ""                     # whose shell; empty: hb webshell manages nothing
+port = 7681
+host = ""                     # public name, e.g. "shell.example.org" (a DNS record to this server); empty: WireGuard only
+ingress_from = []             # where the ingress connects from (the pod network), e.g. ["10.1.0.0/16"]
+ingress_class = "public"      # the cluster's ingress class
+namespace = "default"         # where the Service, EndpointSlice, Certificate and Ingress go
+issuer = ""                   # cert-manager ClusterIssuer for host, e.g. "letsencrypt"
+middlewares = ""              # traefik router.middlewares annotation, e.g. "default-redirect-https@kubernetescrd"
+max_hours = 12                # the longest window hb webshell open allows

@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>{{TITLE}} shell</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="login">
+<main>
+  <h1>{{TITLE}}</h1>
+  <form method="post" action="/login" autocomplete="off">
+    <label>Password
+      <input type="password" name="password" maxlength="256" autocomplete="current-password" required autofocus>
+    </label>
+    <label>Code from the app
+      <input type="text" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6"
+             autocomplete="one-time-code" required>
+    </label>
+    <button type="submit">Log in</button>
+    <p class="msg" role="status">{{MESSAGE}}</p>
+  </form>
+</main>
+</body>
+</html>
