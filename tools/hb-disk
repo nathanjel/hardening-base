@@ -1,0 +1,421 @@
+#!/usr/bin/python3 -IB
+"""hb-disk — what's eating the disk, and big folders nobody has touched in a while.
+
+  hb disk [show]           filesystems now, then the last scan: the biggest folders,
+                           what grew since the scan before, and folders of disk.stale_gb
+                           or more with no file changed for disk.stale_days
+  hb disk scan [--quiet]   walk every local filesystem and keep the result
+                           (hb-disk.timer, Sundays 03:15; a minute or two)
+  hb disk scan PATH        walk one folder and print the same report, keeping nothing
+                           (works without sudo, for what you can read)
+  hb disk check            one line from the last scan
+
+It only reports: nothing is ever deleted (hb clean frees space from build output,
+caches and Docker). It walks local filesystems (btrfs, ext4, xfs, vfat) and never
+network shares, other mounts (snaps, containers, tmpfs) or hb's snapshots, and
+counts a hard-linked file once. "Untouched" goes by the newest file inside, so
+deleting files (hb clean's build folders, say) doesn't make a folder look used.
+
+Config ([disk] in hb.toml): show_gb, stale_roots, stale_days, stale_gb,
+stale_ignore (globs: a folder and everything under it), skip (folders not walked).
+"""
+import fnmatch
+import os
+import stat
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+from hbkit import config, util  # noqa: E402
+
+GB = 10 ** 9
+DAY = 86400
+KEEP = 256 * 10 ** 6          # folders this big are kept in a box scan (for growth and stale)
+KEEP_PATH = 10 ** 6           # and in a scan of one folder, which is smaller and not kept
+LOCAL_FS = {"btrfs", "ext2", "ext3", "ext4", "xfs", "vfat", "f2fs", "zfs"}
+NETWORK_FS = {"nfs", "nfs4", "cifs", "smb3", "sshfs", "fuse.sshfs", "ceph", "glusterfs"}
+BTRFS_SUBVOL_INO = 256
+SCAN_WARN_DAYS = 15
+TOP_GROWTH = 10
+
+
+def human(n):
+    sign = "-" if n < 0 else ""
+    n = abs(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1000:
+            return f"{sign}{n:.0f} {unit}" if unit == "B" else f"{sign}{n:.1f} {unit}"
+        n /= 1000
+    return f"{sign}{n:.1f} TB"
+
+
+def ddir():
+    return util.state_dir("disk")
+
+
+# --- mounts -------------------------------------------------------------------------------
+
+def unescape(s):
+    return s.replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n").replace("\\134", "\\")
+
+
+def mounts(text=None):
+    """[(mount point, fs type, root within the fs)] from /proc/self/mountinfo."""
+    if text is None:
+        with open("/proc/self/mountinfo") as f:
+            text = f.read()
+    out = []
+    for line in text.splitlines():
+        f = line.split()
+        if "-" not in f:
+            continue
+        i = f.index("-")
+        out.append((unescape(f[4]), f[i + 1], unescape(f[3])))
+    return out
+
+
+def walkable(fstype, root, ino):
+    """Is this mount a whole local filesystem (or btrfs subvolume) of its own?
+    Bind mounts of a folder are skipped: the folder is walked where it really is."""
+    if fstype not in LOCAL_FS:
+        return False
+    return root == "/" or (fstype == "btrfs" and ino == BTRFS_SUBVOL_INO)
+
+
+def mount_rules(mount_list):
+    """{mount point: walk it?} for every mount but /."""
+    rules = {}
+    for mp, fstype, root in mount_list:
+        if mp == "/":
+            continue
+        try:
+            ino = os.lstat(mp).st_ino
+        except OSError:
+            ino = 0
+        rules[mp] = walkable(fstype, root, ino)
+    return rules
+
+
+# --- the walk -----------------------------------------------------------------------------
+
+class Progress:
+    def __init__(self, on):
+        self.on, self.last, self.files = on and sys.stderr.isatty(), time.time(), 0
+
+    def tick(self, files):
+        self.files += files
+        if self.on and time.time() - self.last > 1:
+            self.last = time.time()
+            print(f"\r  {self.files:,} files...", end="", file=sys.stderr, flush=True)
+
+    def done(self):
+        if self.on:
+            print("\r" + " " * 30 + "\r", end="", file=sys.stderr, flush=True)
+
+
+def _read(path, seen_files):
+    """(subfolders, bytes, files, newest file mtime) of one folder's own entries."""
+    subs, size, files, newest = [], 0, 0, 0
+    with os.scandir(path) as it:
+        for e in it:
+            try:
+                st = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                subs.append((e.path, st))
+                continue
+            if st.st_mtime > newest:
+                newest = st.st_mtime
+            if st.st_nlink > 1:
+                key = (st.st_dev, st.st_ino)
+                if key in seen_files:
+                    continue
+                seen_files.add(key)
+            size += st.st_blocks * 512
+            files += 1
+    return subs, size, files, newest
+
+
+def walk(top, skip=(), rules=None, keep=KEEP, progress=None):
+    """{"dirs": {folder: [bytes, files, newest]} for folders of `keep` bytes or more
+    (and top), "unreadable": folders that couldn't be listed}. `rules` maps mount points
+    to whether they are walked; skip lists folders that never are."""
+    rules = rules or {}
+    skip = {os.path.normpath(s) for s in skip}
+    dirs, seen_files, seen_dirs, unreadable = {}, set(), set(), 0
+    progress = progress or Progress(False)
+    frames = []
+
+    def enter(path):
+        nonlocal unreadable
+        try:
+            subs, b, f, n = _read(path, seen_files)
+        except OSError:
+            unreadable += 1
+            subs, b, f, n = [], 0, 0, 0
+        progress.tick(f)
+        frames.append([path, subs, b, f, n])
+
+    top = os.path.normpath(top)
+    st = os.lstat(top)
+    seen_dirs.add((st.st_dev, st.st_ino))
+    enter(top)
+    while frames:
+        fr = frames[-1]
+        if fr[1]:
+            path, st = fr[1].pop()
+            if path in skip or not rules.get(path, True) or (st.st_dev, st.st_ino) in seen_dirs:
+                continue
+            seen_dirs.add((st.st_dev, st.st_ino))
+            enter(path)
+            continue
+        frames.pop()
+        path, _, b, f, n = fr
+        if b >= keep or path == top:
+            dirs[path] = [b, f, int(n)]
+        if frames:
+            parent = frames[-1]
+            parent[2] += b
+            parent[3] += f
+            parent[4] = max(parent[4], n)
+    progress.done()
+    return {"dirs": dirs, "unreadable": unreadable}
+
+
+# --- reading a scan -----------------------------------------------------------------------
+
+def children(dirs):
+    kids = {}
+    for p in dirs:
+        parent = os.path.dirname(p)
+        if parent != p and parent in dirs:
+            kids.setdefault(parent, []).append(p)
+    return kids
+
+
+def tree(dirs, top, min_bytes, depth=3):
+    """Lines for the biggest folders under top: size, then the name indented by depth.
+    A folder that is nearly all one subfolder is shown as one line (a/b/c)."""
+    kids = children(dirs)
+    out = [f"{human(dirs[top][0]):>9}  {top}"]
+
+    def big(p):
+        return sorted((c for c in kids.get(p, []) if dirs[c][0] >= min_bytes), key=lambda c: -dirs[c][0])
+
+    def show(path, level):
+        for c in big(path):
+            while True:
+                k = big(c)
+                if len(k) == 1 and dirs[k[0]][0] >= 0.9 * dirs[c][0]:
+                    c = k[0]
+                    continue
+                break
+            out.append(f"{human(dirs[c][0]):>9}  {'  ' * level}{os.path.relpath(c, path)}")
+            if level < depth:
+                show(c, level + 1)
+
+    show(top, 1)
+    return out
+
+
+def under(path, root):
+    return path != root and path.startswith(root.rstrip("/") + "/")
+
+
+def ignored(path, globs):
+    return any(fnmatch.fnmatchcase(path, g) or fnmatch.fnmatchcase(path, g.rstrip("/") + "/*") for g in globs)
+
+
+def stale(dirs, cfg, now=None):
+    """[(folder, bytes, newest)] of disk.stale_gb or more under a stale root, whose newest
+    file is older than disk.stale_days; the outermost such folder only, biggest first."""
+    now = now or time.time()
+    d = cfg["disk"]
+    limit, cutoff = float(d["stale_gb"]) * GB, now - int(d["stale_days"]) * DAY
+    found = sorted(p for p, (b, _, newest) in dirs.items()
+                   if b >= limit and newest < cutoff
+                   and any(under(p, r) for r in d["stale_roots"]) and not ignored(p, d["stale_ignore"]))
+    outer = []
+    for p in found:
+        if not any(under(p, o) for o in outer):
+            outer.append(p)
+    return sorted(((p, dirs[p][0], dirs[p][2]) for p in outer), key=lambda x: -x[1])
+
+
+def growth(dirs, prev, min_bytes=GB):
+    """[(folder, bytes grown)] where a folder grew by min_bytes or more and no subfolder
+    accounts for most of it (the place that grew, not its parents), biggest first."""
+    delta = {p: v[0] - prev.get(p, [0])[0] for p, v in dirs.items()}
+    kids = children(dirs)
+    out = []
+    for p, g in delta.items():
+        if g < min_bytes:
+            continue
+        if any(delta[c] >= 0.8 * g for c in kids.get(p, [])):
+            continue
+        out.append((p, g))
+    return sorted(out, key=lambda x: -x[1])[:TOP_GROWTH]
+
+
+def filesystems():
+    """Lines for every local filesystem and network share: used, size, free."""
+    lines, seen = [], set()
+    for mp, fstype, root in mounts():
+        if mp in seen:
+            continue
+        if fstype in LOCAL_FS and (root == "/" or mp == "/"):
+            seen.add(mp)
+            try:
+                v = os.statvfs(mp)
+            except OSError:
+                continue
+            total, free = v.f_blocks * v.f_frsize, v.f_bavail * v.f_frsize
+            used = total - v.f_bfree * v.f_frsize
+            lines.append(f"  {mp:<22} {human(used):>9} of {human(total):>9} used "
+                         f"({100 * used / total if total else 0:.0f}%), {human(free)} free  {fstype}")
+        elif fstype in NETWORK_FS:
+            seen.add(mp)
+            rc, out, _ = util.run("df", "-P", "-B1", mp, timeout=10)   # a dead share must not hang us
+            f = out.splitlines()[-1].split() if rc == 0 and out.strip() else []
+            if len(f) >= 4 and f[1].isdigit():
+                total, used, free = int(f[1]), int(f[2]), int(f[3])
+                lines.append(f"  {mp:<22} {human(used):>9} of {human(total):>9} used "
+                             f"({100 * used / total if total else 0:.0f}%), {human(free)} free  {fstype}")
+            else:
+                lines.append(f"  {mp:<22} not answering ({fstype})")
+    return lines
+
+
+def when(ts, fmt="%a %d %b %H:%M"):
+    return time.strftime(fmt, time.localtime(ts))
+
+
+def report(scan, cfg, prev=None, now=None):
+    d = cfg["disk"]
+    dirs = scan["dirs"]
+    top = scan["top"]
+    # the box: show_gb; one folder: down to 5% of it, so a small one still shows something
+    show = max(min(float(d["show_gb"]) * GB, dirs[top][0] * 0.05), scan.get("keep", KEEP))
+    lines = [f"Scan of {top}, {when(scan['ts'])} ({scan['secs']:.0f} s): "
+             f"{human(dirs[top][0])} in {dirs[top][1]:,} files"]
+    if scan.get("unreadable"):
+        lines.append(f"  {scan['unreadable']} folders couldn't be read" +
+                     ("" if os.geteuid() == 0 else " (run with sudo to see everything)"))
+    lines += ["", f"Biggest folders ({human(show)} or more)"]
+    lines += ["  " + line for line in tree(dirs, top, show)]
+    if prev and prev.get("top") == top:
+        g = growth(dirs, prev["dirs"])
+        total = dirs[top][0] - prev["dirs"].get(top, [0])[0]
+        lines += ["", f"Since {when(prev['ts'])}: {'+' if total >= 0 else ''}{human(total)} in all"]
+        lines += [f"  +{human(b):>8}  {p}" for p, b in g] or ["  no folder grew by 1 GB or more"]
+    s = stale(dirs, cfg, now)
+    lines += ["", f"Untouched for {d['stale_days']}+ days ({d['stale_gb']} GB or more; hb never deletes these)"]
+    lines += [f"  {human(b):>9}  since {when(n, '%d %b %Y')}  {p}" for p, b, n in s] or ["  none"]
+    return lines
+
+
+# --- verbs --------------------------------------------------------------------------------
+
+def scan_box(cfg, progress=None):
+    """Walk / and every local filesystem under it."""
+    skip = [cfg["snapshot"]["dir"]] + list(cfg["disk"]["skip"])
+    t = time.time()
+    r = walk("/", skip=skip, rules=mount_rules(mounts()), progress=progress)
+    r.update(top="/", ts=int(t), secs=round(time.time() - t, 1), keep=KEEP)
+    return r
+
+
+def do_scan(cfg, path=None, quiet=False):
+    progress = Progress(not quiet)
+    if path:
+        t = time.time()
+        top = os.path.abspath(path)
+        r = walk(top, skip=[cfg["snapshot"]["dir"]] + list(cfg["disk"]["skip"]),
+                 rules=mount_rules(mounts()), keep=KEEP_PATH, progress=progress)
+        r.update(top=top, ts=int(t), secs=round(time.time() - t, 1), keep=KEEP_PATH)
+        print("\n".join(report(r, cfg)))
+        return 0
+    if os.geteuid() != 0:
+        print("error: a whole-box scan needs sudo (or give a folder: hb disk scan ~/)", file=sys.stderr)
+        return 2
+    r = scan_box(cfg, progress)
+    d = ddir()
+    last = os.path.join(d, "last.json")
+    if os.path.exists(last):
+        os.replace(last, os.path.join(d, "prev.json"))
+    util.write_json(last, r)
+    if quiet:
+        print(verdict(cfg)[1])
+    else:
+        do_show(cfg, fs=False)
+    return 0
+
+
+def load():
+    d = os.path.join(util.STATE, "disk")
+    return util.read_json(os.path.join(d, "last.json"), None), util.read_json(os.path.join(d, "prev.json"), None)
+
+
+def do_show(cfg, fs=True):
+    if fs:
+        print("Filesystems now")
+        print("\n".join(filesystems()))
+        print()
+    last, prev = load()
+    if not last:
+        print("No scan yet: sudo hb disk scan (hb-disk.timer runs one on Sundays)")
+        return 0
+    print("\n".join(report(last, cfg, prev)))
+    return 0
+
+
+def verdict(cfg, now=None):
+    now = now or time.time()
+    last, prev = load()
+    if not last:
+        return 0, "ok: no scan yet (hb-disk.timer runs one on Sundays)"
+    days = (now - last["ts"]) / DAY
+    if days > SCAN_WARN_DAYS:
+        return 1, f"warn: last scan {days:.0f} days ago (hb-disk.timer should run weekly)"
+    dirs, top = last["dirs"], last["top"]
+    n = dirs[top][1]
+    line = (f"ok: scanned {when(last['ts'], '%d %b')}: {human(dirs[top][0])} in "
+            f"{f'{n / 1e6:.1f} M' if n >= 10 ** 6 else f'{n:,}'} files")
+    if prev and prev.get("top") == top:
+        g = dirs[top][0] - prev["dirs"].get(top, [0])[0]
+        line += f" ({'+' if g >= 0 else ''}{human(g)} since {when(prev['ts'], '%d %b')})"
+    s = stale(dirs, cfg, now)
+    d = cfg["disk"]
+    if s:
+        line += (f"; {len(s)} folder{'s' if len(s) != 1 else ''} untouched {d['stale_days']}+ days "
+                 f"({human(sum(b for _, b, _ in s))})")
+    return 0, line
+
+
+def main(argv):
+    args = argv[1:]
+    verb = args.pop(0) if args else "show"
+    if verb in ("help", "-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    cfg = config.load()
+    if verb == "scan":
+        quiet = "--quiet" in args
+        rest = [a for a in args if a != "--quiet"]
+        return do_scan(cfg, rest[0] if rest else None, quiet)
+    if os.geteuid() != 0:
+        print("error: run with sudo (or scan a folder of yours: hb disk scan ~/)", file=sys.stderr)
+        return 2
+    if verb == "show":
+        return do_show(cfg)
+    if verb == "check":
+        rc, line = verdict(cfg)
+        print(line)
+        return rc
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

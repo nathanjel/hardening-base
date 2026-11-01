@@ -17,10 +17,10 @@ upgrades and cleanup jobs. They arrive in phases.
 
 ## Status
 
-Phases 1 to 7 are written, phase 8 is next (runbooks:
+Phases 1 to 8 are written and applied on the first box (runbooks:
 [docs/PHASE1.md](docs/PHASE1.md), [docs/PHASE2.md](docs/PHASE2.md),
 [docs/PHASE3.md](docs/PHASE3.md), [docs/PHASE4.md](docs/PHASE4.md),
-[docs/PHASE5.md](docs/PHASE5.md), [docs/PHASE6.md](docs/PHASE6.md), [docs/PHASE7.md](docs/PHASE7.md)). Start from `hb.toml.example`, which lists every
+[docs/PHASE5.md](docs/PHASE5.md), [docs/PHASE6.md](docs/PHASE6.md), [docs/PHASE7.md](docs/PHASE7.md), [docs/PHASE8.md](docs/PHASE8.md)). Start from `hb.toml.example`, which lists every
 key, as `hb.toml` in the checkout. `sudo ./hb install apply` then copies the code
 to `/opt/hb` (root's, so nothing running as your user can change what root's
 timers run) and the config to `/etc/hb/hb.toml`.
@@ -38,7 +38,7 @@ timers run) and the config to `/etc/hb/hb.toml`.
 | `hb-totp` | the code behind the key: RFC 6238 codes from an authenticator app and single-use recovery codes, checked by PAM through `pam_exec` |
 | `hb-webshell` | your shell (tmux) in a browser: over WireGuard always, from the internet only for a window you open (`hb webshell open 2h`); own password and code, rate limits, stdlib daemon, pinned xterm.js |
 | `hb-upgrade` | nightly dnf upgrade and held snap refresh, a pre-upgrade snapshot, a reboot only when needed and nobody is working (`busy.d`) |
-| `hb-digest` | the morning summary: last night's upgrade, backup and cleanup, warnings, dated reminders; one line in the banner |
+| `hb-digest` | the morning summary: last night's upgrade, backup and cleanup, what changed on the box, warnings, dated reminders; one line in the banner |
 | `hb-share` | Windows drive letters over WireGuard: Samba on the tunnel interface only, SMB 3.1.1 with signing, one user |
 | `hb-breakglass` | a rescue account and a printable kit for one trusted person: passphrase-protected key, recovery codes, console password, its own restic key; logging in to it sends an SMS |
 | `hb-snapshot` | read-only btrfs snapshots of `/` before risky changes |
@@ -49,7 +49,8 @@ timers run) and the config to `/etc/hb/hb.toml`.
 | `hb-backup` | restic from a read-only btrfs snapshot, plus a state dump for rebuilding |
 | `hb-restore` | files back from the backup (into a folder, or over the live ones after a yes), and a quarterly drill that restores a random sample and compares it byte for byte with the live files |
 | `hb-clean` | build output in idle projects, stale caches, Docker leftovers; dry-run first. Measures the image registry, never cleans it |
-| `hb-inventory` | the state dump a rebuild needs (packages, snaps, accounts, units, every Kubernetes object you made, ...), written before each backup |
+| `hb-disk` | what's eating the disk: the biggest folders, what grew since last week, big folders nobody has touched in a month; reports only |
+| `hb-inventory` | the state dump a rebuild needs (packages, snaps, accounts, units, every Kubernetes object you made, ...), written before each backup, and what changed since the one before: new packages, accounts, listening ports, SSH keys, sudoers, firewall rules, Kubernetes objects (in the morning digest) |
 | `hb-rebuild` | sets up a fresh box from the newest snapshot: files, packages, snaps, accounts, data, microk8s add-ons, Kubernetes objects, units; only ever adds. See [docs/RUNBOOK-rebuild.md](docs/RUNBOOK-rebuild.md) |
 | `phase0/inventory.sh` | the read-only survey hb started from |
 

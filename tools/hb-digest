@@ -6,7 +6,8 @@
   hb digest check     one-line verdict
 
 It reads what is already there: the status cache (every tool's check, from
-hb-status), last night's upgrade (hb upgrade), the event log (hb notify) and
+hb-status), last night's upgrade (hb upgrade), the event log (hb notify), what
+changed on the box (hb inventory drift), the weekly disk scan (hb disk) and
 digest.reminders. It writes /var/lib/hb/digest/<date>.txt (30 kept) and a short
 line the login banner shows under "last night". Reminders are "YYYY-MM-DD text"
 lines in hb.toml, shown from that day on until you remove them.
@@ -14,6 +15,7 @@ lines in hb.toml, shown from that day on until you remove them.
 Config ([digest] in hb.toml): reminders.
 """
 import datetime
+import json
 import os
 import sys
 import time
@@ -22,6 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.
 from hbkit import config, util  # noqa: E402
 
 KEEP = 30
+DRIFT_LINES = 12
 
 
 def ddir():
@@ -80,6 +83,23 @@ def upgrade_line(now):
     return ", ".join(parts), notes
 
 
+def drift_changes(now):
+    """Changes hb inventory noted in the last 24 hours."""
+    out = []
+    try:
+        with open(os.path.join(util.STATE, "inventory", "drift.jsonl")) as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if e.get("ts", 0) >= now - 86400:
+                    out += e.get("changes", [])
+    except OSError:
+        pass
+    return out
+
+
 def compose(cfg, now=None):
     """(the digest's text, the banner's short line, due reminders)."""
     now = now or time.time()
@@ -89,8 +109,11 @@ def compose(cfg, now=None):
     bad = sorted(((k, v) for k, v in checks.items() if v.get("level") in ("warn", "fail")),
                  key=lambda kv: (kv[1]["level"] != "fail", kv[0]))
     up, notes = upgrade_line(now)
+    drift = drift_changes(now)
     short = [p for p in (up, f"backup {detail(cache, 'backup')}" if detail(cache, "backup") else "",
-                         f"cleanup {detail(cache, 'clean')}" if detail(cache, "clean") else "") if p]
+                         f"cleanup {detail(cache, 'clean')}" if detail(cache, "clean") else "",
+                         f"{len(drift)} change{'s' if len(drift) != 1 else ''} to the system" if drift else "")
+             if p]
     events = [e for e in util.read_events() if e["ts"] >= now - 86400]
     counts = {lvl: sum(1 for e in events if e["level"] == lvl) for lvl in ("fail", "warn", "info")}
     reminders = due_reminders(cfg, datetime.date.fromtimestamp(now))
@@ -99,12 +122,19 @@ def compose(cfg, now=None):
     lines += [f"overnight: {p}" for p in short] or ["overnight: nothing recorded"]
     if detail(cache, "health.disk"):
         lines.append(f"disk:      {detail(cache, 'health.disk')}")
+    if detail(cache, "disk"):
+        lines.append(f"disk scan: {detail(cache, 'disk')} (hb disk)")
     lines.append(f"kernel:    {os.uname().release}, up {uptime_text()}")
     lines.append(f"checks:    {len(checks) - len(bad)} ok, " + ", ".join(
         f"{sum(1 for _, v in bad if v['level'] == lvl)} {lvl}" for lvl in ("warn", "fail")))
     lines += [f"  {v['level'].upper():4}  {k}: {v.get('detail', '')}" for k, v in bad]
     lines.append(f"events:    {counts['fail']} fail, {counts['warn']} warn, {counts['info']} info in 24 h"
                  " (hb notify events)")
+    if drift:
+        lines.append(f"changes:   {len(drift)} in 24 h (hb inventory drift)")
+        lines += [f"  {c}" for c in drift[:DRIFT_LINES]]
+        if len(drift) > DRIFT_LINES:
+            lines.append(f"  and {len(drift) - DRIFT_LINES} more")
     if reminders:
         lines.append("reminders:")
         lines += [f"  {r}" for r in reminders]

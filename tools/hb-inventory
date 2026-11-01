@@ -1,10 +1,13 @@
 #!/usr/bin/python3 -IB
 """hb-inventory — what this box is made of, written down where the backup picks it up.
 
-  hb inventory run      write the state dump to /var/lib/hb/state (hb backup runs this
-                        before every backup, so each snapshot carries its own)
-  hb inventory show     what the dump holds
-  hb inventory check    one line: the dump's age, and pieces that couldn't be read
+  hb inventory run          write the state dump to /var/lib/hb/state (hb backup runs
+                            this before every backup, so each snapshot carries its own),
+                            and note what changed since the dump before
+  hb inventory show         what the dump holds
+  hb inventory drift [DAYS] what changed, run by run (default: the last 7 days); the
+                            digest lists the last 24 hours
+  hb inventory check        one line: the dump's age, and pieces that couldn't be read
 
 The dump (root-only; the backup is encrypted):
   system.txt          date, kernel, OS release
@@ -12,6 +15,12 @@ The dump (root-only; the backup is encrypted):
   repos.txt           enabled repositories
   units-enabled.txt   enabled systemd units
   users.txt           people's accounts (uid 1000-59999): name, uid, gid, home, shell, groups
+  groups.txt          every group with members
+  sudoers.txt         sudoers and sudoers.d, without comments
+  ssh-keys.txt        authorized keys: file and fingerprint (never the keys themselves)
+  cron.txt            crontabs without comments, and what is in the cron.* folders
+  listening.txt       listening sockets: protocol, address, program (loopback sockets on
+                      throwaway ports left out, programs' UDP ones shown as "ephemeral")
   disks.txt           lsblk, RAID, btrfs, fstab
   network.txt         addresses and routes
   firewalld.txt       every zone
@@ -25,15 +34,28 @@ The dump (root-only; the backup is encrypted):
   inventory.json      when, counts, and what failed
 
 hb rebuild reads it from a snapshot to set up a fresh box the same way.
+
+Drift: each run compares the new dump with the one before, piece by piece:
+kernel and OS, packages, repositories, snaps, accounts, groups, enabled units,
+listening sockets, firewall zones, sudoers, SSH keys, cron, containers, add-ons,
+Kubernetes objects (added, removed, changed; values never shown) and network
+addresses. Changes go to /var/lib/hb/inventory/drift.jsonl (90 days kept). A
+piece missing from either dump is skipped, so a new piece doesn't show up as
+everything added.
+
+Config ([inventory] in hb.toml): drift_ignore (regexes; matching lines are left out).
 """
+import glob
+import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
-from hbkit import util  # noqa: E402
+from hbkit import config, util  # noqa: E402
 
 KUBECTL = ["/snap/bin/microk8s", "kubectl"]
 MICROK8S = "/snap/bin/microk8s"
@@ -45,6 +67,15 @@ SKIP_TYPES = {"events", "events.events.k8s.io", "pods", "replicasets.apps", "con
 CLUSTER_TYPES = ["namespaces", "persistentvolumes", "clusterissuers.cert-manager.io",
                  "storageclasses.storage.k8s.io", "ingressclasses.networking.k8s.io"]
 WARN_HOURS = 50
+DRIFT_KEEP_DAYS = 90
+EPHEMERAL = range(32768, 61000)
+# made and remade by the cluster's own controllers
+CONTROLLERS = ("endpointslice-controller.k8s.io", "endpointslicemirroring-controller.k8s.io")
+# changes on every write, or set by the server; not a change you made
+K8S_NOISE_META = ("uid", "resourceVersion", "generation", "creationTimestamp", "managedFields", "selfLink")
+K8S_NOISE_ANNOTATIONS = ("deployment.kubernetes.io/revision",)
+# interfaces that come and go with pods and containers
+VIRTUAL_IF = re.compile(r"^(lo|cali|veth|vxlan|tunl|flannel|cni|lxc|docker|br-|virbr)")
 
 
 def state_root():
@@ -92,6 +123,79 @@ def users_txt(passwd="/etc/passwd", group="/etc/group"):
     return "".join(lines)
 
 
+def groups_txt(group="/etc/group"):
+    lines = []
+    with open(group) as f:
+        for line in f:
+            p = line.rstrip("\n").split(":")
+            if len(p) >= 4 and p[3]:
+                lines.append(f"{p[0]} {p[2]} {','.join(sorted(p[3].split(',')))}\n")
+    return "".join(sorted(lines))
+
+
+def uncommented(path):
+    """A config file's lines without comments and blanks (sudoers' #include kept)."""
+    with open(path) as f:
+        for line in f:
+            s = line.strip()
+            if s and (not s.startswith("#") or s.startswith("#include")):
+                yield s
+
+
+def sudoers_txt(main="/etc/sudoers", folder="/etc/sudoers.d"):
+    files = [main] + sorted(glob.glob(os.path.join(folder, "*")))
+    return "".join(f"{f}: {s}\n" for f in files if os.path.isfile(f) for s in uncommented(f))
+
+
+def ssh_keys_txt(files=None):
+    if files is None:
+        files = (sorted(glob.glob("/etc/ssh/authorized_keys/*")) +
+                 [f"{h}/.ssh/{n}" for h in ["/root"] + sorted(glob.glob("/home/*"))
+                  for n in ("authorized_keys", "authorized_keys2")])
+    lines = []
+    for f in files:
+        if not os.path.isfile(f):
+            continue
+        rc, out, _ = util.run("ssh-keygen", "-lf", f)
+        keys = [line.strip() for line in out.splitlines() if line.strip()] if rc == 0 else []
+        lines += [f"{f} {k}\n" for k in keys] or [f"{f} (no keys)\n"]
+    return "".join(lines)
+
+
+def cron_txt():
+    files = ["/etc/crontab", "/etc/anacrontab"] + sorted(glob.glob("/etc/cron.d/*")) + \
+        sorted(glob.glob("/var/spool/cron/*"))
+    lines = [f"{f}: {s}\n" for f in files if os.path.isfile(f) for s in uncommented(f)]
+    for d in ("hourly", "daily", "weekly", "monthly"):
+        lines += [f"{p}\n" for p in sorted(glob.glob(f"/etc/cron.{d}/*"))]
+    return "".join(lines)
+
+
+def listening_lines(out):
+    """`ss -H -tulnp` as "proto address program" lines."""
+    lines = set()
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) < 5:
+            continue
+        proto, local = f[0], f[4]
+        progs = ",".join(sorted(set(re.findall(r'\("([^"]+)",pid=', line)))) or "?"
+        host, _, port = local.rpartition(":")
+        if port.isdigit() and int(port) in EPHEMERAL:
+            if host.startswith(("127.", "[::1]", "[::ffff:127.")):
+                continue        # local helpers on throwaway ports: they move every restart
+            if proto == "udp" and progs != "?":
+                # a program's client socket; a TCP listener, or a kernel socket such as
+                # WireGuard's (no program), keeps its port
+                local = f"{host}:ephemeral"
+        lines.add(f"{proto} {local} {progs}")
+    return sorted(lines)
+
+
+def listening_txt():
+    return "".join(f"{line}\n" for line in listening_lines(sh("ss", "-H", "-tulnp")))
+
+
 def disks_txt():
     parts = [sh("lsblk", "-f")]
     for path in ("/proc/mdstat", "/etc/fstab"):
@@ -132,9 +236,12 @@ def k8s_objects_json():
 
 def pieces():
     """(file, function) for what this box has."""
-    p = [("system.txt", system_txt), ("users.txt", users_txt), ("disks.txt", disks_txt),
-         ("network.txt", network_txt),
+    p = [("system.txt", system_txt), ("users.txt", users_txt), ("groups.txt", groups_txt),
+         ("sudoers.txt", sudoers_txt), ("ssh-keys.txt", ssh_keys_txt), ("cron.txt", cron_txt),
+         ("disks.txt", disks_txt), ("network.txt", network_txt),
          ("units-enabled.txt", lambda: sh("systemctl", "list-unit-files", "--state=enabled", "--no-legend"))]
+    if have("ss"):
+        p.append(("listening.txt", listening_txt))
     if have("dnf"):
         p += [("packages.txt", packages_txt), ("repos.txt", lambda: sh("dnf", "repolist", "--enabled", timeout=300))]
     if have("firewall-cmd"):
@@ -166,7 +273,207 @@ def counts(root):
     return c
 
 
-def do_run():
+# --- drift: what changed between two dumps ----------------------------------------------------
+
+def _lines(text):
+    return [line.rstrip() for line in text.splitlines() if line.strip()]
+
+
+def p_set(text):
+    return {line: "" for line in _lines(text)}
+
+
+def p_first(text):
+    """First word -> the rest."""
+    return {k: v.strip() for k, _, v in (line.partition(" ") for line in _lines(text))}
+
+
+def p_words(text):
+    return {line.split()[0]: "" for line in _lines(text)}
+
+
+def p_system(text):
+    lines, d = text.splitlines(), {}
+    if len(lines) > 1 and len(lines[1].split()) > 2:
+        d["kernel"] = lines[1].split()[2]
+    for line in lines:
+        if line.startswith("PRETTY_NAME="):
+            d["os"] = line.split("=", 1)[1].strip().strip('"')
+    return d
+
+
+def p_repos(text):
+    return {line.split()[0]: "" for line in _lines(text) if not line.startswith("repo id")}
+
+
+def p_snaps(text):
+    d = {}
+    for line in _lines(text):
+        f = line.split()
+        if f[0] == "Name" or len(f) < 4:
+            continue
+        d[f[0]] = f"{f[1]} {f[3]}" + (f" {f[5]}" if len(f) > 5 and f[5] != "-" else "")
+    return d
+
+
+def p_listening(text):
+    d = {}
+    for line in _lines(text):
+        f = line.split()
+        if len(f) >= 3:
+            d[f"{f[0]} {f[1]}"] = f[2]
+    return d
+
+
+def p_docker(text):
+    return {f[0]: f[1] for f in (line.split("\t") for line in _lines(text)) if len(f) >= 2}
+
+
+def p_addons(text):
+    return {m.group(1): "" for m in re.finditer(r"^\s*(?:[\w-]+/)?([\w-]+): enabled\s*$", text, re.M)}
+
+
+def p_interfaces(text):
+    d = {}
+    for line in _lines(text):
+        f = line.split()
+        if len(f) < 2 or f[1] not in ("UP", "DOWN", "UNKNOWN", "LOWERLAYERDOWN", "DORMANT", "NOTPRESENT"):
+            continue
+        name = f[0].split("@")[0]
+        if not VIRTUAL_IF.match(name):
+            d[name] = " ".join(sorted(a for a in f[2:] if not a.startswith("fe80:")))
+    return d
+
+
+def p_firewalld(text):
+    """{"zone field": value}; rich rules (tab-indented lines) joined with " | "."""
+    d, zone, key = {}, None, None
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+        if not raw[0].isspace():
+            zone, key = raw.split()[0], None
+        elif zone and raw.startswith("  ") and not raw.startswith("   ") and ":" in raw:
+            key, _, value = raw.strip().partition(":")
+            d[f"{zone} {key}"] = value.strip()
+        elif zone and key:
+            d[f"{zone} {key}"] = f"{d[f'{zone} {key}']} | {raw.strip()}".strip(" |")
+    return d
+
+
+def k8s_normal(obj):
+    o = {k: v for k, v in obj.items() if k != "status"}
+    meta = {k: v for k, v in o.get("metadata", {}).items() if k not in K8S_NOISE_META}
+    if "annotations" in meta:
+        meta["annotations"] = {k: v for k, v in meta["annotations"].items() if k not in K8S_NOISE_ANNOTATIONS}
+    o["metadata"] = meta
+    return o
+
+
+def p_k8s(text):
+    """{"namespace/Kind/name": hash of what you'd change}; status and server fields left out,
+    and objects a controller makes (a CronJob's Jobs, a Service's EndpointSlices)."""
+    d = {}
+    for o in json.loads(text).get("items", []):
+        m = o.get("metadata", {})
+        if m.get("ownerReferences"):
+            continue
+        if (o.get("kind") == "EndpointSlice" and
+                m.get("labels", {}).get("endpointslice.kubernetes.io/managed-by") in CONTROLLERS):
+            continue
+        key = "/".join(x for x in (m.get("namespace"), o.get("kind"), m.get("name")) if x)
+        d[key] = hashlib.sha256(json.dumps(k8s_normal(o), sort_keys=True).encode()).hexdigest()[:16]
+    return d
+
+
+ADDED, ENABLED = ("added", "removed"), ("enabled", "disabled")
+# (label, file in the dump, parser, words for in/out, show values when changed)
+DRIFT = [
+    ("system", "system.txt", p_system, ADDED, True),
+    ("package", "packages.txt", p_set, ADDED, False),
+    ("repo", "repos.txt", p_repos, ADDED, False),
+    ("snap", "snaps.txt", p_snaps, ADDED, True),
+    ("user", "users.txt", p_first, ADDED, True),
+    ("group", "groups.txt", p_first, ADDED, True),
+    ("unit", "units-enabled.txt", p_words, ENABLED, False),
+    ("listening", "listening.txt", p_listening, ADDED, True),
+    ("firewall", "firewalld.txt", p_firewalld, ADDED, True),
+    ("sudoers", "sudoers.txt", p_set, ADDED, False),
+    ("ssh key", "ssh-keys.txt", p_set, ADDED, False),
+    ("cron", "cron.txt", p_set, ADDED, False),
+    ("container", "docker.txt", p_docker, ADDED, True),
+    ("addon", "k8s/addons.txt", p_addons, ENABLED, False),
+    ("k8s", "k8s/cluster.json", p_k8s, ADDED, False),
+    ("k8s", "k8s/objects.json", p_k8s, ADDED, False),
+    ("interface", "network.txt", p_interfaces, ADDED, True),
+]
+
+
+def drift(old, new, ignore=()):
+    """Lines saying what changed from dump folder old to dump folder new."""
+    out = []
+    for label, name, parse, (inw, outw), values in DRIFT:
+        try:
+            with open(os.path.join(old, name)) as f:
+                a = parse(f.read())
+            with open(os.path.join(new, name)) as f:
+                b = parse(f.read())
+        except (OSError, ValueError):
+            continue        # missing from one dump: nothing to compare
+        for k in sorted(b.keys() - a.keys()):
+            out.append(f"{label} {inw}: {k}" + (f" ({b[k]})" if values and b[k] else ""))
+        for k in sorted(a.keys() - b.keys()):
+            out.append(f"{label} {outw}: {k}" + (f" ({a[k]})" if values and a[k] else ""))
+        for k in sorted(a.keys() & b.keys()):
+            if a[k] != b[k]:
+                out.append(f"{label} changed: {k}" + (f": {a[k] or '-'} → {b[k] or '-'}" if values else ""))
+    pats = [re.compile(p) for p in ignore]
+    return [line[:300] for line in out if not any(p.search(line) for p in pats)]
+
+
+def drift_path():
+    return os.path.join(util.state_dir("inventory"), "drift.jsonl")
+
+
+def read_drift(since=0):
+    out = []
+    try:
+        with open(drift_path()) as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if e.get("ts", 0) >= since:
+                    out.append(e)
+    except OSError:
+        pass
+    return out
+
+
+def log_drift(changes, since, now=None):
+    """Add this run's changes to the log and drop entries older than DRIFT_KEEP_DAYS."""
+    now = now or int(time.time())
+    keep = read_drift(now - DRIFT_KEEP_DAYS * 86400)
+    if changes:
+        keep.append({"ts": now, "since": since, "changes": changes})
+    util.write_atomic(drift_path(), "".join(json.dumps(e) + "\n" for e in keep))
+
+
+def do_drift(days):
+    entries = read_drift(time.time() - days * 86400)
+    if not entries:
+        print(f"no changes in the last {days:g} days")
+        return 0
+    for e in entries:
+        print(f"{time.strftime('%a %d %b %H:%M', time.localtime(e['ts']))} "
+              f"(since {time.strftime('%d %b %H:%M', time.localtime(e.get('since', 0)))}):")
+        for c in e["changes"]:
+            print(f"  {c}")
+    return 0
+
+
+def do_run(cfg):
     """Write every piece into a fresh folder, then swap it in: the dump is always whole."""
     root = state_root()
     new, old = root + ".new", root + ".old"
@@ -184,13 +491,20 @@ def do_run():
         util.write_atomic(os.path.join(new, name), text)
     meta = {"ts": int(time.time()), "errors": errors, "counts": counts(new)}
     util.write_json(os.path.join(new, "inventory.json"), meta)
+    before = util.read_json(os.path.join(root, "inventory.json"), None)
+    changes = drift(root, new, cfg["inventory"]["drift_ignore"]) if before else []
     if os.path.exists(root):
         os.rename(root, old)
     os.rename(new, root)
     shutil.rmtree(old, ignore_errors=True)
+    if before:
+        log_drift(changes, before["ts"], meta["ts"])
     for e in errors:
         print(f"state dump: {e}", file=sys.stderr)
     print(f"state dump in {root}: " + ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in meta["counts"].items()))
+    if before:
+        print(f"{len(changes)} change{'s' if len(changes) != 1 else ''} since the dump of "
+              f"{time.strftime('%d %b %H:%M', time.localtime(before['ts']))}" + (" (hb inventory drift)" if changes else ""))
     return 1 if errors else 0
 
 
@@ -231,7 +545,13 @@ def main(argv):
         print("error: run with sudo", file=sys.stderr)
         return 2
     if verb == "run":
-        return do_run()
+        return do_run(config.load())
+    if verb == "drift":
+        try:
+            return do_drift(float(argv[2]) if len(argv) > 2 else 7)
+        except ValueError:
+            print("usage: hb inventory drift [DAYS]", file=sys.stderr)
+            return 2
     if verb == "show":
         return do_show()
     if verb == "check":

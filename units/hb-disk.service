@@ -1,0 +1,11 @@
+# Managed by hb install from units/; changes made here are overwritten.
+[Unit]
+Description=hb: walk the local filesystems and note the biggest and untouched folders
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+ExecStart=/opt/hb/hb disk scan --quiet
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=2h

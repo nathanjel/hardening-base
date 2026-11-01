@@ -253,6 +253,24 @@ class DigestTest(unittest.TestCase):
         stale = status.render({"ts": time.time(), "checks": {}}, [], {"ts": time.time() - 2 * 86400, "short": "x"})
         self.assertNotIn("last night", stale)
 
+    def test_drift_and_disk_scan(self):
+        now = time.time()
+        os.makedirs(os.path.join(self.state, "inventory"))
+        with open(os.path.join(self.state, "inventory", "drift.jsonl"), "w") as f:
+            f.write(json.dumps({"ts": now - 2 * 86400, "changes": ["package added: old"]}) + "\n")
+            f.write(json.dumps({"ts": now - 3600, "changes": [f"package added: p{i}" for i in range(14)]}) + "\n")
+        with open(os.path.join(self.state, "status.json")) as f:
+            cache = json.load(f)
+        cache["checks"]["disk"] = {"level": "ok", "detail": "ok: scanned 01 Nov: 192.3 GB in 2.3 M files"}
+        with open(os.path.join(self.state, "status.json"), "w") as f:
+            json.dump(cache, f)
+        text, short, _ = digest.compose({"digest": {"reminders": []}}, now=now)
+        self.assertIn("changes:   14 in 24 h (hb inventory drift)", text)
+        self.assertIn("  package added: p11\n  and 2 more", text)
+        self.assertNotIn("package added: old", text)
+        self.assertIn("disk scan: scanned 01 Nov: 192.3 GB in 2.3 M files (hb disk)", text)
+        self.assertIn("14 changes to the system", short)
+
 
 if __name__ == "__main__":
     unittest.main()

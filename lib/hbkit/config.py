@@ -83,6 +83,18 @@ DEFAULTS = {
         "skip_namespaces": ["kube-system", "kube-public", "kube-node-lease", "ingress", "cert-manager",
                             "container-registry", "metallb-system", "observability"],
     },
+    "inventory": {
+        "drift_ignore": [],     # regexes; drift lines matching one are left out
+    },
+    "disk": {
+        "show_gb": 2,
+        # where a big folder untouched for stale_days is worth a mention
+        "stale_roots": ["/home", "/root", "/srv", "/opt", "/var/tmp", "/var/lib/hb/backup"],
+        "stale_days": 30,
+        "stale_gb": 1,
+        "stale_ignore": [],     # globs: the folder and everything under it
+        "skip": [],             # folders never walked (hb's snapshots never are)
+    },
     "clean": {
         "dry_run": True,
         "users": [],

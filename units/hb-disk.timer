@@ -1,0 +1,10 @@
+# Managed by hb install from units/; changes made here are overwritten.
+[Unit]
+Description=hb: disk scan on Sundays at 03:15
+
+[Timer]
+OnCalendar=Sun *-*-* 03:15:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

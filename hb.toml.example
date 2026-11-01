@@ -78,6 +78,20 @@ data = []                     # empty: backup.paths without /etc, /usr/local and
 skip_namespaces = ["kube-system", "kube-public", "kube-node-lease", "ingress", "cert-manager",
                    "container-registry", "metallb-system", "observability"]   # microk8s' own
 
+[inventory]
+# hb inventory writes the state dump before each backup and notes what changed since the
+# one before (hb inventory drift; the digest lists the last 24 hours).
+drift_ignore = []             # regexes, e.g. "^k8s changed: default/Secret/" for renewing certificates
+
+[disk]
+# hb disk: the biggest folders, what grew, and big folders nobody touched (hb-disk.timer, Sundays).
+show_gb = 2
+stale_roots = ["/home", "/root", "/srv", "/opt", "/var/tmp", "/var/lib/hb/backup"]
+stale_days = 30               # no file inside changed for this long
+stale_gb = 1
+stale_ignore = []             # globs: kept on purpose, e.g. "/srv/app/recordings"
+skip = []                     # folders never walked (hb's snapshots never are)
+
 [clean]
 dry_run = true                # report only; set false once the reports look right
 users = []                    # whose ~/.cache to clean
