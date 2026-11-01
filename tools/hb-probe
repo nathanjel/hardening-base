@@ -14,12 +14,15 @@ listens (SIP, DNS, LLMNR, mDNS, NTP), and compares the open TCP ports with
 a stranger, so it can't be seen this way; that is the point of it.
 
 On the server:
-  hb probe            prints the scan command with the values from hb.toml
+  hb probe            prints the scan command: probe.host from hb.toml plus this
+                      server's own public addresses, because a name without an
+                      AAAA record would leave IPv6 unscanned
   hb probe check      always ok (the scan itself runs elsewhere)
 """
 import argparse
 import concurrent.futures
 import errno
+import ipaddress
 import os
 import socket
 import struct
@@ -28,8 +31,8 @@ import time
 
 
 def resolve(hosts):
-    """[(host, address)] for every IPv4 and IPv6 address of each host."""
-    out = []
+    """[(host, address)] for every IPv4 and IPv6 address of each host, each address once."""
+    out, seen = [], set()
     for h in hosts:
         try:
             infos = socket.getaddrinfo(h, None, proto=socket.IPPROTO_TCP)
@@ -37,7 +40,25 @@ def resolve(hosts):
             print(f"{h}: cannot resolve ({e})", file=sys.stderr)
             continue
         for addr in dict.fromkeys(i[4][0] for i in sorted(infos, key=lambda i: i[0])):
-            out.append((h, addr))
+            if addr not in seen:
+                seen.add(addr)
+                out.append((h, addr))
+    return out
+
+
+def public_addresses():
+    """This machine's public IPv4 and IPv6 source addresses. Connecting a UDP
+    socket only picks a route; nothing is sent."""
+    out = []
+    for fam, dest in ((socket.AF_INET, "192.0.2.1"), (socket.AF_INET6, "2001:db8::1")):
+        try:
+            with socket.socket(fam, socket.SOCK_DGRAM) as s:
+                s.connect((dest, 53))
+                addr = s.getsockname()[0]
+        except OSError:
+            continue
+        if ipaddress.ip_address(addr).is_global:
+            out.append(addr)
     return out
 
 
@@ -114,7 +135,7 @@ def scan(args):
     expect = set(args.expect)
     worst = 0
     for host, addr in targets:
-        print(f"{host}  {addr}")
+        print(addr if host == addr else f"{host}  {addr}")
         if tcp_state(addr, args.ports[0], args.timeout) == "unreachable":
             print("  no route to this address from here (no IPv6 on this network?); skipped\n")
             continue
@@ -155,12 +176,14 @@ def box_command():
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
     from hbkit import config
     probe = config.load()["probe"]
-    host = probe["host"] or "HOST"
+    hosts = " ".join(dict.fromkeys([probe["host"] or "HOST"] + public_addresses()))
     expect = ",".join(str(p) for p in probe["expect_tcp"]) or "22,80,443"
     print("From a machine outside this server's network, with python3:\n")
     print("  git clone https://github.com/<you>/hardening-base   (or copy tools/hb-probe there)")
-    print(f"  python3 hardening-base/tools/hb-probe scan {host} --expect {expect}\n")
-    print("A full scan takes a minute or two per address (longer from Windows).")
+    print(f"  python3 hardening-base/tools/hb-probe scan {hosts} --expect {expect}\n")
+    print("Each address is scanned once, whether it comes from the name or is listed;")
+    print("IPv6 is skipped from a network without it. A full scan takes a few minutes")
+    print("per address.")
     return 0
 
 

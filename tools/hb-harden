@@ -187,8 +187,11 @@ llmnr_text() { printf '# Managed by hb-harden from hb.toml (harden.llmnr).\n[Res
 chk_llmnr() {
   [ -z "$LLMNR" ] && { echo "not managed"; return 0; }
   case "$LLMNR" in yes|no|resolve) ;; *) echo "harden.llmnr must be yes, no or resolve"; return 2 ;; esac
-  local listening
+  local listening dir="${RESOLVED_DROPIN%/*}"
   listening="$(ss -lnH 'sport = :5355' 2>/dev/null | wc -l)"
+  if [ -d "$dir" ] && [ -z "$(find "$dir" -maxdepth 0 -perm -005)" ]; then
+    echo "systemd-resolved can't read $dir (mode $(stat -c %a "$dir")), so it ignores LLMNR=$LLMNR"; return 1
+  fi
   if cmp -s "$RESOLVED_DROPIN" <(llmnr_text); then
     [ "$LLMNR" = no ] && [ "$listening" -gt 0 ] && { echo "LLMNR=no is set, yet $listening sockets listen on 5355"; return 1; }
     echo "LLMNR=$LLMNR"; return 0
@@ -197,7 +200,8 @@ chk_llmnr() {
 }
 fix_llmnr() {
   keep_copy "$RESOLVED_DROPIN"
-  mkdir -p "${RESOLVED_DROPIN%/*}" && ( umask 022; llmnr_text > "$RESOLVED_DROPIN" ) || return 1
+  # systemd-resolved runs as its own user, and hb's umask is 077: set the mode.
+  install -d -m 755 "${RESOLVED_DROPIN%/*}" && ( umask 022; llmnr_text > "$RESOLVED_DROPIN" ) || return 1
   log "  restarting systemd-resolved (name lookups on this host pause for a moment)"
   systemctl restart systemd-resolved
 }

@@ -19,6 +19,14 @@ class ProbeTest(unittest.TestCase):
             with self.assertRaises(Exception):
                 probe.parse_ports(bad)
 
+    def test_each_address_once(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            got = probe.resolve(["127.0.0.1", "localhost", "127.0.0.1", "no-such-host.invalid"])
+        self.assertEqual([a for _, a in got].count("127.0.0.1"), 1)
+        self.assertEqual(got[0], ("127.0.0.1", "127.0.0.1"))
+        for addr in probe.public_addresses():
+            self.assertTrue(probe.ipaddress.ip_address(addr).is_global)
+
     def test_scan_finds_a_listener_and_flags_the_unexpected(self):
         with socket.socket() as srv:
             srv.bind(("127.0.0.1", 0))

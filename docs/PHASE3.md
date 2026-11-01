@@ -35,8 +35,11 @@ On a machine outside the server's network (any OS with python3):
     git clone https://github.com/<you>/hardening-base
     python3 hardening-base/tools/hb-probe scan HOST --expect 22,80,443
 
-`sudo hb probe` on the server prints that line with your values. Keep the output
-to compare with step 6.
+`sudo hb probe` on the server prints that line with your values, plus the
+server's own public addresses: a name without an AAAA record would otherwise
+leave IPv6 unscanned. The IPv6 address is only reachable from a network that
+has IPv6; from one without, the scan says so and skips it. Keep the output to
+compare with step 7.
 
 ## 1. Install the new code and config
 
@@ -87,8 +90,15 @@ If it doesn't, do nothing: the old zones come back by themselves after
 
 4. In the app, edit the tunnel: keep `[Interface]` and `PrivateKey`, paste the
    rest below them, save, activate.
-5. From the PC: `ssh you@10.77.0.1`. On the server, `sudo hb wg status` shows the
-   handshake.
+5. Check the tunnel from the PC. On Windows, in PowerShell,
+   `Test-NetConnection 10.77.0.1 -Port 22` reports `TcpTestSucceeded : True`; on
+   the server, `sudo hb wg status` shows the handshake.
+6. `ssh you@10.77.0.1` asks once about the host key for the new address (the
+   fingerprint is the one you know from the public name) and, as from anywhere
+   else, needs a key the server accepts. `Permission denied (publickey,...)`
+   means the tunnel works and this PC's key isn't on the server: run
+   `ssh-keygen -t ed25519` on the PC, then append its `.pub` line to
+   `~/.ssh/authorized_keys` on the server.
 
 Only traffic for the server goes through the tunnel; the PC's internet stays as
 it was.
