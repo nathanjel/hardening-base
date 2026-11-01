@@ -1,7 +1,8 @@
 # hardening-base (`hb`)
 
 An admin toolkit for one Linux server you work on remotely: many small tools
-behind one `hb` command, bash and stdlib Python only, no third-party libraries.
+behind one `hb` command, bash and stdlib Python only, no third-party libraries
+(one vendored data file: the EFF wordlist for passphrases, CC BY 3.0).
 It targets Fedora/RHEL-family hosts (dnf, firewalld, btrfs), with an optional
 microk8s plug-in. Nothing about a particular host lives in the repo: that goes
 in `hb.toml` and `local/`, both git-ignored.
@@ -16,8 +17,10 @@ upgrades and cleanup jobs. They arrive in phases.
 
 ## Status
 
-Phases 1 to 3 are written (runbooks: [docs/PHASE1.md](docs/PHASE1.md),
-[docs/PHASE2.md](docs/PHASE2.md), [docs/PHASE3.md](docs/PHASE3.md)). Start from `hb.toml.example`, which lists every
+Phases 1 to 4 are written, and phase 5 is in progress (runbooks:
+[docs/PHASE1.md](docs/PHASE1.md), [docs/PHASE2.md](docs/PHASE2.md),
+[docs/PHASE3.md](docs/PHASE3.md), [docs/PHASE4.md](docs/PHASE4.md),
+[docs/PHASE5.md](docs/PHASE5.md)). Start from `hb.toml.example`, which lists every
 key, as `hb.toml` in the checkout. `sudo ./hb install apply` then copies the code
 to `/opt/hb` (root's, so nothing running as your user can change what root's
 timers run) and the config to `/etc/hb/hb.toml`.
@@ -31,6 +34,10 @@ timers run) and the config to `/etc/hb/hb.toml`.
 | `hb-wg` | WireGuard endpoint for your PCs: config from `hb.toml`, each PC keeps its own private key |
 | `hb-fw` | firewalld zones from `hb.toml`, applied with a revert timer you cancel from a new session |
 | `hb-probe` | stdlib-only outside scan (TCP and a few UDP services) to run from another network |
+| `hb-ssh` | who may log in and how: root-owned keys from `hb.toml`, one allowed group, key plus code from the internet and key only over WireGuard; applied with a revert timer |
+| `hb-totp` | the code behind the key: RFC 6238 codes from an authenticator app and single-use recovery codes, checked by PAM through `pam_exec` |
+| `hb-share` | Windows drive letters over WireGuard: Samba on the tunnel interface only, SMB 3.1.1 with signing, one user |
+| `hb-breakglass` | a rescue account and a printable kit for one trusted person: passphrase-protected key, recovery codes, console password, its own restic key; logging in to it sends an SMS |
 | `hb-snapshot` | read-only btrfs snapshots of `/` before risky changes |
 | `hb-health` | reboot pending, RAID, NVMe wear, btrfs, disk, mounts, containers, k8s, sites and certificates, registry, SIP trunk |
 | `hb-status` | runs every check every 15 minutes, writes the login banner, passes changes to hb-notify |
@@ -42,10 +49,12 @@ timers run) and the config to `/etc/hb/hb.toml`.
 
 ## Conventions
 
-- Item tools (`harden`, `k8s`, `wg`, `install`, `alerts`) share four verbs: `status`, `plan` (changes nothing),
+- Item tools (`harden`, `k8s`, `wg`, `install`, `alerts`, `breakglass`) share four verbs: `status`, `plan` (changes nothing),
   `apply [--yes]` (asks before each item) and `check` (one line; exit 0 ok, 1 pending, 2 broken).
   See `lib/hb.sh`.
 - Anything changed is first copied to `/var/lib/hb/backup/<run>/`.
+- Changes that could lock you out (`fw`, `ssh`) undo themselves after a few minutes unless
+  confirmed from a new session (`lib/hbkit/guard.py`).
 - `busy.d/` scripts say when now is a bad moment to disrupt things (a call in progress).
   Pod restarts consult them, and reboots will too.
 - Python tools run as `python3 -IB`: isolated mode, no bytecode written.

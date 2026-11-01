@@ -64,6 +64,27 @@ class Lock:
         os.close(self.fd)
 
 
+def ask(question):
+    """y/N from the terminal, even with stdin redirected; False without one."""
+    try:
+        with open("/dev/tty") as tty:
+            print(f"{question} [y/N] ", end="", flush=True)
+            return tty.readline().strip().lower().startswith("y")
+    except OSError:
+        return False
+
+
+def notify(level, key, text):
+    """hb notify send: the banner always, an SMS for fail."""
+    run(HB, "notify", "send", level, key, text, timeout=120)
+
+
+def sudo_user():
+    """Who ran sudo, or None."""
+    u = os.environ.get("SUDO_USER", "")
+    return u if u and u != "root" else None
+
+
 # --- events: what hb-notify records and hb-status shows in the login banner ---
 
 def events_path():

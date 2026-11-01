@@ -98,6 +98,26 @@ DEFAULTS = {
         "host": "",
         "expect_tcp": [],
     },
+    "ssh": {
+        "keys": [],
+        "codes": False,
+        "key_only_from": [],
+        "revert_minutes": 5,
+    },
+    "totp": {
+        "issuer": "",
+    },
+    "breakglass": {
+        "user": "",
+        "uid": 4700,
+        "host": "",
+        "note": "",
+        "test_days": 180,
+    },
+    "share": {
+        "user": "",
+        "shares": [],
+    },
 }
 
 

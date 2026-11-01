@@ -104,3 +104,26 @@ revert_minutes = 5            # unconfirmed changes go back after this long
 [probe]
 host = ""                     # the name to scan from outside
 expect_tcp = []               # e.g. [22, 80, 443]: what should answer
+
+[ssh]
+keys = []                     # "USER TYPE KEY [COMMENT]", e.g. "alice ssh-ed25519 AAAA... alice@laptop";
+                              # empty: hb ssh manages nothing
+codes = false                 # true: key, then a 6-digit code (hb totp) from the internet
+key_only_from = []            # networks where the key alone is enough, e.g. ["10.77.0.0/24"]
+revert_minutes = 5            # an unconfirmed change undoes itself after this
+
+[totp]
+issuer = ""                   # the name the authenticator app shows; default: the short host name
+
+[breakglass]
+user = ""                     # e.g. "rescue"; empty: hb breakglass manages nothing
+uid = 4700                    # a uid no account or container uses
+host = ""                     # the name the kit connects to; default probe.host
+test_days = 180               # hb check reminds you when the kit hasn't been used for longer
+note = ""                     # top of the kit page: where the provider login is kept, who to call
+
+[share]
+# Samba on the WireGuard interface only (wg.interface, wg.address), for one user.
+# Open 445/tcp in the WireGuard zone first: add "445/tcp" to fw.zones.<zone>.ports.
+user = ""                     # e.g. "you"; empty: hb share manages nothing
+shares = []                   # "NAME PATH", e.g. "workspaces ~/workspaces"; ~ is the user's home

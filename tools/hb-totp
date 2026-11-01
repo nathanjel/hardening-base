@@ -1,0 +1,381 @@
+#!/usr/bin/python3 -IB
+"""hb-totp — the 6-digit code public SSH asks for after the key.
+
+  hb totp status            who can answer the prompt, recovery codes left
+  hb totp enrol USER        a new secret for an authenticator app (QR code or
+                            typed), proven with one code; prints 10 recovery codes
+  hb totp codes USER        10 new recovery codes; the old ones stop working
+  hb totp ready USER...     exit 0 when every USER can answer the prompt
+  hb totp check             one-line verdict (exit 0 ok, 1 attention)
+  hb-totp verify            PAM's entry point (pam_exec expose_authtok): the code
+                            on stdin, the user in PAM_USER; exit 0 lets them in
+
+Codes follow RFC 6238: HMAC-SHA1, 6 digits, 30-second steps, one step of clock
+drift either way, and a step that was used once is refused after. A recovery
+code (ten characters, printed as XXXXX-XXXXX) works once and only its scrypt
+hash is kept. Each user's file is /etc/hb/secrets/totp/<user>, root-only; a
+file with recovery codes and no secret is fine (the rescue account's). Any
+error refuses the login.
+
+Guessing: sshd only shows the prompt after the key is accepted, allows
+MaxAuthTries attempts per connection, and its PerSourcePenalties slow down an
+address that keeps failing.
+
+Config ([totp] in hb.toml): issuer, the name the authenticator app shows
+(default: this host's short name).
+"""
+import base64
+import datetime
+import hashlib
+import hmac
+import json
+import os
+import pwd
+import re
+import secrets
+import socket
+import struct
+import subprocess
+import sys
+import time
+import urllib.parse
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+from hbkit import util  # noqa: E402
+
+DIR = "/etc/hb/secrets/totp"
+USER = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+STEP, DIGITS, DRIFT = 30, 6, 1
+ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"   # Crockford's base32: no I, L, O or U
+N_CODES, LOW_CODES = 10, 3
+SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 14, 8, 1
+PATH_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}
+
+
+# --- RFC 4226 / 6238 ---------------------------------------------------------------
+
+def hotp(key, counter, digits=DIGITS):
+    mac = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    off = mac[-1] & 0x0F
+    return str((struct.unpack(">I", mac[off:off + 4])[0] & 0x7FFFFFFF) % 10 ** digits).zfill(digits)
+
+
+def b32key(secret):
+    s = secret.upper().replace(" ", "")
+    return base64.b32decode(s + "=" * (-len(s) % 8))
+
+
+def match_totp(secret, code, last_step, now):
+    """The time step code belongs to, if it is within the drift and newer than last_step."""
+    key, cur = b32key(secret), int(now // STEP)
+    for step in range(cur - DRIFT, cur + DRIFT + 1):
+        if step > last_step and hmac.compare_digest(hotp(key, step), code):
+            return step
+    return None
+
+
+# --- recovery codes -----------------------------------------------------------------
+
+def new_code():
+    raw = "".join(secrets.choice(ALPHABET) for _ in range(10))
+    return f"{raw[:5]}-{raw[5:]}"
+
+
+def norm_code(text):
+    """A recovery code as stored (ten characters, no dash), or None."""
+    t = text.upper().replace("-", "").replace(" ", "").translate(str.maketrans("ILO", "110"))
+    return t if len(t) == 10 and all(c in ALPHABET for c in t) else None
+
+
+def _scrypt(code, salt, n, r, p):
+    return hashlib.scrypt(code.encode(), salt=salt, n=n, r=r, p=p, dklen=32)
+
+
+def hash_code(code):
+    salt = secrets.token_bytes(16)
+    return f"scrypt${SCRYPT_N}${SCRYPT_R}${SCRYPT_P}${salt.hex()}${_scrypt(code, salt, SCRYPT_N, SCRYPT_R, SCRYPT_P).hex()}"
+
+
+def code_matches(code, stored):
+    _, n, r, p, salt, want = stored.split("$")
+    return hmac.compare_digest(_scrypt(code, bytes.fromhex(salt), int(n), int(r), int(p)).hex(), want)
+
+
+# --- files ----------------------------------------------------------------------------
+
+def user_path(user):
+    if not USER.match(user):
+        raise ValueError(f"{user!r} is not a user name")
+    return os.path.join(DIR, user)
+
+
+def load(user):
+    try:
+        with open(user_path(user)) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+
+def save(user, data):
+    os.makedirs(DIR, mode=0o700, exist_ok=True)
+    util.write_atomic(user_path(user), json.dumps(data, indent=1) + "\n", mode=0o600)
+
+
+def lock():
+    os.makedirs(DIR, mode=0o700, exist_ok=True)
+    return util.Lock(os.path.join(DIR, ".lock"))
+
+
+def usable(data):
+    return bool(data and (data.get("secret") or data.get("codes")))
+
+
+# --- PAM --------------------------------------------------------------------------------
+
+def verify(env, raw, now=None):
+    """0 lets the login through; everything else, including any error, is 1."""
+    if env.get("PAM_TYPE") != "auth":
+        return 1
+    user = env.get("PAM_USER", "")
+    if not USER.match(user):
+        return 1
+    text = raw[:512].decode("utf-8", "replace").replace("\0", "").strip()
+    with lock():
+        data = load(user)
+        if not usable(data):
+            return 1
+        if re.fullmatch(r"\d{6}", text):
+            if not data.get("secret"):
+                return 1
+            step = match_totp(data["secret"], text, int(data.get("last_step", 0)),
+                              time.time() if now is None else now)
+            if step is None:
+                return 1
+            data["last_step"] = step
+            save(user, data)
+            return 0
+        code = norm_code(text)
+        if code is None:
+            return 1
+        for i, stored in enumerate(data.get("codes", [])):
+            if code_matches(code, stored):
+                del data["codes"][i]
+                save(user, data)
+                announce(user, len(data["codes"]))
+                return 0
+    return 1
+
+
+def announce(user, left):
+    """Banner note that a recovery code went; detached, so the login doesn't wait."""
+    try:
+        subprocess.Popen([util.HB, "notify", "send", "warn", "totp.code",
+                          f"recovery code used for {user}; {left} left"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True, env=PATH_ENV)
+    except OSError:
+        pass
+
+
+def safe_verify():
+    try:
+        return verify(os.environ, sys.stdin.buffer.read(4096))
+    except Exception:  # noqa: BLE001 - any failure refuses the login
+        return 1
+
+
+# --- verbs ---------------------------------------------------------------------------
+
+def need_user(user):
+    try:
+        pwd.getpwnam(user)
+        user_path(user)
+        return True
+    except (KeyError, ValueError):
+        print(f"no user {user!r}")
+        return False
+
+
+def print_codes(user, codes):
+    print(f"\nRecovery codes for {user}. Each works once at the code prompt, in place of")
+    print("the 6 digits. Keep them off this server (a password manager, or on paper):\n")
+    for i in range(0, len(codes), 2):
+        print("    " + "    ".join(codes[i:i + 2]))
+    print()
+
+
+def new_codes():
+    codes = [new_code() for _ in range(N_CODES)]
+    return codes, [hash_code(norm_code(c)) for c in codes]
+
+
+def show_qr(uri):
+    try:
+        p = subprocess.run(["qrencode", "-t", "ANSIUTF8", "-m", "2"], input=uri, text=True,
+                           capture_output=True, timeout=10)
+        if p.returncode == 0:
+            print(p.stdout)
+            return
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    print("(no QR code: qrencode isn't installed; `sudo dnf install qrencode` shows one)\n")
+
+
+def issuer(cfg):
+    return cfg["totp"]["issuer"] or socket.gethostname().split(".")[0]
+
+
+def do_enrol(user, cfg):
+    if not need_user(user):
+        return 2
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("enrol needs a terminal")
+        return 2
+    old = load(user)
+    if old and old.get("secret") and not util.ask(f"{user} already has a secret; replace it (the old one stops working)?"):
+        print("nothing changed")
+        return 1
+    secret = base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
+    iss = issuer(cfg)
+    uri = ("otpauth://totp/" + urllib.parse.quote(f"{iss}:{user}") + "?"
+           + urllib.parse.urlencode({"secret": secret, "issuer": iss, "algorithm": "SHA1",
+                                     "digits": DIGITS, "period": STEP}))
+    print("In your authenticator app, add an account by scanning this, or by typing the key.\n")
+    show_qr(uri)
+    print(f"    account  {iss}:{user}")
+    print(f"    key      {' '.join(secret[i:i + 4] for i in range(0, len(secret), 4))}")
+    print("    type     time-based, 6 digits, 30 seconds\n")
+    for _ in range(3):
+        try:
+            code = input("The code the app shows now: ").strip().replace(" ", "")
+        except EOFError:
+            break
+        step = match_totp(secret, code, 0, time.time()) if re.fullmatch(r"\d{6}", code) else None
+        if step is not None:
+            break
+        print("that doesn't match; check the phone's clock and try the next code")
+    else:
+        step = None
+    if step is None:
+        print("nothing saved")
+        return 1
+    codes, hashes = new_codes()
+    with lock():
+        save(user, {"secret": secret, "codes": hashes, "last_step": step,
+                    "enrolled": datetime.date.today().isoformat()})
+    print(f"\n{user} is enrolled.")
+    print_codes(user, codes)
+    return 0
+
+
+def do_codes(user, plain):
+    if not need_user(user):
+        return 2
+    if not plain and not util.ask(f"make 10 new recovery codes for {user} (the old ones stop working)?"):
+        print("nothing changed")
+        return 1
+    codes, hashes = new_codes()
+    with lock():
+        data = load(user) or {"last_step": 0}
+        data["codes"] = hashes
+        data["codes_made"] = datetime.date.today().isoformat()
+        save(user, data)
+    if plain:
+        print("\n".join(codes))
+    else:
+        print_codes(user, codes)
+    return 0
+
+
+def do_ready(users):
+    missing = [u for u in users if not (USER.match(u) and usable(load(u)))]
+    print(("not enrolled: " + ", ".join(missing)) if missing else "ready: " + ", ".join(users))
+    return 1 if missing else 0
+
+
+def enrolled():
+    """{user: data} for every file in DIR."""
+    out = {}
+    try:
+        names = sorted(os.listdir(DIR))
+    except OSError:
+        return out
+    for n in names:
+        if USER.match(n):
+            try:
+                out[n] = load(n)
+            except (OSError, ValueError):
+                out[n] = None
+    return out
+
+
+def describe(data):
+    if not data:
+        return "unreadable"
+    n = len(data.get("codes", []))
+    return ("app + " if data.get("secret") else "") + f"{n} recovery code{'' if n == 1 else 's'}"
+
+
+def clock_synced():
+    rc, out, _ = util.run("timedatectl", "show", "-p", "NTPSynchronized", "--value")
+    return rc != 0 or out.strip() == "yes"   # unknown counts as fine
+
+
+def verdict(cfg):
+    users = enrolled()
+    need = [l.split()[0] for l in cfg["ssh"]["keys"] if l.split()] if cfg["ssh"]["codes"] else []
+    if not users and not need:
+        return 0, "ok: not in use"
+    problems = [f"{u} not enrolled" for u in dict.fromkeys(need) if not usable(users.get(u))]
+    problems += [f"{u} has {len(d.get('codes', []))} recovery codes left" for u, d in users.items()
+                 if d and len(d.get("codes", [])) < LOW_CODES]
+    problems += [f"{u}: file unreadable" for u, d in users.items() if d is None]
+    if not clock_synced():
+        problems.append("the clock isn't NTP-synchronised; codes depend on it")
+    if problems:
+        return 1, "warn: " + "; ".join(problems)
+    return 0, "ok: " + ", ".join(f"{u} ({describe(d)})" for u, d in users.items())
+
+
+def do_status(cfg):
+    users = enrolled()
+    if not users:
+        print("nobody enrolled")
+    for u, d in users.items():
+        since = (d.get("enrolled") or d.get("codes_made") or "?") if d else "?"
+        print(f"{u:<12} {describe(d)}, since {since}")
+    print("clock: " + ("NTP-synchronised" if clock_synced() else "NOT synchronised"))
+    return verdict(cfg)[0]
+
+
+def main(argv):
+    verb = argv[1] if len(argv) > 1 else "status"
+    if verb == "verify":
+        return safe_verify()
+    if verb in ("help", "-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if os.geteuid() != 0:
+        print("error: run with sudo", file=sys.stderr)
+        return 2
+    from hbkit import config
+    cfg = config.load()
+    if verb == "status":
+        return do_status(cfg)
+    if verb == "check":
+        rc, line = verdict(cfg)
+        print(line)
+        return rc
+    if verb == "enrol" and len(argv) == 3:
+        return do_enrol(argv[2], cfg)
+    if verb == "codes" and len(argv) in (3, 4):
+        return do_codes(argv[2], "--plain" in argv[3:])
+    if verb == "ready" and len(argv) > 2:
+        return do_ready(argv[2:])
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

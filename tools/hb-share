@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+# hb-share — Windows drive letters over WireGuard: Samba for the tunnel's
+# network only, SMB 3.1.1 with mandatory signing, one user with its own Samba
+# password, no guests, NetBIOS or printers.
+#
+# Samba can't bind to a WireGuard interface (it has no broadcast or peer
+# address, and Samba's interface probe skips it), so smbd listens on all
+# addresses and three things keep it to the tunnel: 445/tcp is open only in the
+# tunnel's firewalld zone, the kernel drops smb.service's traffic to and from
+# anywhere else (systemd IPAddressAllow), and Samba's own hosts allow.
+#
+#   hb share status         one line per item
+#   hb share plan           what apply would change (changes nothing)
+#   hb share apply [--yes]  make the changes, asking before each item
+#   hb share check          one-line verdict (exit 0 ok, 1 pending, 2 broken)
+#   hb share password       set or change the user's Samba password
+#
+# Items:
+#   package   samba installed
+#   folders   each share's folder exists (missing ones in the user's home are
+#             created, owned by the user, mode 700)
+#   conf      /etc/samba/smb.conf matches hb.toml (checked with testparm first)
+#   unit      smb.service may talk to localhost and the tunnel's network only
+#   smb       smb enabled and running; nmb (NetBIOS) off
+#   password  the user has a Samba password, and Samba knows no one else
+#   firewall  445/tcp open in the tunnel's firewalld zone and in no other
+#             (hb fw's job; checked here)
+#
+# On each PC, once the tunnel is up: map \\<wg address>\<NAME> as a drive, with
+# the user name and the Samba password, and let Windows remember it.
+#
+# Config ([share] in hb.toml): user, shares ("NAME PATH"; ~ is the user's home).
+# The interface and address come from [wg].
+set -u
+source "$(dirname "$(readlink -f "$0")")/../lib/hb.sh"
+need_root
+need_config
+
+SUSER="$(cfg share.user)"
+IFACE="$(cfg wg.interface)"
+WGADDR="$(cfg wg.address)"
+CONF=/etc/samba/smb.conf
+DROPIN=/etc/systemd/system/smb.service.d/hb-share.conf
+ITEMS=(package folders conf unit smb password firewall)
+
+managed() { [ -n "$SUSER" ]; }
+
+# shares — "NAME<TAB>PATH" per share, with ~ expanded; problems go to stderr, return 2.
+shares() {
+  local home line name path rest bad=0
+  home="$(getent passwd "$SUSER" | cut -d: -f6)"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    read -r name path rest <<<"$line"
+    if [[ ! $name =~ ^[A-Za-z0-9_-]{1,32}$ ]] || [ -z "$path" ] || [ -n "$rest" ]; then
+      echo "share.shares entry '$line': want 'NAME PATH' (NAME: letters, digits, - and _)" >&2; bad=1; continue
+    fi
+    [[ $path == "~" || $path == "~/"* ]] && path="$home${path:1}"
+    [[ $path == /* ]] || { echo "share $name: $path is not an absolute path" >&2; bad=1; continue; }
+    printf '%s\t%s\n' "$name" "${path%/}"
+  done < <(cfg share.shares)
+  return $((bad * 2))
+}
+
+# network — the tunnel's network (10.77.0.0/24 from 10.77.0.1/24).
+network() { python3 -IB -c 'import ipaddress, sys; print(ipaddress.ip_interface(sys.argv[1]).network)' "$WGADDR"; }
+
+# prereq — print why the share can't be set up, return 2; silent and 0 when it can.
+prereq() {
+  getent passwd "$SUSER" >/dev/null || { echo "share.user $SUSER: no such user"; return 2; }
+  [ -n "$WGADDR" ] || { echo "needs WireGuard: wg.address is empty (hb wg)"; return 2; }
+  shares >/dev/null 2>&1 || { shares 2>&1 >/dev/null | head -1; return 2; }
+}
+
+smb_wanted() {
+  local net name path
+  net="$(network)"
+  cat <<EOF
+# Managed by hb-share from hb.toml [share]; changes made here are overwritten.
+# The previous file is kept under /var/lib/hb/backup/.
+# For $net only, SMB 3.1.1 with signing, user $SUSER, no guests, NetBIOS or printers.
+# smbd listens on all addresses: Samba can't bind to a WireGuard interface. The
+# firewall, smb.service's IPAddressAllow and hosts allow keep it to the tunnel.
+# map archive = no: files saved from Windows don't get the execute bit (git would see a mode change).
+[global]
+	server role = standalone server
+	workgroup = WORKGROUP
+	server string = hb
+	bind interfaces only = no
+	hosts allow = $net
+	hosts deny = ALL
+	smb ports = 445
+	disable netbios = yes
+	server min protocol = SMB3_11
+	server signing = mandatory
+	security = user
+	passdb backend = tdbsam
+	map to guest = never
+	restrict anonymous = 2
+	valid users = $SUSER
+	load printers = no
+	printing = bsd
+	printcap name = /dev/null
+	disable spoolss = yes
+	usershare max shares = 0
+	map archive = no
+	logging = systemd
+EOF
+  while IFS=$'\t' read -r name path; do
+    printf '\n[%s]\n\tpath = %s\n\tvalid users = %s\n\tread only = no\n' "$name" "$path" "$SUSER"
+  done < <(shares 2>/dev/null)
+}
+
+dropin_wanted() {
+  cat <<EOF
+# Managed by hb-share. The kernel drops smb's traffic to and from anywhere but
+# localhost and the tunnel's network, whatever smbd itself listens on.
+[Service]
+IPAddressDeny=any
+IPAddressAllow=localhost $(network)
+EOF
+}
+
+# --- package ----------------------------------------------------------------------
+chk_package() {
+  managed || { echo "not managed"; return 0; }
+  rpm -q samba >/dev/null && { rpm -q samba; return 0; }
+  echo "will install samba"; return 1
+}
+fix_package() { dnf install -y -q samba; }
+
+# --- folders ----------------------------------------------------------------------
+chk_folders() {
+  managed || { echo "not managed"; return 0; }
+  prereq || return 2
+  local home name path new=() out=()
+  home="$(getent passwd "$SUSER" | cut -d: -f6)"
+  while IFS=$'\t' read -r name path; do
+    if [ -d "$path" ]; then
+      out+=("$name=$path")
+    elif [ -e "$path" ]; then
+      echo "share $name: $path exists but isn't a folder"; return 2
+    elif [[ $path == "$home"/* ]]; then
+      new+=("$path")
+    else
+      echo "share $name: $path doesn't exist (hb share creates folders only inside $home)"; return 2
+    fi
+  done < <(shares)
+  [ ${#new[@]} -eq 0 ] || { echo "will create ${new[*]} (owned by $SUSER, mode 700)"; return 1; }
+  echo "${out[*]}"
+}
+fix_folders() {
+  local name path
+  while IFS=$'\t' read -r name path; do
+    [ -e "$path" ] || install -d -o "$SUSER" -g "$(id -gn "$SUSER")" -m 700 "$path" || return 1
+  done < <(shares)
+}
+
+# --- conf -------------------------------------------------------------------------
+chk_conf() {
+  managed || { echo "not managed"; return 0; }
+  prereq || return 2
+  [ -d /etc/samba ] || { echo "install samba first"; return 1; }
+  cmp -s <(smb_wanted) "$CONF" && { echo "$CONF: for $(network), shares $(shares | cut -f1 | paste -sd' ')"; return 0; }
+  if [ -f "$CONF" ] && ! grep -q '^# Managed by hb-share' "$CONF"; then
+    echo "$CONF will be replaced (Fedora's sample is kept under $HB_STATE/backup/)"
+  else
+    echo "$CONF will be rewritten from hb.toml"
+  fi
+  return 1
+}
+fix_conf() {
+  command -v testparm >/dev/null || { log "  testparm missing: install samba first"; return 1; }
+  local tmp err
+  tmp="$(mktemp)"; smb_wanted > "$tmp"
+  if ! err="$(testparm -s --suppress-prompt "$tmp" 2>&1 >/dev/null)" || grep -qi 'unknown parameter\|error' <<<"$err"; then
+    log "  testparm refused the new file; nothing changed:"; log "$err"; rm -f "$tmp"; return 1
+  fi
+  keep_copy "$CONF"
+  install -m 644 "$tmp" "$CONF" && rm -f "$tmp"
+  systemctl try-restart smb
+}
+
+# --- unit -------------------------------------------------------------------------
+chk_unit() {
+  managed || { echo "not managed"; return 0; }
+  prereq || return 2
+  cmp -s <(dropin_wanted) "$DROPIN" || { echo "will write $DROPIN (smb may reach $(network) and localhost only)"; return 1; }
+  [ -n "$(systemctl show smb -p IPAddressDeny --value)" ] \
+    || { echo "$DROPIN is written but systemd doesn't apply it: systemctl daemon-reload"; return 1; }
+  echo "smb may reach $(network) and localhost only"
+}
+fix_unit() {
+  install -d -m 755 "$(dirname "$DROPIN")"
+  dropin_wanted > "$DROPIN" && chmod 644 "$DROPIN"
+  systemctl daemon-reload && systemctl try-restart smb
+}
+
+# --- smb --------------------------------------------------------------------------
+# listeners — the local addresses smbd listens on for 445, one per line.
+listeners() { ss -lntH 'sport = :445' | awk '{print $4}' | sort -u; }
+
+chk_smb() {
+  managed || { echo "not managed"; return 0; }
+  rpm -q samba >/dev/null || { echo "install samba first"; return 1; }
+  local todo=""
+  if ! { systemctl is-enabled -q smb && systemctl is-active -q smb; }; then todo="enable and start smb"; fi
+  if systemctl is-enabled -q nmb 2>/dev/null || systemctl is-active -q nmb; then
+    todo="${todo:+$todo; }stop and disable nmb"
+  fi
+  [ -z "$todo" ] || { echo "will $todo"; return 1; }
+  [ -n "$(listeners)" ] || { echo "smb runs but nothing listens on 445: journalctl -u smb"; return 1; }
+  echo "listening on $(listeners | paste -sd' ')"
+}
+fix_smb() {
+  systemctl disable -q --now nmb 2>/dev/null
+  systemctl enable -q smb && systemctl restart smb || return 1
+  sleep 2
+  systemctl is-active -q smb || { log "  smb didn't stay up: journalctl -u smb"; return 1; }
+}
+
+# --- password ---------------------------------------------------------------------
+# samba_users — the accounts in Samba's password database.
+samba_users() { pdbedit -L 2>/dev/null | cut -d: -f1; }
+
+chk_password() {
+  managed || { echo "not managed"; return 0; }
+  command -v pdbedit >/dev/null || { echo "install samba first"; return 1; }
+  local others
+  others="$(samba_users | grep -vx "$SUSER" | paste -sd' ')"
+  [ -z "$others" ] || { echo "Samba also knows $others; apply removes them"; return 1; }
+  samba_users | grep -qx "$SUSER" && { echo "$SUSER has a Samba password"; return 0; }
+  echo "$SUSER needs a Samba password (apply asks for it; Windows remembers it)"; return 1
+}
+fix_password() {
+  local u
+  for u in $(samba_users | grep -vx "$SUSER"); do pdbedit -x -u "$u" >/dev/null || return 1; done
+  samba_users | grep -qx "$SUSER" && return 0
+  [ -t 0 ] || { log "  needs a terminal: sudo hb share password"; return 1; }
+  smbpasswd -a "$SUSER"
+}
+
+# --- firewall ---------------------------------------------------------------------
+# zones445 — the firewalld zones whose ports or services open 445/tcp.
+zones445() {
+  firewall-cmd --list-all-zones | awk '
+    /^[^ \t]/            { z = $1 }
+    /^[ \t]+ports:/      { for (i = 2; i <= NF; i++) if ($i == "445/tcp") print z }
+    /^[ \t]+services:/   { for (i = 2; i <= NF; i++) if ($i == "samba") print z }' | sort -u
+}
+
+chk_firewall() {
+  managed || { echo "not managed"; return 0; }
+  local zone
+  zone="$(firewall-cmd --get-zone-of-interface="$IFACE" 2>/dev/null)" \
+    || { echo "$IFACE has no firewalld zone: hb fw"; return 2; }
+  local open others
+  open="$(zones445)"
+  others="$(grep -vx "$zone" <<<"$open" | paste -sd' ')"
+  [ -z "$others" ] || { echo "445/tcp is open in zone $others, not only $zone: remove it there (hb fw)"; return 2; }
+  grep -qx "$zone" <<<"$open" && { echo "445/tcp open in zone $zone only"; return 0; }
+  echo "445/tcp isn't open in zone $zone: add \"445/tcp\" to fw.zones.$zone.ports, then hb fw apply"; return 2
+}
+
+if [ "${1:-}" = password ]; then
+  managed || die "share.user is empty"
+  command -v smbpasswd >/dev/null || die "install samba first: sudo hb share apply"
+  exec smbpasswd -a "$SUSER"
+fi
+item_main "$@"

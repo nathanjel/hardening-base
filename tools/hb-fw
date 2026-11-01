@@ -22,7 +22,6 @@ import ipaddress
 import json
 import os
 import re
-import shutil
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -30,11 +29,11 @@ from dataclasses import dataclass
 from xml.sax.saxutils import escape, quoteattr
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
-from hbkit import config, util  # noqa: E402
+from hbkit import config, guard, util  # noqa: E402
 
 ETC = "/etc/firewalld/zones"
 LIB = "/usr/lib/firewalld/zones"
-UNIT = "hb-fw-revert"
+GUARD = guard.Guard("fw")
 ZONE_KEYS = ("target", "interfaces", "sources", "services", "ports", "rules", "forward")
 TARGETS = ("default", "ACCEPT", "DROP", "%%REJECT%%")
 NAME = re.compile(r"^[A-Za-z0-9_.+-]{1,32}$")
@@ -324,32 +323,17 @@ def busy():
 
 
 def notify(level, key, text):
-    util.run(util.HB, "notify", "send", level, key, text, timeout=120)
+    util.notify(level, key, text)
 
 
 def pending_path():
-    return os.path.join(util.state_dir("fw"), "pending.json")
-
-
-def confirm(question):
-    try:
-        with open("/dev/tty") as tty:
-            print(f"{question} [y/N] ", end="", flush=True)
-            return tty.readline().strip().lower().startswith("y")
-    except OSError:
-        return False
+    return GUARD.path
 
 
 def restore(pend):
     """Put back the files a pending change replaced, reload; True when firewalld took it."""
-    for path, saved in pend["files"].items():
-        if saved:
-            shutil.copy2(saved, path)
-        elif os.path.exists(path):
-            os.unlink(path)
+    GUARD.restore(pend)
     rc, _, err = util.run("firewall-cmd", "--reload", timeout=120)
-    if os.path.exists(pending_path()):
-        os.unlink(pending_path())
     if rc != 0:
         print(f"firewall-cmd --reload failed: {err.strip()}")
     return rc == 0
@@ -390,7 +374,7 @@ def do_apply(cfg, yes):
     if not todo:
         print("nothing to change")
         return 0
-    if os.path.exists(pending_path()):
+    if GUARD.pending() is not None:
         print("a change is still waiting for confirmation: hb fw confirm, or hb fw revert")
         return 2
     if util.run("firewall-cmd", "--state")[0] != 0:
@@ -404,34 +388,17 @@ def do_apply(cfg, yes):
         if yes:
             print("not applying with --yes while busy")
             return 1
-    if not yes and not confirm(f"apply, with the old zones coming back after {minutes} minutes unless confirmed?"):
+    if not yes and not util.ask(f"apply, with the old zones coming back after {minutes} minutes unless confirmed?"):
         print("nothing changed")
         return 1
 
-    run_id = os.environ.get("HB_RUN") or time.strftime("%Y%m%d-%H%M%S")
-    backup = os.path.join(util.STATE, "backup", run_id)
-    files = {}
-    for e in todo:
-        path = os.path.join(ETC, e["name"] + ".xml")
-        files[path] = None
-        if os.path.exists(path):
-            files[path] = backup + path
-            os.makedirs(os.path.dirname(files[path]), mode=0o700, exist_ok=True)
-            shutil.copy2(path, files[path])
     before = active_bindings()
-
     # The timer comes first: without it, nothing changes.
-    util.run("systemctl", "reset-failed", f"{UNIT}.timer", f"{UNIT}.service")
-    rc, _, err = util.run("systemd-run", f"--unit={UNIT}", f"--on-active={minutes}min",
-                          "--timer-property=AccuracySec=1s",
-                          "--description=hb fw: put back an unconfirmed firewall change",
-                          util.HB, "fw", "revert", "--timer")
-    if rc != 0:
-        print(f"cannot start the revert timer ({err.strip()}); nothing changed")
+    pend, err = GUARD.begin([os.path.join(ETC, e["name"] + ".xml") for e in todo], minutes,
+                            "put back an unconfirmed firewall change", zones=[e["name"] for e in todo])
+    if err:
+        print(f"{err}; nothing changed")
         return 2
-    until = time.time() + minutes * 60
-    pend = {"run": run_id, "files": files, "until": until, "zones": [e["name"] for e in todo]}
-    util.write_json(pending_path(), pend)
 
     os.makedirs(ETC, exist_ok=True)
     for e in todo:
@@ -441,7 +408,7 @@ def do_apply(cfg, yes):
         rc, out, err = util.run("firewall-cmd", *step, timeout=120)
         if rc != 0:
             print(f"firewall-cmd {step[0]} failed: {(out + err).strip()}\nputting the old zones back")
-            util.run("systemctl", "stop", f"{UNIT}.timer")
+            GUARD.stop_timer()
             restore(pend)
             return 2
 
@@ -463,22 +430,20 @@ def do_apply(cfg, yes):
         print("after the reload these bindings are missing: " + ", ".join(sorted(missing)))
         print("docker puts its own back within seconds; if not: sudo systemctl restart docker")
 
-    print(f"\napplied; the old zones come back at {time.strftime('%H:%M', time.localtime(until))} unless confirmed.")
+    print(f"\napplied; the old zones come back at {guard.until_text(pend)} unless confirmed.")
     print("Keep this session open. Open a NEW ssh session (and one over WireGuard, if you use it).")
     print("If it logs in, run there:  sudo hb fw confirm")
     return 0
 
 
 def do_confirm():
-    if not os.path.exists(pending_path()):
+    pend, err = GUARD.confirm()
+    if err:
+        print(err)
+        return 2
+    if pend is None:
         print("nothing waiting for confirmation")
         return 0
-    pend = util.read_json(pending_path(), {})
-    rc, _, err = util.run("systemctl", "stop", f"{UNIT}.timer")
-    if rc != 0:
-        print(f"could not stop the revert timer: {err.strip()}")
-        return 2
-    os.unlink(pending_path())
     zones = ", ".join(pend.get("zones", []))
     notify("info", "fw.change", f"firewall change confirmed: {zones}")
     print(f"confirmed: {zones}. The previous files stay in {util.STATE}/backup/{pend.get('run')}/")
@@ -486,12 +451,12 @@ def do_confirm():
 
 
 def do_revert(by_timer):
-    if not os.path.exists(pending_path()):
+    pend = GUARD.pending()
+    if pend is None:
         print("nothing to revert")
         return 0
-    pend = util.read_json(pending_path(), {})
     if not by_timer:
-        util.run("systemctl", "stop", f"{UNIT}.timer")
+        GUARD.stop_timer()
     ok = restore(pend)
     text = ("firewall change not confirmed in time: previous zones restored" if by_timer
             else "firewall change reverted by hand")
@@ -544,7 +509,7 @@ def verdict(cfg):
     bad = [e["name"] for e in entries if e["error"]]
     if bad:
         return 2, f"fail: {', '.join(bad)} (hb fw plan)"
-    pend = util.read_json(pending_path(), None) if os.path.exists(pending_path()) else None
+    pend = GUARD.pending()
     if pend:
         at = time.strftime("%H:%M", time.localtime(pend.get("until", 0)))
         return 1, f"warn: change waiting for confirmation; reverts at {at} (hb fw confirm)"

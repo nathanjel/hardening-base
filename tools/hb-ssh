@@ -1,0 +1,573 @@
+#!/usr/bin/python3 -IB
+"""hb-ssh — who may log in over SSH and how, applied with a revert timer.
+
+  hb ssh status           one line per piece
+  hb ssh plan             what apply would change (changes nothing)
+  hb ssh apply [--yes]    write the files, reload sshd, start the revert timer
+  hb ssh confirm          keep the change; run it from a NEW ssh session
+  hb ssh revert           put the previous files back now
+  hb ssh check            one-line verdict (exit 0 ok, 1 pending, 2 broken)
+
+What it manages:
+  /etc/ssh/authorized_keys/<user>  the keys in ssh.keys, owned by root, so nothing
+                                   running as that user can add one. The
+                                   break-glass user's file is hb breakglass's.
+  group hb-ssh                     sshd lets in only its members: the users in
+                                   ssh.keys and breakglass.user
+  /etc/ssh/sshd_config.d/10-hb-ssh.conf
+                                   keys from those files only, no passwords; with
+                                   ssh.codes, a key and then a code (hb totp),
+                                   except from the networks in ssh.key_only_from
+  /etc/pam.d/sshd                  with ssh.codes, the code check takes the place
+                                   of Fedora's password step
+
+After apply, the previous files come back by themselves after
+ssh.revert_minutes unless `hb ssh confirm` runs first. Sessions already open
+stay open either way. apply refuses when the person running it has no key in
+ssh.keys, or, with ssh.codes, when someone listed isn't enrolled in hb totp.
+
+Config ([ssh] in hb.toml): keys ("USER TYPE KEY [COMMENT]"), codes,
+key_only_from, revert_minutes.
+"""
+import base64
+import binascii
+import difflib
+import grp
+import hashlib
+import ipaddress
+import os
+import pwd
+import re
+import struct
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+from hbkit import config, guard, util  # noqa: E402
+
+KEYDIR = "/etc/ssh/authorized_keys"
+DROPIN = "/etc/ssh/sshd_config.d/10-hb-ssh.conf"
+PAM = "/etc/pam.d/sshd"
+GROUP = "hb-ssh"
+GUARD = guard.Guard("ssh")
+USER = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+KEY_TYPES = ("ssh-ed25519", "sk-ssh-ed25519@openssh.com", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384",
+             "ecdsa-sha2-nistp521", "sk-ecdsa-sha2-nistp256@openssh.com", "ssh-rsa")
+PAM_STOCK_RE = re.compile(r"^auth\s+substack\s+password-auth\s*$")
+PAM_HB_RE = re.compile(r"^auth\s+(requisite|required|\[success=ok\s+default=die\])\s+pam_exec\.so\s+quiet\s+expose_authtok"
+                       r"\s+\S+/hb-totp\s+verify\s*$")
+PAM_PERMIT_RE = re.compile(r"^auth\s+required\s+pam_permit\.so\s*$")
+PAM_NOTE = "# hb-ssh: "
+PAM_STOCK = "auth       substack     password-auth"
+HEADER = "# Managed by hb-ssh from hb.toml [ssh]; changes made here are overwritten."
+
+
+def totp_path():
+    return os.path.join(util.HB_ROOT, "tools", "hb-totp")
+
+
+def pam_hb_lines():
+    """The code check, in place of Fedora's password step.
+
+    After a keyboard-interactive login sshd calls pam_setcred and drops the
+    session if it fails. sshd authenticates in a forked child, so the parent's
+    pam_setcred runs the auth stack afresh: pam_exec answers "ignore" there
+    (always, pam 1.7.2) and something has to answer success, which pam_permit
+    does. In pam_authenticate a failed code ends the login at pam_exec
+    (requisite) before pam_permit is reached; pam_exec answers "ignore" there
+    only for a type= option that doesn't match, which hb never writes."""
+    return [PAM_NOTE + "the code from hb totp decides (requisite); pam_permit only lets sshd's pam_setcred succeed",
+            f"auth       requisite    pam_exec.so quiet expose_authtok {totp_path()} verify",
+            "auth       required     pam_permit.so"]
+
+
+# --- keys --------------------------------------------------------------------------
+
+def key_fields(line):
+    """(type, blob, comment) of an authorized_keys line without options, or None."""
+    parts = line.split(None, 2)
+    if len(parts) < 2 or parts[0] not in KEY_TYPES:
+        return None
+    try:
+        blob = base64.b64decode(parts[1], validate=True)
+        n = struct.unpack(">I", blob[:4])[0]
+        if blob[4:4 + n].decode() != parts[0]:
+            return None
+    except (binascii.Error, ValueError, struct.error, UnicodeDecodeError):
+        return None
+    return parts[0], parts[1], parts[2].strip() if len(parts) > 2 else ""
+
+
+def fingerprint(blob_b64):
+    return "SHA256:" + base64.b64encode(hashlib.sha256(base64.b64decode(blob_b64)).digest()).decode().rstrip("=")
+
+
+def parse_keys(lines):
+    """({user: [(type, blob, comment)]}, [errors])."""
+    keys, errors, seen = {}, [], set()
+    for line in lines:
+        parts = str(line).split(None, 1)
+        if len(parts) != 2:
+            errors.append(f"ssh.keys entry {str(line)[:40]!r}: want 'USER TYPE KEY [COMMENT]'")
+            continue
+        user, rest = parts
+        if not USER.match(user):
+            errors.append(f"ssh.keys: {user!r} is not a user name")
+            continue
+        try:
+            pwd.getpwnam(user)
+        except KeyError:
+            errors.append(f"ssh.keys: no user {user}")
+            continue
+        k = key_fields(rest)
+        if k is None:
+            errors.append(f"ssh.keys: {user}'s key {rest[:30]!r}… is not a public key line (TYPE BASE64 [COMMENT])")
+            continue
+        if k[1] in seen:
+            errors.append(f"ssh.keys: {user}'s key {k[2] or fingerprint(k[1])} is listed twice")
+            continue
+        seen.add(k[1])
+        keys.setdefault(user, []).append(k)
+    return keys, errors
+
+
+def render_keys(keys):
+    lines = ["# Managed by hb-ssh from hb.toml (ssh.keys); changes made here are overwritten."]
+    lines += [" ".join(x for x in k if x) for k in keys]
+    return "\n".join(lines) + "\n"
+
+
+def file_keys(text):
+    return [k for k in (key_fields(l.strip()) for l in (text or "").splitlines()) if k]
+
+
+def home_keys(user):
+    """Keys in the user's own ~/.ssh/authorized_keys (options stripped), or []."""
+    try:
+        home = pwd.getpwnam(user).pw_dir
+        with open(os.path.join(home, ".ssh", "authorized_keys")) as f:
+            text = f.read()
+    except (KeyError, OSError):
+        return []
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        k = key_fields(line)
+        if k is None:   # options first: find where the key type starts
+            m = re.search(r"(?:^|\s)((?:%s)\s.*)$" % "|".join(map(re.escape, KEY_TYPES)), line)
+            k = key_fields(m.group(1)) if m else None
+        if k:
+            out.append(k)
+    return out
+
+
+# --- sshd and PAM -------------------------------------------------------------------
+
+def render_dropin(codes, key_only_from):
+    lines = [HEADER,
+             "# sshd reads its drop-ins in name order and keeps the first value it sees.",
+             f"AuthorizedKeysFile {KEYDIR}/%u",
+             f"AllowGroups {GROUP}",
+             "PasswordAuthentication no",
+             "PermitEmptyPasswords no",
+             "GSSAPIAuthentication no",
+             "X11Forwarding no",
+             "MaxAuthTries 3"]
+    if codes:
+        lines += ["KbdInteractiveAuthentication yes",
+                  "AuthenticationMethods publickey,keyboard-interactive:pam"]
+        if key_only_from:
+            lines += [f"Match Address {','.join(key_only_from)}", "    AuthenticationMethods publickey"]
+    else:
+        lines += ["KbdInteractiveAuthentication no", "AuthenticationMethods publickey"]
+    return "\n".join(lines) + "\n"
+
+
+def pam_want(text, codes):
+    """(the PAM file as it should be, None) or (None, why it can't be done)."""
+    lines = text.splitlines()
+    stock = [i for i, l in enumerate(lines) if PAM_STOCK_RE.match(l)]
+    ours = [i for i, l in enumerate(lines) if PAM_HB_RE.match(l)]
+    if len(stock) + len(ours) != 1:
+        return None, (f"{PAM} doesn't have exactly one '{PAM_STOCK}' line (or hb's in its place); "
+                      "edit it by hand")
+    start = end = (stock + ours)[0]
+    if ours:   # hb's block: its note, the code line, pam_permit (older versions wrote the code line alone)
+        if start > 0 and lines[start - 1].startswith(PAM_NOTE):
+            start -= 1
+        if end + 1 < len(lines) and PAM_PERMIT_RE.match(lines[end + 1]):
+            end += 1
+    lines[start:end + 1] = pam_hb_lines() if codes else [PAM_STOCK]
+    return "\n".join(lines) + "\n", None
+
+
+def describe_dropin(codes, key_only_from):
+    out = [f"keys only from {KEYDIR}/<user>, owned by root",
+           f"only members of {GROUP}; no passwords, no GSSAPI, no X11 forwarding; 3 tries"]
+    if codes:
+        out.append("from the internet: the key, then a code from hb totp (the prompt says Password:)")
+        if key_only_from:
+            out.append(f"from {', '.join(key_only_from)}: the key alone")
+    else:
+        out.append("the key alone, from anywhere")
+    return out
+
+
+def not_root_owned(path):
+    """Path components that someone other than root could change."""
+    bad, p = [], os.path.realpath(path)
+    while True:
+        try:
+            st = os.stat(p)
+            if st.st_uid != 0 or st.st_mode & 0o022:
+                bad.append(p)
+        except OSError:
+            bad.append(p)
+        if p == os.path.dirname(p):
+            return bad
+        p = os.path.dirname(p)
+
+
+# --- survey -------------------------------------------------------------------------
+
+def read(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def group_members():
+    try:
+        return set(grp.getgrnam(GROUP).gr_mem)
+    except KeyError:
+        return None
+
+
+def line_diff(old, new):
+    keep = lambda t: [l for l in (t or "").splitlines() if l.strip() and not l.startswith("#")]  # noqa: E731
+    return [f"{d[0]} {d[2:].strip()}" for d in difflib.ndiff(keep(old), keep(new)) if d[0] in "+-"]
+
+
+def key_label(k):
+    return f"{k[2] or k[0]} ({fingerprint(k[1])[:19]}…)"
+
+
+def survey(cfg):
+    """{"errors", "notes", "files": [(path, have, want, mode, [changes])], "group": (have, want)}."""
+    s = cfg["ssh"]
+    out = {"errors": [], "notes": [], "files": [], "group": None, "managed": bool(s["keys"])}
+    if not s["keys"]:
+        return out
+    keys, out["errors"] = parse_keys(s["keys"])
+    nets = []
+    for n in s["key_only_from"]:
+        try:
+            nets.append(str(ipaddress.ip_network(str(n), strict=True)))
+        except ValueError:
+            out["errors"].append(f"ssh.key_only_from: {n!r} is not a network")
+    rescue = cfg["breakglass"]["user"]
+
+    for user, ks in sorted(keys.items()):
+        path = os.path.join(KEYDIR, user)
+        have, want = read(path), render_keys(ks)
+        if have != want:
+            hk = file_keys(have)
+            ch = ["new"] if have is None else []
+            ch += [f"+ {key_label(k)}" for k in ks if k not in hk]
+            ch += [f"- {key_label(k)}" for k in hk if k not in ks]
+            out["files"].append((path, have, want, 0o644, ch or ["layout only"]))
+        extra = [k for k in home_keys(user) if k[1] not in {x[1] for x in ks}]
+        if extra:
+            out["notes"].append(f"{user}'s ~/.ssh/authorized_keys has {len(extra)} key(s) not in ssh.keys "
+                                f"({', '.join(key_label(k) for k in extra)}); sshd won't read that file")
+    if os.path.isdir(KEYDIR):
+        for name in sorted(os.listdir(KEYDIR)):
+            if name not in keys and name != rescue:
+                out["files"].append((os.path.join(KEYDIR, name), read(os.path.join(KEYDIR, name)), None,
+                                     0o644, ["remove: not in ssh.keys"]))
+
+    want = render_dropin(s["codes"], nets)
+    have = read(DROPIN)
+    if have != want:
+        if have is None:
+            ch = ["new"] + describe_dropin(s["codes"], nets)
+        else:
+            ch = line_diff(have, want) or ["layout only"]
+        out["files"].append((DROPIN, have, want, 0o600, ch))
+
+    pam_have = read(PAM)
+    if pam_have is None:
+        out["errors"].append(f"{PAM} is missing")
+    else:
+        pam_new, err = pam_want(pam_have, s["codes"])
+        if err:
+            out["errors"].append(err)
+        elif pam_new != pam_have:
+            ch = ["the code check takes the place of Fedora's password step" if s["codes"]
+                  else "Fedora's password step comes back in place of the code check"]
+            out["files"].append((PAM, pam_have, pam_new, 0o644, ch))
+
+    members = set(keys) | ({rescue} if rescue and user_exists(rescue) else set())
+    out["group"] = (group_members(), members)
+    out["users"] = sorted(keys)
+    out["nets"] = nets
+    return out
+
+
+def user_exists(name):
+    try:
+        pwd.getpwnam(name)
+        return True
+    except KeyError:
+        return False
+
+
+def group_changes(group):
+    have, want = group
+    if have is None:
+        return [f"new, members {', '.join(sorted(want))}"]
+    ch = [f"+ {u}" for u in sorted(want - have)] + [f"- {u}" for u in sorted(have - want)]
+    return ch
+
+
+def totp_missing(users):
+    """'' when every user can answer the code prompt, else hb totp's answer."""
+    rc, out, _ = util.run(util.HB, "totp", "ready", *users)
+    return "" if rc == 0 else out.strip().removeprefix("not enrolled: ")
+
+
+def preflight(cfg, sv):
+    """Reasons apply must not go ahead."""
+    why = list(sv["errors"])
+    me = util.sudo_user()
+    if me and me not in sv.get("users", []):
+        why.append(f"you ({me}) have no key in ssh.keys: after this you couldn't log in")
+    if cfg["ssh"]["codes"] and sv.get("users"):
+        missing = totp_missing(sv["users"])
+        if missing:
+            why.append(f"not enrolled in hb totp: {missing}; run sudo hb totp enrol USER first")
+        bad = not_root_owned(totp_path())
+        if bad:
+            why.append(f"sshd would run {totp_path()} as root, but {bad[0]} isn't root's alone; "
+                       "run it from the installed copy (sudo hb ...)")
+    return why
+
+
+# --- verbs --------------------------------------------------------------------------
+
+def show_plan(sv):
+    for e in sv["errors"]:
+        print(f"cannot  {e}")
+    ch = group_changes(sv["group"]) if sv["group"] else []
+    if ch:
+        print(f"group {GROUP}")
+        for c in ch:
+            print(f"    {c}")
+    for path, _, _, _, changes in sv["files"]:
+        if changes[0] == "new" or len(changes) == 1:
+            print(f"{path}: {changes[0]}")
+            rest = changes[1:]
+        else:
+            print(path)
+            rest = changes
+        for c in rest:
+            print(f"    {c}")
+    for n in sv["notes"]:
+        print(f"note: {n}")
+
+
+def pending_changes(sv):
+    return bool(sv["files"]) or bool(sv["group"] and group_changes(sv["group"]))
+
+
+def do_plan(cfg):
+    sv = survey(cfg)
+    if not sv["managed"]:
+        print("not managed (no ssh.keys)")
+        return 0
+    show_plan(sv)
+    if sv["errors"]:
+        return 2
+    if not pending_changes(sv):
+        print("nothing to change")
+        return 0
+    return 1
+
+
+def set_group(have, want):
+    if have is None:
+        rc, _, err = util.run("groupadd", "-r", GROUP)
+        if rc != 0:
+            return f"groupadd {GROUP}: {err.strip()}"
+    if have != want:
+        rc, _, err = util.run("gpasswd", "-M", ",".join(sorted(want)), GROUP)
+        if rc != 0:
+            return f"gpasswd {GROUP}: {err.strip()}"
+    return None
+
+
+def reload_sshd():
+    rc, _, err = util.run("systemctl", "reload", "sshd", timeout=60)
+    return None if rc == 0 else f"systemctl reload sshd: {err.strip()}"
+
+
+def do_apply(cfg, yes):
+    sv = survey(cfg)
+    if not sv["managed"]:
+        print("not managed (no ssh.keys)")
+        return 0
+    why = preflight(cfg, sv)
+    if why:
+        for w in why:
+            print(f"cannot  {w}")
+        return 2
+    if not pending_changes(sv):
+        print("nothing to change")
+        return 0
+    if GUARD.pending() is not None:
+        print("a change is still waiting for confirmation: hb ssh confirm, or hb ssh revert")
+        return 2
+    show_plan(sv)
+    minutes = int(cfg["ssh"]["revert_minutes"])
+    if not yes and not util.ask(f"apply, with the old files coming back after {minutes} minutes unless confirmed?"):
+        print("nothing changed")
+        return 1
+
+    # The group first: on its own it changes nothing (sshd doesn't look at it yet).
+    err = set_group(*sv["group"])
+    if err:
+        print(f"{err}; nothing else changed")
+        return 2
+    if not sv["files"]:
+        print("group updated; no files to change")
+        return 0
+    pend, err = GUARD.begin([f[0] for f in sv["files"]], minutes, "put back an unconfirmed sshd change",
+                            files_changed=[f[0] for f in sv["files"]])
+    if err:
+        print(f"{err}; files unchanged")
+        return 2
+    os.makedirs(KEYDIR, mode=0o755, exist_ok=True)
+    os.chmod(KEYDIR, 0o755)
+    for path, _, want, mode, _ in sv["files"]:
+        if want is None:
+            os.unlink(path)
+        else:
+            util.write_atomic(path, want, mode=mode)
+    rc, out, err = util.run("sshd", "-t", timeout=30)
+    err = None if rc == 0 else f"sshd -t: {(out + err).strip()}"
+    err = err or reload_sshd()
+    if err:
+        print(f"{err}\nputting the old files back")
+        GUARD.stop_timer()
+        GUARD.restore(pend)
+        reload_sshd()
+        return 2
+
+    print(f"\napplied; the old files come back at {guard.until_text(pend)} unless confirmed.")
+    print("Keep this session open. Open a NEW session from the internet"
+          + (" (key, then the 6-digit code at the Password: prompt)" if cfg["ssh"]["codes"] else ""))
+    if sv.get("nets") and cfg["ssh"]["codes"]:
+        print(f"and one over {', '.join(sv['nets'])} (key only).")
+    print("If they log in, run in one of them:  sudo hb ssh confirm")
+    return 0
+
+
+def do_confirm():
+    pend, err = GUARD.confirm()
+    if err:
+        print(err)
+        return 2
+    if pend is None:
+        print("nothing waiting for confirmation")
+        return 0
+    util.notify("info", "ssh.change", "sshd change confirmed")
+    print(f"confirmed. The previous files stay in {util.STATE}/backup/{pend.get('run')}/")
+    return 0
+
+
+def do_revert(by_timer):
+    pend = GUARD.pending()
+    if pend is None:
+        print("nothing to revert")
+        return 0
+    if not by_timer:
+        GUARD.stop_timer()
+    GUARD.restore(pend)
+    err = reload_sshd()
+    text = "sshd change not confirmed in time: previous files restored" if by_timer else "sshd change reverted by hand"
+    util.notify("warn" if by_timer else "info", "ssh.revert", text + ("; reload failed" if err else ""))
+    print(text + (f"; {err}" if err else ""))
+    return 2 if err else 0
+
+
+def summary(cfg, sv):
+    users = sv.get("users", [])
+    rescue = cfg["breakglass"]["user"]
+    who = ", ".join(users + ([rescue] if rescue and rescue in sv["group"][1] else []))
+    if cfg["ssh"]["codes"]:
+        how = "key + code" + (f", key only from {', '.join(sv['nets'])}" if sv.get("nets") else "")
+    else:
+        how = "key only"
+    return f"{who}; {how}"
+
+
+def verdict(cfg):
+    sv = survey(cfg)
+    if not sv["managed"]:
+        return 0, "ok: not managed"
+    if sv["errors"]:
+        return 2, "fail: " + "; ".join(sv["errors"])
+    pend = GUARD.pending()
+    if pend is not None:
+        return 1, f"warn: waiting for hb ssh confirm (reverts at {guard.until_text(pend)})"
+    if pending_changes(sv):
+        what = ([f"group {GROUP}"] if group_changes(sv["group"]) else []) + [f[0] for f in sv["files"]]
+        return 1, "pending: " + ", ".join(what)
+    return 0, "ok: " + summary(cfg, sv)
+
+
+def do_status(cfg):
+    sv = survey(cfg)
+    if not sv["managed"]:
+        print("not managed (no ssh.keys)")
+        return 0
+    rc, line = verdict(cfg)
+    print(line)
+    if rc:
+        show_plan(sv)
+    return rc
+
+
+def main(argv):
+    verb = argv[1] if len(argv) > 1 else "status"
+    if verb in ("help", "-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if os.geteuid() != 0:
+        print("error: run with sudo", file=sys.stderr)
+        return 2
+    cfg = config.load()
+    if verb == "status":
+        return do_status(cfg)
+    if verb == "plan":
+        return do_plan(cfg)
+    if verb == "check":
+        rc, line = verdict(cfg)
+        print(line)
+        return rc
+    if verb in ("apply", "confirm", "revert"):
+        with util.Lock(os.path.join(util.state_dir("ssh"), "lock")):
+            if verb == "apply":
+                return do_apply(cfg, "--yes" in argv[2:])
+            if verb == "confirm":
+                return do_confirm()
+            return do_revert("--timer" in argv[2:])
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
