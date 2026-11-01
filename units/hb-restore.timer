@@ -1,0 +1,10 @@
+# Managed by hb install from units/; changes made here are overwritten.
+[Unit]
+Description=hb: restore drill on the 15th of January, April, July and October at 02:30
+
+[Timer]
+OnCalendar=*-01,04,07,10-15 02:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

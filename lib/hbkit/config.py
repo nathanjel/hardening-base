@@ -68,6 +68,21 @@ DEFAULTS = {
         "fail_hours": 50,
         "read_data_percent": 10,
     },
+    "restore": {
+        "sample_files": 200,
+        "max_file_mb": 200,
+        "must_have": ["/etc/hb/hb.toml", "/var/lib/hb/state"],
+        "drill_days": 92,
+    },
+    "rebuild": {
+        # copied from the snapshot's /etc and /usr/local where the box has none
+        "files": ["/etc/yum.repos.d/*.repo", "/etc/pki/rpm-gpg/*", "/etc/docker/daemon.json",
+                  "/usr/local/bin/*", "/usr/local/sbin/*"],
+        "data": [],     # empty: backup.paths without /etc, /usr/local and hb's own state
+        # made by microk8s and its add-ons; every other namespace is yours
+        "skip_namespaces": ["kube-system", "kube-public", "kube-node-lease", "ingress", "cert-manager",
+                            "container-registry", "metallb-system", "observability"],
+    },
     "clean": {
         "dry_run": True,
         "users": [],

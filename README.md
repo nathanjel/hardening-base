@@ -17,10 +17,10 @@ upgrades and cleanup jobs. They arrive in phases.
 
 ## Status
 
-Phases 1 to 6 are written (runbooks:
+Phases 1 to 7 are written, phase 8 is next (runbooks:
 [docs/PHASE1.md](docs/PHASE1.md), [docs/PHASE2.md](docs/PHASE2.md),
 [docs/PHASE3.md](docs/PHASE3.md), [docs/PHASE4.md](docs/PHASE4.md),
-[docs/PHASE5.md](docs/PHASE5.md), [docs/PHASE6.md](docs/PHASE6.md)). Start from `hb.toml.example`, which lists every
+[docs/PHASE5.md](docs/PHASE5.md), [docs/PHASE6.md](docs/PHASE6.md), [docs/PHASE7.md](docs/PHASE7.md)). Start from `hb.toml.example`, which lists every
 key, as `hb.toml` in the checkout. `sudo ./hb install apply` then copies the code
 to `/opt/hb` (root's, so nothing running as your user can change what root's
 timers run) and the config to `/etc/hb/hb.toml`.
@@ -47,8 +47,11 @@ timers run) and the config to `/etc/hb/hb.toml`.
 | `hb-notify` | events for the banner; failures also as SMS through any command you name (rate-limited) |
 | `hb-alerts` | mdadm and smartd report through hb-notify, no mail server needed |
 | `hb-backup` | restic from a read-only btrfs snapshot, plus a state dump for rebuilding |
+| `hb-restore` | files back from the backup (into a folder, or over the live ones after a yes), and a quarterly drill that restores a random sample and compares it byte for byte with the live files |
 | `hb-clean` | build output in idle projects, stale caches, Docker leftovers; dry-run first. Measures the image registry, never cleans it |
-| `phase0/inventory.sh` | read-only system inventory (becomes `hb-inventory`) |
+| `hb-inventory` | the state dump a rebuild needs (packages, snaps, accounts, units, every Kubernetes object you made, ...), written before each backup |
+| `hb-rebuild` | sets up a fresh box from the newest snapshot: files, packages, snaps, accounts, data, microk8s add-ons, Kubernetes objects, units; only ever adds. See [docs/RUNBOOK-rebuild.md](docs/RUNBOOK-rebuild.md) |
+| `phase0/inventory.sh` | the read-only survey hb started from |
 
 ## Conventions
 

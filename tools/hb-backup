@@ -13,10 +13,10 @@
 #                           hb backup restic snapshots
 #                           hb backup restic restore latest --target /tmp/r --include /etc/hb
 #
-# Before the backup, the state dump writes what a rebuild needs to know into
-# /var/lib/hb/state: installed packages, snaps, firewall zones, enabled units,
-# disks, Docker containers and, with microk8s, its add-ons and objects
-# (secrets included; the repository is encrypted).
+# Before the backup, hb inventory run writes the state dump, what a rebuild
+# needs to know, into /var/lib/hb/state: installed packages, snaps, accounts,
+# firewall zones, enabled units, disks, Docker containers and, with microk8s,
+# its add-ons and every object (secrets included; the repository is encrypted).
 #
 # Config ([backup] in hb.toml): repo, password_file, require_mount, paths,
 # exclude, exclude_if_present, keep_daily, keep_weekly, keep_monthly,
@@ -37,7 +37,6 @@ mapfile -t EXCLUDE < <(cfg backup.exclude)
 mapfile -t IF_PRESENT < <(cfg backup.exclude_if_present)
 SNAP="$(cfg snapshot.dir)/backup-run"
 STATUS="$HB_STATE/hb-backup"     # last-ok, last-run, last-check: read by `check`
-DUMP="$HB_STATE/state"           # the state dump; /var/lib/hb is backed up with it
 CACHE="${HB_CACHE:-/var/cache}/hb-restic"   # not under /var/lib/hb, so not backed up
 HOST="$(hostname -s)"
 KEEP=(--keep-daily "$(cfg backup.keep_daily)" --keep-weekly "$(cfg backup.keep_weekly)"
@@ -62,32 +61,9 @@ need_init() { [ -f "$REPO/config" ] || die "no repository at $REPO yet: hb backu
 take_lock() { exec 9>"$STATUS/lock"; flock -n 9 || die "another hb backup run or maintain is in progress"; }
 
 # --- state dump -------------------------------------------------------------------
-dump() {  # dump FILE COMMAND... — one piece of the state dump; a failure is noted, not fatal
-  local f="$DUMP/$1"; shift
-  "$@" > "$f" 2>&1 || log "state dump: '$*' failed (see $f)"
-}
-dump_state() {
-  rm -rf "$DUMP" && mkdir -p "$DUMP/k8s"
-  { date -Is; uname -a; cat /etc/os-release; } > "$DUMP/system.txt"
-  dump packages.txt dnf repoquery --userinstalled --queryformat '%{name}\n'
-  dump repos.txt dnf repolist --enabled
-  dump units-enabled.txt systemctl list-unit-files --state=enabled --no-legend
-  dump disks.txt sh -c 'lsblk -f; echo; cat /proc/mdstat; echo; btrfs filesystem show 2>/dev/null; echo; cat /etc/fstab'
-  dump network.txt sh -c 'ip -br address; echo; ip route; echo; ip -6 route'
-  command -v firewall-cmd >/dev/null && dump firewalld.txt firewall-cmd --list-all-zones
-  command -v docker >/dev/null && dump docker.txt docker ps -a --format '{{.Names}}\t{{.Image}}\t{{.Status}}'
-  command -v snap >/dev/null && dump snaps.txt snap list
-  if [ -x /snap/bin/microk8s ]; then
-    dump k8s/status.yaml /snap/bin/microk8s status --format yaml
-    local t
-    for t in namespaces deployments statefulsets daemonsets services configmaps secrets \
-             persistentvolumeclaims persistentvolumes ingresses cronjobs serviceaccounts \
-             certificates.cert-manager.io issuers.cert-manager.io clusterissuers.cert-manager.io; do
-      dump "k8s/$t.yaml" /snap/bin/microk8s kubectl get "$t" -A -o yaml
-    done
-  fi
-  chmod -R go= "$DUMP"
-}
+# hb inventory writes it into /var/lib/hb/state, which is backed up with the rest.
+# A piece it can't read is noted there (and in its check), never fatal here.
+dump_state() { "$HB_ROOT/hb" inventory run >/dev/null || log "state dump incomplete (hb inventory show)"; }
 
 # --- snapshot -----------------------------------------------------------------------
 take_snapshot() {

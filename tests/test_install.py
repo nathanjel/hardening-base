@@ -69,6 +69,13 @@ class UnitsTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(out, "will install: hb-status.timer; will remove: hb-old.timer")
 
+    def test_timers_are_read_when_checked_not_at_start(self):
+        # apply copies the checkout's hb.toml in its config item; the timers item must see the new list
+        script = f'source "$1"; printf \'[install]\\ntimers = ["hb-new"]\\n\' > "{self.cfg}"; load_timers; echo "${{TIMERS[*]}}"'
+        p = subprocess.run(["bash", "-c", script, "_", harness()], env=dict(os.environ, HB_CONFIG=self.cfg),
+                           capture_output=True, text=True)
+        self.assertEqual(p.stdout.strip(), "hb-new", p.stderr)
+
     def test_every_unit_in_the_repo_is_marked(self):
         files = glob.glob(os.path.join(REPO, "units", "hb-*"))
         self.assertTrue(files)

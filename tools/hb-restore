@@ -1,0 +1,314 @@
+#!/usr/bin/python3 -IB
+"""hb-restore — get files back from the backup, and prove regularly that it works.
+
+  hb restore list                         the backup's snapshots, newest last
+  hb restore ls [SNAP] PATH               what a snapshot holds under PATH (default: the newest)
+  hb restore get PATH... [--from SNAP] [--to DIR]
+                                          restore PATHs into DIR, by default a new folder in
+                                          /var/tmp/hb-restore; over the live files only with
+                                          --to / and after you confirm
+  hb restore drill                        restore a random sample of the newest snapshot and
+                                          compare it with the live files (hb-restore.timer,
+                                          quarterly)
+  hb restore status                       the last drill
+  hb restore check                        one-line verdict (exit 0 ok, 1 attention, 2 broken)
+
+  --host NAME                             another host's snapshots (default: this one), e.g.
+                                          after a rebuild under a new name
+
+The drill picks restore.sample_files random files (each at most restore.max_file_mb)
+plus a few from each restore.must_have path, and restores them with restic's
+--verify into a temporary folder. A file unchanged since the backup (same size and
+modification time to the nanosecond) must match the live one byte for byte;
+files changed since are counted, not compared. A mismatch, a failed restore or a
+must_have path missing from the snapshot fails the check, which sends an SMS.
+
+Snapshots are the ones hb backup makes (this host, tag hb). The repository, the
+password and the mount check come from [backup], through hb backup restic.
+
+Config ([restore] in hb.toml): sample_files, max_file_mb, must_have, drill_days.
+"""
+import datetime
+import hashlib
+import json
+import os
+import random
+import re
+import shutil
+import sys
+import tempfile
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+from hbkit import config, restic, util  # noqa: E402
+
+DRILL_DIR = "/var/tmp"
+GET_DIR = "/var/tmp/hb-restore"
+GRACE_DAYS = 7
+MUST_HAVE_FILES = 3                         # files restored from each must_have folder
+MAX_TOTAL = 5 * 10**9                       # the sample's biggest files go until it fits
+GLOB = re.compile(r"[*?\[\\\n]")            # restic reads --include as patterns: skip such paths
+
+
+def mtime_ns(text):
+    """restic's RFC 3339 time, nanoseconds included, as integer nanoseconds since the epoch."""
+    m = re.fullmatch(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,9}))?(Z|[+-]\d\d:\d\d)", text)
+    if not m:
+        raise ValueError(f"unexpected time {text!r}")
+    tz = "+00:00" if m.group(3) == "Z" else m.group(3)
+    secs = int(datetime.datetime.fromisoformat(m.group(1) + tz).timestamp())
+    return secs * 10**9 + int((m.group(2) or "0").ljust(9, "0"))
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# --- the drill -------------------------------------------------------------------------------
+
+def under(path, parent):
+    return path == parent or path.startswith(parent.rstrip("/") + "/")
+
+
+def pick(snap_id, rcfg, rng):
+    """Walk the snapshot once: a uniform sample of its files, plus files from each must_have.
+    Returns (picked nodes by path, number of files, must_have paths not in the snapshot)."""
+    limit, cap = rcfg["sample_files"], rcfg["max_file_mb"] * 10**6
+    must = {p.rstrip("/") or "/": [] for p in rcfg["must_have"]}
+    found, sample, seen = set(), [], 0
+    for line in restic.lines("ls", "--json", snap_id):
+        node = json.loads(line)
+        if node.get("struct_type") != "node":
+            continue
+        path = node["path"]
+        for m, files in must.items():
+            if under(path, m):
+                found.add(m)
+                if node["type"] == "file" and len(files) < MUST_HAVE_FILES and not GLOB.search(path):
+                    files.append(node)
+        if node["type"] != "file" or not 0 < node.get("size", 0) <= cap or GLOB.search(path):
+            continue
+        seen += 1
+        if len(sample) < limit:
+            sample.append(node)
+        else:
+            j = rng.randrange(seen)
+            if j < limit:
+                sample[j] = node
+    sample.sort(key=lambda n: n["size"])
+    while sample and sum(n["size"] for n in sample) > MAX_TOTAL:
+        sample.pop()
+    picked = {n["path"]: n for n in sample}
+    for files in must.values():
+        picked.update((n["path"], n) for n in files)
+    return picked, seen, sorted(m for m in must if m not in found)
+
+
+def compare(picked, root):
+    """Each picked file against the live one: matched, changed (since the backup), mismatched,
+    not restored."""
+    res = {"matched": 0, "changed": 0, "mismatched": [], "not_restored": []}
+    for path, node in sorted(picked.items()):
+        restored = root + path
+        if not os.path.isfile(restored):
+            res["not_restored"].append(path)
+            continue
+        try:
+            st = os.lstat(path)
+        except OSError:
+            res["changed"] += 1                  # gone since the backup
+            continue
+        if (not os.path.isfile(path) or os.path.islink(path) or st.st_size != node["size"]
+                or st.st_mtime_ns != mtime_ns(node["mtime"])):
+            res["changed"] += 1
+            continue
+        if sha256(restored) == sha256(path):
+            res["matched"] += 1
+        else:
+            res["mismatched"].append(path)
+    return res
+
+
+def drill(cfg, host=None, rng=None):
+    """One drill; the result is saved and returned."""
+    rcfg, start = cfg["restore"], time.time()
+    result = {"ts": int(start), "ok": False, "errors": []}
+    tmp = None
+    try:
+        snap = restic.snapshot("latest", host)
+        result.update(snapshot=snap["short_id"], snapshot_time=snap["time"])
+        picked, seen, missing = pick(snap["id"], rcfg, rng or random.Random())
+        result.update(files_in_snapshot=seen, sampled=len(picked), missing=missing)
+        tmp = tempfile.mkdtemp(prefix="hb-drill-", dir=DRILL_DIR)
+        inc = os.path.join(tmp, "include")
+        with open(inc, "w") as f:
+            f.write("".join(p + "\n" for p in picked))
+        target = os.path.join(tmp, "r")
+        rc, out, err = restic.run("restore", snap["id"], "--target", target, "--include-file", inc, "--verify")
+        if rc:
+            result["errors"].append(f"restic restore exit {rc}: {(err or out).strip()[-300:]}")
+        result.update(compare(picked, target))
+    except (RuntimeError, ValueError, OSError) as e:
+        result["errors"].append(str(e))
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+    result["seconds"] = int(time.time() - start)
+    result["compared"] = result.get("matched", 0) + len(result.get("mismatched", []))
+    result["ok"] = not (result["errors"] or result.get("missing") or result.get("mismatched")
+                        or result.get("not_restored"))
+    util.write_json(os.path.join(util.state_dir("restore"), "drill.json"), result)
+    return result
+
+
+def problems(r, paths=True):
+    """What went wrong. Without paths for the banner and SMS: file names under /srv or /home
+    can say more than they should, so those only get counts."""
+    out = list(r.get("errors", [])) if paths else [f"{len(r['errors'])} errors"] if r.get("errors") else []
+    if r.get("missing"):
+        out.append(f"not in the snapshot: {', '.join(r['missing'])}")   # config paths, never file names
+    if r.get("mismatched"):
+        out.append(f"{len(r['mismatched'])} restored files differ from the live ones"
+                   + (f": {', '.join(r['mismatched'][:5])}" if paths else ""))
+    if r.get("not_restored"):
+        out.append(f"{len(r['not_restored'])} files didn't come back"
+                   + (f": {', '.join(r['not_restored'][:5])}" if paths else ""))
+    return out
+
+
+def summary(r):
+    return (f"{r.get('matched', 0)} of {r.get('compared', 0)} files compared matched, "
+            f"{r.get('changed', 0)} changed since the backup (snapshot {r.get('snapshot', '?')}, "
+            f"{r.get('sampled', 0)} picked of {r.get('files_in_snapshot', 0)})")
+
+
+def do_drill(cfg, host):
+    with util.Lock(os.path.join(util.state_dir("restore"), "lock")):
+        r = drill(cfg, host)
+    if r["ok"]:
+        print(f"restore drill ok: {summary(r)}, {r['seconds']} s")
+        util.notify("info", "restore.drill", f"restore drill ok: {summary(r)}")
+        return 0
+    print("restore drill FAILED:\n" + "".join(f"  {p}\n" for p in problems(r)) + f"  ({summary(r)})")
+    # warn here; the failing check sends the SMS (one message, not two)
+    util.notify("warn", "restore.drill", "restore drill failed: " + "; ".join(problems(r, paths=False))
+                + " (sudo hb restore status)")
+    return 1
+
+
+def verdict(cfg, now=None):
+    now = now or time.time()
+    r = util.read_json(os.path.join(util.STATE, "restore", "drill.json"), None)
+    if not r:
+        return 1, "warn: no restore drill yet (sudo hb restore drill)"
+    when = time.strftime("%d %b", time.localtime(r["ts"]))
+    if not r.get("ok"):
+        return 2, f"fail: restore drill on {when} failed: {'; '.join(problems(r, paths=False))} (hb restore status)"
+    days = (now - r["ts"]) / 86400
+    if days > cfg["restore"]["drill_days"] + GRACE_DAYS:
+        return 1, f"warn: last restore drill {days:.0f} days ago (sudo hb restore drill)"
+    return 0, f"ok: drill {when}: {r.get('matched', 0)} files matched, {r.get('changed', 0)} changed since the backup"
+
+
+def do_status(cfg):
+    r = util.read_json(os.path.join(util.STATE, "restore", "drill.json"), None)
+    if not r:
+        print("no drill yet: sudo hb restore drill")
+        return 0
+    print(f"last drill: {time.strftime('%Y-%m-%d %H:%M', time.localtime(r['ts']))}, "
+          f"{r.get('seconds', 0)} s, {'ok' if r.get('ok') else 'FAILED'}")
+    print(f"  {summary(r)}")
+    for p in problems(r):
+        print(f"  {p}")
+    print(verdict(cfg)[1])
+    return 0
+
+
+# --- getting files back ----------------------------------------------------------------------
+
+def do_get(paths, snap, to, host):
+    paths = [os.path.abspath(p) for p in paths]
+    if not paths:
+        print("usage: hb restore get PATH... [--from SNAP] [--to DIR]", file=sys.stderr)
+        return 2
+    in_place = to is not None and os.path.abspath(to) == "/"
+    if in_place:
+        print(f"This writes {', '.join(paths)} from snapshot {snap} over the live files"
+              " (files that differ are replaced; files the snapshot doesn't have stay).")
+        if not util.ask("restore over the live files?"):
+            print("nothing restored")
+            return 1
+    else:
+        to = to or os.path.join(GET_DIR, time.strftime("%Y%m%d-%H%M%S"))
+        os.makedirs(to, mode=0o700, exist_ok=True)
+    args = ["restore", snap, *(restic.host_args(host) if snap == "latest" else []), "--target", to]
+    args += ["--overwrite", "if-changed"] if in_place else []
+    for p in paths:
+        args += ["--include", p]
+    rc, out, err = restic.run(*args, timeout=24 * 3600)
+    print((out + err).strip())
+    if rc == 0 and not in_place:
+        print(f"\nrestored into {to}; the files sit at their full paths below it, e.g. {to}{paths[0]}")
+    return 0 if rc == 0 else 1
+
+
+def parse(argv):
+    """(positional args, options) for --from, --to, --host."""
+    pos, opts, i = [], {}, 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--from", "--to", "--host"):
+            if i + 1 >= len(argv):
+                raise SystemExit(f"hb-restore: {a} needs a value")
+            opts[a[2:]] = argv[i + 1]
+            i += 2
+            continue
+        pos.append(a)
+        i += 1
+    return pos, opts
+
+
+def main(argv):
+    verb = argv[1] if len(argv) > 1 else "status"
+    if verb in ("help", "-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if os.geteuid() != 0:
+        print("error: run with sudo", file=sys.stderr)
+        return 2
+    cfg = config.load()
+    pos, opts = parse(argv[2:])
+    host = opts.get("host")
+    if verb == "check":
+        rc, line = verdict(cfg)
+        print(line)
+        return rc
+    if verb == "status":
+        return do_status(cfg)
+    if verb == "drill":
+        return do_drill(cfg, host)
+    if verb == "list":
+        rc, out, err = restic.run("snapshots", *restic.host_args(host), timeout=600)
+        print((out + err).strip())
+        return rc and 1
+    if verb == "ls":
+        if not pos:
+            print("usage: hb restore ls [SNAP] PATH", file=sys.stderr)
+            return 2
+        snap, path = (pos[0], pos[1]) if len(pos) > 1 else ("latest", pos[0])
+        args = ["ls", "-l", snap, *(restic.host_args(host) if snap == "latest" else []), os.path.abspath(path)]
+        rc, out, err = restic.run(*args, timeout=600)
+        print((out + err).strip())
+        return rc and 1
+    if verb == "get":
+        return do_get(pos, opts.get("from", "latest"), opts.get("to"), host)
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

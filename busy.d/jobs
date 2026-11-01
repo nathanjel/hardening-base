@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Busy while one of hb's own long jobs runs: the backup, its weekly maintenance, the cleanup.
-for u in hb-backup hb-backup-maintain hb-clean; do
+# Busy while one of hb's own long jobs runs: the backup, its weekly maintenance, the cleanup,
+# the restore drill.
+for u in hb-backup hb-backup-maintain hb-clean hb-restore; do
   if systemctl is-active -q "$u.service" 2>/dev/null; then
     echo "$u is running"
     exit 1

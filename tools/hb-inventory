@@ -1,0 +1,246 @@
+#!/usr/bin/python3 -IB
+"""hb-inventory — what this box is made of, written down where the backup picks it up.
+
+  hb inventory run      write the state dump to /var/lib/hb/state (hb backup runs this
+                        before every backup, so each snapshot carries its own)
+  hb inventory show     what the dump holds
+  hb inventory check    one line: the dump's age, and pieces that couldn't be read
+
+The dump (root-only; the backup is encrypted):
+  system.txt          date, kernel, OS release
+  packages.txt        packages installed on purpose (dnf repoquery --userinstalled)
+  repos.txt           enabled repositories
+  units-enabled.txt   enabled systemd units
+  users.txt           people's accounts (uid 1000-59999): name, uid, gid, home, shell, groups
+  disks.txt           lsblk, RAID, btrfs, fstab
+  network.txt         addresses and routes
+  firewalld.txt       every zone
+  docker.txt          containers
+  snaps.txt           snaps, their channels and notes
+  k8s/addons.txt      microk8s add-ons, enabled and not
+  k8s/cluster.json    namespaces, volumes, cluster issuers, storage and ingress classes
+  k8s/objects.json    every object in every namespace (secrets included), except what
+                      the cluster makes and remakes by itself: pods, replica sets,
+                      events, endpoints, leases, ACME orders and the like
+  inventory.json      when, counts, and what failed
+
+hb rebuild reads it from a snapshot to set up a fresh box the same way.
+"""
+import json
+import os
+import shutil
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+from hbkit import util  # noqa: E402
+
+KUBECTL = ["/snap/bin/microk8s", "kubectl"]
+MICROK8S = "/snap/bin/microk8s"
+# made and remade by the cluster itself; nothing to rebuild from
+SKIP_TYPES = {"events", "events.events.k8s.io", "pods", "replicasets.apps", "controllerrevisions.apps",
+              "endpoints", "leases.coordination.k8s.io", "csistoragecapacities.storage.k8s.io",
+              "challenges.acme.cert-manager.io", "orders.acme.cert-manager.io",
+              "certificaterequests.cert-manager.io"}
+CLUSTER_TYPES = ["namespaces", "persistentvolumes", "clusterissuers.cert-manager.io",
+                 "storageclasses.storage.k8s.io", "ingressclasses.networking.k8s.io"]
+WARN_HOURS = 50
+
+
+def state_root():
+    return os.path.join(util.STATE, "state")
+
+
+def sh(*cmd, timeout=300):
+    rc, out, err = util.run(*cmd, timeout=timeout)
+    if rc:
+        raise RuntimeError(f"{' '.join(cmd[:3])}: exit {rc}: {(err or out).strip()[-200:]}")
+    return out
+
+
+def have(cmd):
+    return shutil.which(cmd) is not None or os.path.exists(cmd)
+
+
+# --- pieces: each returns the file's text, or raises ----------------------------------------
+
+def system_txt():
+    with open("/etc/os-release") as f:
+        osr = f.read()
+    return f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n{' '.join(os.uname())}\n{osr}"
+
+
+def packages_txt():
+    out = sh("dnf", "repoquery", "--userinstalled", "--queryformat", "%{name}\n", timeout=600)
+    return "".join(f"{n}\n" for n in sorted(set(out.split())))
+
+
+def users_txt(passwd="/etc/passwd", group="/etc/group"):
+    members = {}
+    with open(group) as f:
+        for line in f:
+            p = line.rstrip("\n").split(":")
+            if len(p) >= 4:
+                for u in filter(None, p[3].split(",")):
+                    members.setdefault(u, []).append(p[0])
+    lines = []
+    with open(passwd) as f:
+        for line in f:
+            p = line.rstrip("\n").split(":")
+            if len(p) >= 7 and 1000 <= int(p[2]) < 60000:
+                lines.append(f"{p[0]} {p[2]} {p[3]} {p[5]} {p[6]} {','.join(sorted(members.get(p[0], [])))}\n")
+    return "".join(lines)
+
+
+def disks_txt():
+    parts = [sh("lsblk", "-f")]
+    for path in ("/proc/mdstat", "/etc/fstab"):
+        try:
+            with open(path) as f:
+                parts.append(f.read())
+        except OSError:
+            pass
+    if have("btrfs"):
+        parts.append(util.run("btrfs", "filesystem", "show")[1])
+    return "\n".join(parts)
+
+
+def network_txt():
+    return "\n".join(sh("ip", *a) for a in (("-br", "address"), ("route",), ("-6", "route")))
+
+
+def kubectl_json(*args):
+    return json.loads(sh(*KUBECTL, "get", *args, "-o", "json", timeout=300))
+
+
+def k8s_types(namespaced):
+    out = sh(*KUBECTL, "api-resources", "--verbs=list,create", f"--namespaced={'true' if namespaced else 'false'}",
+             "-o", "name", timeout=120)
+    return out.split()
+
+
+def k8s_cluster_json():
+    there = set(k8s_types(False))
+    types = [t for t in CLUSTER_TYPES if t in there]
+    return json.dumps(kubectl_json(",".join(types)), indent=1) + "\n"
+
+
+def k8s_objects_json():
+    types = [t for t in k8s_types(True) if t not in SKIP_TYPES]
+    return json.dumps(kubectl_json(",".join(types), "-A"), indent=1) + "\n"
+
+
+def pieces():
+    """(file, function) for what this box has."""
+    p = [("system.txt", system_txt), ("users.txt", users_txt), ("disks.txt", disks_txt),
+         ("network.txt", network_txt),
+         ("units-enabled.txt", lambda: sh("systemctl", "list-unit-files", "--state=enabled", "--no-legend"))]
+    if have("dnf"):
+        p += [("packages.txt", packages_txt), ("repos.txt", lambda: sh("dnf", "repolist", "--enabled", timeout=300))]
+    if have("firewall-cmd"):
+        p.append(("firewalld.txt", lambda: sh("firewall-cmd", "--list-all-zones")))
+    if have("docker"):
+        p.append(("docker.txt", lambda: sh("docker", "ps", "-a", "--format", "{{.Names}}\t{{.Image}}\t{{.Status}}")))
+    if have("snap"):
+        p.append(("snaps.txt", lambda: sh("snap", "list")))
+    if os.path.exists(MICROK8S):
+        p += [("k8s/addons.txt", lambda: sh(MICROK8S, "status", "--format", "short", timeout=120)),
+              ("k8s/cluster.json", k8s_cluster_json), ("k8s/objects.json", k8s_objects_json)]
+    return p
+
+
+def counts(root):
+    c = {}
+    for name, path in (("packages", "packages.txt"), ("users", "users.txt"), ("units", "units-enabled.txt")):
+        try:
+            with open(os.path.join(root, path)) as f:
+                c[name] = sum(1 for line in f if line.strip())
+        except OSError:
+            pass
+    for name in ("cluster", "objects"):
+        try:
+            with open(os.path.join(root, "k8s", f"{name}.json")) as f:
+                c[f"k8s_{name}"] = len(json.load(f).get("items", []))
+        except (OSError, ValueError):
+            pass
+    return c
+
+
+def do_run():
+    """Write every piece into a fresh folder, then swap it in: the dump is always whole."""
+    root = state_root()
+    new, old = root + ".new", root + ".old"
+    for d in (new, old):
+        shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(os.path.join(new, "k8s"), mode=0o700)
+    os.chmod(new, 0o700)
+    errors = []
+    for name, fn in pieces():
+        try:
+            text = fn()
+        except Exception as e:  # one piece failing must not lose the others
+            errors.append(f"{name}: {e}")
+            continue
+        util.write_atomic(os.path.join(new, name), text)
+    meta = {"ts": int(time.time()), "errors": errors, "counts": counts(new)}
+    util.write_json(os.path.join(new, "inventory.json"), meta)
+    if os.path.exists(root):
+        os.rename(root, old)
+    os.rename(new, root)
+    shutil.rmtree(old, ignore_errors=True)
+    for e in errors:
+        print(f"state dump: {e}", file=sys.stderr)
+    print(f"state dump in {root}: " + ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in meta["counts"].items()))
+    return 1 if errors else 0
+
+
+def verdict(now=None):
+    meta = util.read_json(os.path.join(state_root(), "inventory.json"), None)
+    if not meta:
+        return 0, "ok: no state dump yet (hb backup writes one before each backup)"
+    hours = ((now or time.time()) - meta["ts"]) / 3600
+    if meta.get("errors"):
+        return 1, f"warn: state dump {int(hours)} h ago couldn't read {', '.join(e.split(':')[0] for e in meta['errors'])}"
+    if hours > WARN_HOURS:
+        return 1, f"warn: state dump is {int(hours)} h old (it comes with each backup)"
+    c = meta.get("counts", {})
+    return 0, (f"ok: state dump {int(hours)} h ago: {c.get('packages', 0)} packages, "
+               f"{c.get('k8s_objects', 0)} k8s objects")
+
+
+def do_show():
+    root = state_root()
+    meta = util.read_json(os.path.join(root, "inventory.json"), None)
+    if not meta:
+        print("no state dump yet: sudo hb inventory run")
+        return 0
+    print(f"state dump {time.strftime('%Y-%m-%d %H:%M', time.localtime(meta['ts']))} in {root}")
+    for k, v in meta.get("counts", {}).items():
+        print(f"  {v:>6}  {k.replace('_', ' ')}")
+    for e in meta.get("errors", []):
+        print(f"  couldn't read {e}")
+    return 0
+
+
+def main(argv):
+    verb = argv[1] if len(argv) > 1 else "show"
+    if verb in ("help", "-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if os.geteuid() != 0:
+        print("error: run with sudo", file=sys.stderr)
+        return 2
+    if verb == "run":
+        return do_run()
+    if verb == "show":
+        return do_show()
+    if verb == "check":
+        rc, line = verdict()
+        print(line)
+        return rc
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

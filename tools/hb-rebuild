@@ -1,0 +1,708 @@
+#!/usr/bin/python3 -IB
+"""hb-rebuild — set up a fresh box like the one in the backup.
+
+  hb rebuild status [ITEM...]           one line per item
+  hb rebuild plan [ITEM...]             what apply would add
+  hb rebuild apply [--yes] [ITEM...]    add it, asking before each item
+  hb rebuild check                      one line for hb check (there's nothing to watch on a
+                                        running box)
+
+  --host NAME      the snapshot's host, when this box has a new name
+  --snapshot ID    an older snapshot instead of the newest
+
+status, plan and apply first restore /etc, /usr/local and the state dump (hb
+inventory) of the snapshot into /var/lib/hb/rebuild/stage: seconds, and again
+only when there's a newer snapshot. Every item only adds what the box lacks;
+nothing is replaced or removed. So on the running box the plan should say
+there's nothing to do, which also shows the backup holds what a rebuild needs.
+
+Items, in this order:
+  files     rebuild.files from the staged /etc and /usr/local, where the box has
+            none (third-party repositories and their signing keys, ...)
+  packages  the packages that were installed on purpose (unavailable ones are listed)
+  snaps     the snaps on their channels, classic where they were
+  users     people's accounts: uid, gid, groups and password hash
+  data      rebuild.data from the snapshot: every top-level folder the box lacks
+            (restic restore, never over an existing file; this one takes hours)
+  addons    the microk8s add-ons that were enabled
+  k8s       the objects you made: everything in your namespaces (all but
+            rebuild.skip_namespaces), the volumes they claim, cluster issuers and
+            their ACME account keys. What the cluster makes itself (owned objects,
+            default service accounts, tokens) is left to it, and Jobs aren't
+            restarted
+  units     systemd units that were enabled, enabled again (not started: the
+            runbook reboots at the end). hb's own are hb install's
+
+docs/RUNBOOK-rebuild.md has the way from a blank box to a working one.
+Config ([rebuild] in hb.toml): files, data, skip_namespaces.
+"""
+import glob
+import json
+import os
+import pwd
+import grp
+import re
+import shutil
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+from hbkit import config, restic, util  # noqa: E402
+
+MICROK8S = "/snap/bin/microk8s"
+SNAP_LINK = "/snap"                         # classic snaps need it; Fedora doesn't make it
+KUBECTL = [MICROK8S, "kubectl"]
+STAGED = ["/etc", "/usr/local", "/var/lib/hb/state"]
+DUMP = "/var/lib/hb/state"                 # where hb inventory writes, on the box that was backed up
+HUMAN = range(1000, 60000)
+FIRST_ADDONS = ["dns", "hostpath-storage"]
+# created in this order; kinds not listed come after them
+KIND_ORDER = ["Namespace", "PersistentVolume", "ServiceAccount", "Secret", "ConfigMap", "PersistentVolumeClaim",
+              "Role", "RoleBinding", "Service", "EndpointSlice", "Deployment", "StatefulSet", "DaemonSet",
+              "CronJob", "Ingress"]
+LAST_KINDS = ["ClusterIssuer", "Issuer", "Certificate"]
+# EndpointSlices these make are remade from their Services; any other managed-by value is someone's own
+CONTROLLERS = ("endpointslice-controller.k8s.io", "endpointslicemirroring-controller.k8s.io")
+UNIT_SKIP = re.compile(r"^hb-|@|^(smb|nmb)\.service$")   # hb's own, templates, hb share's
+
+
+class Ctx:
+    """What the items work from: the config, the staged snapshot, the snapshot itself."""
+
+    def __init__(self, cfg, stage, snap):
+        self.cfg, self.stage, self.snap = cfg, stage, snap
+
+    def path(self, live_path):
+        return self.stage + live_path
+
+    def dump(self, name):
+        return self.stage + DUMP + "/" + name
+
+    def read(self, name, default=""):
+        try:
+            with open(self.dump(name)) as f:
+                return f.read()
+        except OSError:
+            return default
+
+
+def stage_dir():
+    return os.path.join(util.state_dir("rebuild"), "stage")
+
+
+def prepare(cfg, spec="latest", host=None):
+    """Stage /etc, /usr/local and the state dump of the snapshot (once per snapshot)."""
+    snap = restic.snapshot(spec, host)
+    stage = stage_dir()
+    mark = os.path.join(stage, ".hb-snapshot")
+    if util.read_json(mark, {}).get("id") != snap["id"]:
+        shutil.rmtree(stage, ignore_errors=True)
+        os.makedirs(stage, mode=0o700)
+        args = ["restore", snap["id"], "--target", stage]
+        for p in STAGED:
+            args += ["--include", p]
+        rc, out, err = restic.run(*args, timeout=3600)
+        if rc:
+            raise RuntimeError(f"restic restore into {stage} failed: {(err or out).strip()[-300:]}")
+        util.write_json(mark, {"id": snap["id"], "time": snap["time"], "hostname": snap.get("hostname", "")})
+    print(f"from snapshot {snap['short_id']} of {snap.get('hostname', '?')}, {snap['time'][:16].replace('T', ' ')}"
+          f" (staged in {stage})")
+    return Ctx(cfg, stage, snap)
+
+
+def few(names, n=6):
+    names = list(names)
+    return ", ".join(names[:n]) + (f" and {len(names) - n} more" if len(names) > n else "")
+
+
+# --- files --------------------------------------------------------------------------------
+
+def missing_files(ctx):
+    out = []
+    for pat in ctx.cfg["rebuild"]["files"]:
+        for staged in sorted(glob.glob(ctx.path(pat))):
+            live = staged[len(ctx.stage):]
+            if not os.path.isdir(staged) and not os.path.lexists(live):
+                out.append((staged, live))
+    return out
+
+
+def chk_files(ctx):
+    miss = missing_files(ctx)
+    if miss:
+        return 1, f"will copy {len(miss)} files the box lacks: {few(live for _, live in miss)}"
+    return 0, "nothing in rebuild.files is missing"
+
+
+def fix_files(ctx):
+    for staged, live in missing_files(ctx):
+        os.makedirs(os.path.dirname(live), mode=0o755, exist_ok=True)
+        shutil.copy2(staged, live, follow_symlinks=False)
+        st = os.lstat(staged)
+        os.lchown(live, st.st_uid, st.st_gid)
+    return None
+
+
+# --- packages -----------------------------------------------------------------------------
+
+def missing_packages(ctx):
+    want = ctx.read("packages.txt").split()
+    if not want:
+        return want, []
+    rc, out, err = util.run("rpm", "-q", *want, timeout=300)
+    return want, re.findall(r"^package (\S+) is not installed$", out + err, re.M)
+
+
+def chk_packages(ctx):
+    want, miss = missing_packages(ctx)
+    if not want:
+        return 2, "no packages.txt in the state dump"
+    if miss:
+        return 1, f"will install {len(miss)} of {len(want)} packages: {few(miss)}"
+    return 0, f"all {len(want)} packages installed"
+
+
+def fix_packages(ctx):
+    _, miss = missing_packages(ctx)
+    rc, out, err = util.run("dnf", "install", "-y", "--skip-unavailable", *miss, timeout=3 * 3600)
+    return (err or out).strip()[-300:] if rc else None
+
+
+# --- snaps --------------------------------------------------------------------------------
+
+def staged_snaps(ctx):
+    """[(name, channel, classic)] that need installing by name: not bases, not snapd itself."""
+    out = []
+    for line in ctx.read("snaps.txt").splitlines()[1:]:
+        f = line.split()
+        if len(f) < 6:
+            continue
+        notes = f[5].split(",")
+        if f[0] == "snapd" or "base" in notes or "snapd" in notes or f[3] == "-":
+            continue
+        out.append((f[0], f[3], "classic" in notes))
+    return out
+
+
+def live_snaps():
+    rc, out, _ = util.run("snap", "list")
+    return None if rc else {line.split()[0] for line in out.splitlines()[1:] if line.split()}
+
+
+def chk_snaps(ctx):
+    want = staged_snaps(ctx)
+    if not want:
+        return 0, "no snaps in the state dump"
+    have = live_snaps()
+    if have is None:
+        return 1, "snapd isn't running yet (the packages item installs it)"
+    miss = [w for w in want if w[0] not in have]
+    if miss:
+        return 1, "will install " + ", ".join(f"{n} ({c}{', classic' if cl else ''})" for n, c, cl in miss)
+    return 0, f"{', '.join(n for n, _, _ in want)} installed"
+
+
+def fix_snaps(ctx):
+    util.run("systemctl", "enable", "--now", "snapd.socket", timeout=120)
+    if not os.path.lexists(SNAP_LINK):
+        os.symlink("/var/lib/snapd/snap", SNAP_LINK)
+    util.run("snap", "wait", "system", "seed.loaded", timeout=900)
+    have, errors = live_snaps() or set(), []
+    for name, channel, classic in staged_snaps(ctx):
+        if name in have:
+            continue
+        rc, out, err = util.run("snap", "install", name, "--channel", channel, *(["--classic"] if classic else []),
+                                timeout=1800)
+        if rc:
+            errors.append(f"{name}: {(err or out).strip()[-200:]}")
+    return "; ".join(errors) or None
+
+
+# --- users --------------------------------------------------------------------------------
+
+def read_db(path, fields):
+    out = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                p = line.rstrip("\n").split(":")
+                if len(p) >= fields:
+                    out[p[0]] = p
+    except OSError:
+        pass
+    return out
+
+
+def staged_accounts(ctx):
+    users = {n: p for n, p in read_db(ctx.path("/etc/passwd"), 7).items() if p[2].isdigit() and int(p[2]) in HUMAN}
+    groups = read_db(ctx.path("/etc/group"), 4)
+    shadow = read_db(ctx.path("/etc/shadow"), 2)
+    return users, groups, shadow
+
+
+def live_user(name):
+    try:
+        return pwd.getpwnam(name)
+    except KeyError:
+        return None
+
+
+def live_group(name):
+    try:
+        return grp.getgrnam(name)
+    except KeyError:
+        return None
+
+
+def uid_owner(uid):
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return None
+
+
+def user_groups(name, groups):
+    return sorted(g for g, p in groups.items() if name in p[3].split(","))
+
+
+def plan_users(ctx):
+    """(accounts to make, {user: groups to join}, problems)."""
+    users, groups, _ = staged_accounts(ctx)
+    make, join, problems = [], {}, []
+    for name, p in sorted(users.items()):
+        uid = int(p[2])
+        if live_user(name) is None:
+            owner = uid_owner(uid)
+            if owner:
+                problems.append(f"uid {uid} of {name} belongs to {owner} here")
+                continue
+            make.append(name)
+            want = user_groups(name, groups)
+        else:
+            have = {g.gr_name for g in grp.getgrall() if name in g.gr_mem}
+            want = [g for g in user_groups(name, groups) if g not in have]
+        if want:
+            join[name] = want
+    return make, join, problems
+
+
+def chk_users(ctx):
+    users, _, _ = staged_accounts(ctx)
+    if not users:
+        return 2, "no people's accounts in the staged /etc/passwd"
+    make, join, problems = plan_users(ctx)
+    if problems:
+        return 2, "; ".join(problems)
+    parts = ([f"will make {', '.join(make)}"] if make else []) + [
+        f"add {u} to {', '.join(g)}" for u, g in join.items() if u not in make]
+    if make:
+        parts[0] += " (with their uid, groups and password)"
+    if parts:
+        return 1, "; ".join(parts)
+    return 0, f"{', '.join(sorted(users))} in place"
+
+
+def fix_users(ctx):
+    users, groups, shadow = staged_accounts(ctx)
+    make, join, problems = plan_users(ctx)
+    errors = list(problems)
+    for name in make:
+        p = users[name]
+        gname = next((g for g, q in groups.items() if q[2] == p[3]), name)
+        if live_group(gname) is None:
+            rc, _, err = util.run("groupadd", "-g", p[3], gname)
+            if rc:
+                errors.append(f"groupadd {gname}: {err.strip()}")
+                continue
+        rc, _, err = util.run("useradd", "-u", p[2], "-g", gname, "-M", "-d", p[5], "-s", p[6], "-c", p[4], name)
+        if rc:
+            errors.append(f"useradd {name}: {err.strip()}")
+            continue
+        h = shadow.get(name, [name, ""])[1]
+        if h and h[0] not in "!*":
+            rc, _, err = util.run("chpasswd", "-e", input=f"{name}:{h}\n")   # the hash on stdin, never in argv
+            if rc:
+                errors.append(f"password of {name}: {err.strip()}")
+    for name, want in join.items():
+        ok = []
+        for g in want:
+            if live_group(g) is None:
+                gid = groups[g][2]
+                if int(gid) not in HUMAN:
+                    errors.append(f"group {g} doesn't exist here yet (a package or snap makes it)")
+                    continue
+                if util.run("groupadd", "-g", gid, g)[0]:
+                    errors.append(f"groupadd {g} failed")
+                    continue
+            ok.append(g)
+        if ok and live_user(name):
+            rc, _, err = util.run("usermod", "-aG", ",".join(ok), name)
+            if rc:
+                errors.append(f"usermod {name}: {err.strip()}")
+    return "; ".join(errors) or None
+
+
+# --- data ---------------------------------------------------------------------------------
+
+def data_paths(cfg):
+    if cfg["rebuild"]["data"]:
+        return cfg["rebuild"]["data"]
+    skip = ["/etc", "/usr/local", util.STATE]
+    return [p for p in cfg["backup"]["paths"] if not any(p == s or p.startswith(s + "/") for s in skip)]
+
+
+def missing_data(ctx):
+    """([snapshot paths the box lacks], [data paths not in the snapshot])."""
+    miss, absent = [], []
+    for top in data_paths(ctx.cfg):
+        top = top.rstrip("/")
+        nodes = []
+        try:
+            for line in restic.lines("ls", "--json", ctx.snap["id"], top):
+                n = json.loads(line)
+                if n.get("struct_type") == "node":
+                    nodes.append(n["path"])
+        except RuntimeError:
+            nodes = []
+        if top not in nodes:
+            absent.append(top)
+            continue
+        if not os.path.isdir(top):
+            miss.append(top)
+            continue
+        have = set(os.listdir(top))
+        miss += [p for p in nodes if os.path.dirname(p) == top and os.path.basename(p) not in have]
+    return miss, absent
+
+
+def chk_data(ctx):
+    miss, absent = missing_data(ctx)
+    note = f" (not in the snapshot: {few(absent)})" if absent else ""
+    if miss:
+        return 1, f"will restore {few(miss)}{note}"
+    return 0, f"{len(data_paths(ctx.cfg)) - len(absent)} data folders in place{note}"
+
+
+def fix_data(ctx):
+    miss, _ = missing_data(ctx)
+    args = ["restore", ctx.snap["id"], "--target", "/", "--overwrite", "never"]
+    for p in miss:
+        args += ["--include", p]
+    print(f"  restoring {len(miss)} paths; restic shows its progress")
+    rc = restic.stream(*args)
+    return f"restic restore exit {rc}" if rc else None
+
+
+# --- addons -------------------------------------------------------------------------------
+
+def parse_addons(text):
+    return [m.group(1) for m in re.finditer(r"^\s*(?:[\w-]+/)?([\w-]+): enabled\s*$", text, re.M)]
+
+
+def missing_addons(ctx):
+    want = parse_addons(ctx.read("k8s/addons.txt"))
+    if not want:
+        return want, None
+    rc, out, _ = util.run(MICROK8S, "status", "--format", "short", timeout=120)
+    if rc:
+        return want, None
+    have = set(parse_addons(out))
+    order = [a for a in FIRST_ADDONS if a in want] + [a for a in want if a not in FIRST_ADDONS]
+    return want, [a for a in order if a not in have]
+
+
+def chk_addons(ctx):
+    want, miss = missing_addons(ctx)
+    if not want:
+        return 0, "no microk8s in the state dump"
+    if miss is None:
+        return 1, "microk8s isn't running yet (the snaps item installs it)"
+    if miss:
+        return 1, f"will enable {', '.join(miss)}"
+    return 0, f"{len(want)} add-ons enabled"
+
+
+def fix_addons(ctx):
+    _, miss = missing_addons(ctx)
+    errors = []
+    for a in miss or []:
+        rc, out, err = util.run(MICROK8S, "enable", a, timeout=900)
+        if rc:
+            errors.append(f"{a}: {(err or out).strip()[-200:]}")
+    util.run(MICROK8S, "status", "--wait-ready", "--timeout", "600", timeout=660)
+    return "; ".join(errors) or None
+
+
+# --- k8s ----------------------------------------------------------------------------------
+
+DROP_META = ("uid", "resourceVersion", "creationTimestamp", "generation", "managedFields", "selfLink",
+             "deletionTimestamp", "deletionGracePeriodSeconds")
+DROP_ANNOTATIONS = ("deployment.kubernetes.io/revision", "pv.kubernetes.io/bind-completed",
+                    "pv.kubernetes.io/bound-by-controller")
+
+
+def clean(o):
+    """The object as you'd write it: no server-side fields, no status, no addresses the cluster assigns."""
+    o = json.loads(json.dumps(o))
+    meta = o.get("metadata", {})
+    for k in DROP_META:
+        meta.pop(k, None)
+    ann = meta.get("annotations") or {}
+    for k in DROP_ANNOTATIONS:
+        ann.pop(k, None)
+    if "annotations" in meta and not ann:
+        meta.pop("annotations")
+    o.pop("status", None)
+    spec = o.get("spec") or {}
+    if o.get("kind") == "Service":
+        if spec.get("clusterIP") != "None":
+            spec.pop("clusterIP", None)
+            spec.pop("clusterIPs", None)
+        spec.pop("healthCheckNodePort", None)
+    if o.get("kind") == "PersistentVolume" and spec.get("claimRef"):
+        ref = spec["claimRef"]
+        spec["claimRef"] = {k: ref[k] for k in ("apiVersion", "kind", "name", "namespace") if k in ref}
+    return o
+
+
+def skipped(o):
+    """Made by the cluster, or not to be repeated."""
+    meta, kind = o.get("metadata", {}), o.get("kind")
+    name, ns = meta.get("name"), meta.get("namespace")
+    return (bool(meta.get("ownerReferences"))
+            or kind == "Job"
+            or (kind == "ConfigMap" and name == "kube-root-ca.crt")
+            or (kind == "ServiceAccount" and name == "default")
+            or (kind == "Secret" and o.get("type") in ("kubernetes.io/service-account-token", "helm.sh/release.v1"))
+            or (kind == "EndpointSlice" and (meta.get("labels") or {}).get("endpointslice.kubernetes.io/managed-by")
+                in CONTROLLERS)
+            or (kind in ("Service", "EndpointSlice") and ns == "default" and name == "kubernetes"))
+
+
+def wanted_objects(ctx):
+    try:
+        cluster = json.loads(ctx.read("k8s/cluster.json", "{}") or "{}").get("items", [])
+        objects = json.loads(ctx.read("k8s/objects.json", "{}") or "{}").get("items", [])
+    except ValueError as e:
+        raise RuntimeError(f"state dump unreadable: {e}")
+    skip_ns = set(ctx.cfg["rebuild"]["skip_namespaces"])
+    mine = {o["metadata"]["name"] for o in cluster if o["kind"] == "Namespace"} - skip_ns
+    out, acme = [], set()
+    for o in cluster:
+        meta = o["metadata"]
+        if o["kind"] == "Namespace" and meta["name"] in mine and meta["name"] != "default":
+            out.append(o)
+        elif o["kind"] == "PersistentVolume" and ((o.get("spec") or {}).get("claimRef") or {}).get("namespace") in mine:
+            out.append(o)
+        elif o["kind"] == "ClusterIssuer":
+            out.append(o)
+            ref = ((o.get("spec") or {}).get("acme") or {}).get("privateKeySecretRef") or {}
+            if ref.get("name"):
+                acme.add(ref["name"])
+    for o in objects:
+        meta = o["metadata"]
+        ns = meta.get("namespace")
+        if o["kind"] == "Secret" and ns == "cert-manager" and meta["name"] in acme:
+            out.append(o)
+        elif ns in mine and not skipped(o):
+            out.append(o)
+    rank = {k: i for i, k in enumerate(KIND_ORDER)}
+    last = {k: i for i, k in enumerate(LAST_KINDS)}
+    out.sort(key=lambda o: (o["kind"] in last, last.get(o["kind"], rank.get(o["kind"], len(rank)))))
+    return [clean(o) for o in out]
+
+
+def type_name(o):
+    group = o.get("apiVersion", "v1").rpartition("/")[0]
+    return o["kind"].lower() + (f".{group}" if group else "")
+
+
+def key(o):
+    return (o["kind"], o["metadata"].get("namespace", ""), o["metadata"]["name"])
+
+
+def missing_objects(ctx):
+    """(objects to create, kinds the cluster doesn't know yet), or None without a cluster."""
+    want = wanted_objects(ctx)
+    if not want:
+        return [], []
+    if util.run(*KUBECTL, "version", timeout=60)[0]:
+        return None
+    have, unknown = set(), []
+    for t in sorted({type_name(o) for o in want}):
+        rc, out, err = util.run(*KUBECTL, "get", t, "-A", "-o", "json", timeout=120)
+        if rc:
+            unknown.append(t)
+            continue
+        have |= {key(i) for i in json.loads(out).get("items", [])}
+    return [o for o in want if key(o) not in have and type_name(o) not in unknown], unknown
+
+
+def chk_k8s(ctx):
+    found = missing_objects(ctx)
+    if found is None:
+        return 1, "no cluster yet (the snaps and addons items)"
+    miss, unknown = found
+    note = f"; the cluster doesn't know {', '.join(unknown)} yet (add-ons)" if unknown else ""
+    if miss:
+        kinds = {}
+        for o in miss:
+            kinds[o["kind"]] = kinds.get(o["kind"], 0) + 1
+        return 1, f"will create {len(miss)} objects: " + ", ".join(f"{n} {k}" for k, n in kinds.items()) + note
+    return (1 if unknown else 0), f"{len(wanted_objects(ctx))} objects in place" + note
+
+
+def fix_k8s(ctx):
+    found = missing_objects(ctx)
+    if not found:
+        return "no cluster"
+    miss, _ = found
+    errors = []
+    for tier in (["Namespace"], None):        # namespaces first, so the rest has somewhere to go
+        items = [o for o in miss if (o["kind"] in tier if tier else o["kind"] != "Namespace")]
+        if not items:
+            continue
+        doc = json.dumps({"apiVersion": "v1", "kind": "List", "items": items})
+        rc, out, err = util.run(*KUBECTL, "create", "-f", "-", input=doc, timeout=300)
+        if rc:
+            # kubectl names the objects it couldn't create; it never echoes their data
+            errors += [line for line in err.splitlines() if line.strip()][:10]
+    return "; ".join(errors) or None
+
+
+# --- units --------------------------------------------------------------------------------
+
+def missing_units(ctx):
+    want = [line.split()[0] for line in ctx.read("units-enabled.txt").splitlines()
+            if len(line.split()) >= 2 and line.split()[1] == "enabled" and not UNIT_SKIP.search(line.split()[0])]
+    rc, out, _ = util.run("systemctl", "list-unit-files", "--no-legend", timeout=60)
+    live = {f[0]: f[1] for f in (line.split() for line in out.splitlines()) if len(f) >= 2}
+    return want, [u for u in want if live.get(u) == "disabled"], [u for u in want if u not in live]
+
+
+def chk_units(ctx):
+    want, off, absent = missing_units(ctx)
+    note = f" (not on this box: {few(absent)})" if absent else ""
+    if off:
+        return 1, f"will enable {few(off)} (from the next boot){note}"
+    return 0, f"{len(want) - len(absent)} units enabled{note}"
+
+
+def fix_units(ctx):
+    _, off, _ = missing_units(ctx)
+    rc, _, err = util.run("systemctl", "enable", *off, timeout=300)
+    return err.strip()[-300:] if rc else None
+
+
+ITEMS = (("files", chk_files, fix_files), ("packages", chk_packages, fix_packages),
+         ("snaps", chk_snaps, fix_snaps), ("users", chk_users, fix_users), ("data", chk_data, fix_data),
+         ("addons", chk_addons, fix_addons), ("k8s", chk_k8s, fix_k8s), ("units", chk_units, fix_units))
+
+
+def checked(chk, ctx):
+    try:
+        return chk(ctx)
+    except (RuntimeError, OSError, ValueError) as e:
+        return 2, f"can't tell: {e}"
+
+
+def do_status(ctx, names):
+    worst = 0
+    for name, chk, _ in ITEMS:
+        if name in names:
+            rc, line = checked(chk, ctx)
+            worst = max(worst, rc)
+            print(f"{['ok', 'todo', 'FAIL'][rc]:<5} {name:<9} {line}")
+    return worst
+
+
+def do_plan(ctx, names, apply=False, yes=False):
+    worst, todo = 0, 0
+    for name, chk, fix in ITEMS:
+        if name not in names:
+            continue
+        rc, line = checked(chk, ctx)
+        if rc == 0:
+            continue
+        todo += 1
+        print(f"{name}: {line}")
+        if rc == 2 or not apply:
+            worst = max(worst, rc)
+            continue
+        if not yes and not util.ask(f"  apply {name}?"):
+            worst = max(worst, 1)
+            continue
+        try:
+            err = fix(ctx)
+        except (RuntimeError, OSError) as e:
+            err = str(e)
+        rc, line = checked(chk, ctx)
+        print(f"  now: {line}" if not err else f"  failed: {err}\n  now: {line}")
+        worst = max(worst, rc if not err else 2)
+    if not todo:
+        print("nothing to add")
+    util.write_json(os.path.join(util.state_dir("rebuild"), "last.json"),
+                    {"ts": int(time.time()), "snapshot": ctx.snap["short_id"], "verb": "apply" if apply else "plan",
+                     "todo": todo, "rc": worst})
+    return worst
+
+
+def verdict():
+    last = util.read_json(os.path.join(util.STATE, "rebuild", "last.json"), None)
+    if not last:
+        return 0, "ok: nothing to watch on a running box (sudo hb rebuild plan compares it with the backup)"
+    when = time.strftime("%d %b", time.localtime(last["ts"]))
+    return 0, f"ok: last {last['verb']} {when} against snapshot {last['snapshot']}: {last['todo']} items to add"
+
+
+def parse(argv):
+    names, opts, i = [], {}, 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--host", "--snapshot"):
+            if i + 1 >= len(argv):
+                raise SystemExit(f"hb-rebuild: {a} needs a value")
+            opts[a[2:]] = argv[i + 1]
+            i += 2
+            continue
+        if a != "--yes":
+            names.append(a)
+        i += 1
+    return names, opts
+
+
+def main(argv):
+    verb = argv[1] if len(argv) > 1 else "status"
+    if verb in ("help", "-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if os.geteuid() != 0:
+        print("error: run with sudo", file=sys.stderr)
+        return 2
+    if verb == "check":
+        rc, line = verdict()
+        print(line)
+        return rc
+    if verb not in ("status", "plan", "apply"):
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    names, opts = parse(argv[2:])
+    known = [n for n, _, _ in ITEMS]
+    bad = [n for n in names if n not in known]
+    if bad:
+        print(f"hb-rebuild: no item {' '.join(bad)} (items: {' '.join(known)})", file=sys.stderr)
+        return 2
+    cfg = config.load()
+    with util.Lock(os.path.join(util.state_dir("rebuild"), "lock")):
+        try:
+            ctx = prepare(cfg, opts.get("snapshot", "latest"), opts.get("host"))
+        except RuntimeError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        if verb == "status":
+            return do_status(ctx, names or known)
+        return do_plan(ctx, names or known, apply=verb == "apply", yes="--yes" in argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

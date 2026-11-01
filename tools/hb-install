@@ -30,7 +30,9 @@ ITEMS=(code link config units timers)
 PREFIX=/opt/hb
 ETC=/etc/hb
 UNITDIR=/etc/systemd/system
-mapfile -t TIMERS < <(cfg install.timers)
+# The timers come from /etc/hb/hb.toml as it is when they're checked: read after the config
+# item has copied the checkout's, not when this script starts.
+load_timers() { mapfile -t TIMERS < <(cfg install.timers); }
 
 # The checkout to install from: this one, unless we are the installed copy.
 if [ "$HB_ROOT" = "$PREFIX" ]; then
@@ -137,6 +139,7 @@ fix_units() {
 # --- timers ---------------------------------------------------------------------
 chk_timers() {
   local t want on=() off=() missing=()
+  load_timers
   for t in "${TIMERS[@]}"; do
     [ -f "$UNITDIR/$t.timer" ] || { missing+=("$t"); continue; }
     systemctl is-enabled -q "$t.timer" && systemctl is-active -q "$t.timer" || on+=("$t")
@@ -152,6 +155,7 @@ chk_timers() {
 }
 fix_timers() {
   local t want
+  load_timers
   for t in "${TIMERS[@]}"; do systemctl enable --now -q "$t.timer" || return 1; done
   for t in $(systemctl list-unit-files 'hb-*.timer' --state=enabled --no-legend | awk '{print $1}'); do
     want=0

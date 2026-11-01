@@ -63,6 +63,21 @@ warn_hours = 26               # warn when the last good backup is older
 fail_hours = 50               # fail (SMS) when it is older: two nights missed
 read_data_percent = 10        # share of the data read back in the first week of each month
 
+[restore]
+# hb restore drill (quarterly, hb-restore.timer): random files from the newest snapshot,
+# restored and compared byte for byte with the live ones that haven't changed since.
+sample_files = 200
+max_file_mb = 200             # bigger files aren't picked
+must_have = ["/etc/hb/hb.toml", "/var/lib/hb/state"]   # the drill fails if a snapshot lacks one
+drill_days = 92               # the check warns a week after this
+
+[rebuild]
+# hb rebuild sets up a fresh box from the newest snapshot; it only ever adds what's missing.
+files = ["/etc/yum.repos.d/*.repo", "/etc/pki/rpm-gpg/*", "/etc/docker/daemon.json", "/usr/local/bin/*", "/usr/local/sbin/*"]
+data = []                     # empty: backup.paths without /etc, /usr/local and hb's own state
+skip_namespaces = ["kube-system", "kube-public", "kube-node-lease", "ingress", "cert-manager",
+                   "container-registry", "metallb-system", "observability"]   # microk8s' own
+
 [clean]
 dry_run = true                # report only; set false once the reports look right
 users = []                    # whose ~/.cache to clean
