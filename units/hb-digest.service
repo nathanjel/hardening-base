@@ -1,0 +1,9 @@
+# Managed by hb install from units/; changes made here are overwritten.
+[Unit]
+Description=hb: morning digest (what happened overnight, what needs you)
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+ExecStart=/opt/hb/hb digest run
+TimeoutStartSec=5min

@@ -1,0 +1,377 @@
+#!/usr/bin/python3 -IB
+"""hb-upgrade — upgrades every night, and a reboot only when one is needed and nobody is working.
+
+  hb upgrade status           the items, last night, a pending reboot
+  hb upgrade plan             what apply would change (changes nothing)
+  hb upgrade apply [--yes]    make the changes, asking before each item
+  hb upgrade check            one-line verdict (exit 0 ok, 1 attention, 2 broken)
+  hb upgrade run              the nightly job (hb-upgrade.timer: 04:30, then every 30
+                              minutes until upgrade.window_end)
+  hb upgrade now              the same at once, outside the window; asks before a reboot
+  hb upgrade hold [8h|off]    no reboots or snap refreshes for a while (busy.d/hold)
+
+Items:
+  snaps     auto-refresh held for upgrade.snaps, so microk8s doesn't refresh (and
+            restart Kubernetes) at a random hour; they refresh here instead
+
+Each night, once:
+  1. a read-only snapshot of / (hb snapshot, label "upgrade"), kept
+     upgrade.snapshot_days
+  2. dnf upgrade --refresh -y (Fedora, Docker, any repo you added)
+  3. snap refresh of upgrade.snaps, only when the box is idle
+  4. a reboot when dnf needs-restarting -r asks for one (or a newer kernel is
+     installed), only when the box is idle
+Idle means every busy.d check passes (no recent typing in a terminal or the
+web shell, no calls, low load, no builds, no tmux pane running anything but a
+shell, no backup, no hold). Busy: the next run tries again, until
+upgrade.window_end, then the next night. A reboot waiting 7 days shows in
+hb check and the digest; with upgrade.force_after_days set it then happens even
+when busy. Fedora release upgrades stay manual.
+
+Config ([upgrade] in hb.toml): enabled, window_end, snaps, snapshot_days,
+force_after_days. The busy checks read [busy].
+"""
+import datetime
+import os
+import re
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+from hbkit import config, util  # noqa: E402
+
+WAIT_WARN_DAYS = 7
+HOLD_MAX = 7 * 86400
+
+
+def state_path():
+    return os.path.join(util.state_dir("upgrade"), "state.json")
+
+
+def load_state():
+    st = util.read_json(state_path(), {})
+    return st if isinstance(st, dict) else {}
+
+
+def save_state(st):
+    util.write_json(state_path(), st)
+
+
+def log(text):
+    print(text, flush=True)
+
+
+# --- snaps ------------------------------------------------------------------------------
+
+def held_snaps():
+    """{snap name: held?} for the installed snaps."""
+    rc, out, _ = util.run("snap", "list")
+    snaps = {}
+    for line in out.splitlines()[1:]:
+        f = line.split()
+        if f:
+            snaps[f[0]] = "held" in (f[-1].split(",") if len(f) >= 6 else [])
+    return snaps
+
+
+def chk_snaps(cfg):
+    want = cfg["upgrade"]["snaps"]
+    if not want:
+        return 0, "no snaps managed"
+    have = held_snaps()
+    missing = [s for s in want if s not in have]
+    if missing:
+        return 2, f"upgrade.snaps names {', '.join(missing)}, not installed"
+    loose = [s for s in want if not have[s]]
+    if loose:
+        return 1, f"will hold auto-refresh for {', '.join(loose)} (they refresh in the upgrade window instead)"
+    return 0, f"{', '.join(want)} held; refreshed in the upgrade window"
+
+
+def fix_snaps(cfg):
+    rc, _, err = util.run("snap", "refresh", "--hold", *cfg["upgrade"]["snaps"], timeout=120)
+    return err.strip() if rc else None
+
+
+ITEMS = (("snaps", chk_snaps, fix_snaps),)
+
+
+# --- the night's steps ----------------------------------------------------------------------
+
+def packages():
+    rc, out, _ = util.run("rpm", "-qa", "--qf", "%{NAME}.%{ARCH} %{VERSION}-%{RELEASE}\n", timeout=120)
+    pk = {}
+    for line in out.splitlines():
+        name, _, ver = line.partition(" ")
+        pk.setdefault(name, set()).add(ver)
+    return pk
+
+
+def changes(before, after):
+    """Package names (name.arch) upgraded, added or removed."""
+    return sorted(n for n in set(before) | set(after) if before.get(n) != after.get(n))
+
+
+def snapshot(cfg):
+    """A read-only snapshot before the upgrade; older "upgrade" ones beyond snapshot_days go."""
+    rc, out, err = util.run(util.HB, "snapshot", "create", "upgrade", timeout=300)
+    if rc:
+        log(f"snapshot failed (going on without it): {(err or out).strip()[:200]}")
+    else:
+        m = re.search(r"in '([^']+)'", out)
+        log(f"snapshot: {m.group(1) if m else 'taken'}")
+    d, keep = cfg["snapshot"]["dir"], cfg["upgrade"]["snapshot_days"]
+    cutoff = datetime.datetime.now() - datetime.timedelta(days=keep)
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    for name in names:
+        m = re.fullmatch(r"upgrade-(\d{8}-\d{4})", name)
+        if m and datetime.datetime.strptime(m.group(1), "%Y%m%d-%H%M") < cutoff:
+            rc, _, err = util.run("btrfs", "subvolume", "delete", os.path.join(d, name), timeout=300)
+            log(f"removed old snapshot {name}" if rc == 0 else f"couldn't remove {name}: {err.strip()}")
+
+
+def dnf_upgrade(st):
+    before = packages()
+    rc, out, err = util.run("dnf", "upgrade", "--refresh", "-y", timeout=3600)
+    changed = changes(before, packages())
+    error = "" if rc == 0 else ((err or out).strip().splitlines() or [f"exit {rc}"])[-1][:200]
+    st["dnf"] = {"at": int(time.time()), "rc": rc, "changed": changed, "error": error}
+    log(f"dnf upgrade: exit {rc}, {len(changed)} packages changed" + (f": {error}" if error else ""))
+    if rc:
+        util.notify("warn", "upgrade.dnf", f"dnf upgrade failed: {error}")   # the failing check sends the SMS
+
+
+def snap_refresh(cfg, st):
+    snaps = cfg["upgrade"]["snaps"]
+    rc, out, err = util.run("snap", "refresh", *snaps, timeout=1800)
+    text = (out or err).strip().splitlines()
+    st["snaps"] = {"at": int(time.time()), "rc": rc, "out": text[-1][:200] if text else ""}
+    log(f"snap refresh {' '.join(snaps)}: exit {rc} {st['snaps']['out']}")
+    if rc:
+        util.notify("warn", "upgrade.snap", f"snap refresh failed: {st['snaps']['out']}")
+
+
+def newest_kernel():
+    rc, out, _ = util.run("rpm", "-q", "kernel-core", "--last")
+    first = out.splitlines()[0].split()[0] if rc == 0 and out.strip() else ""
+    return first[len("kernel-core-"):] if first.startswith("kernel-core-") else ""
+
+
+def reboot_reason():
+    """Why a reboot is needed, or None."""
+    rc, out, _ = util.run("dnf", "needs-restarting", "-r", timeout=300)
+    if rc == 1:
+        lines = [l.strip() for l in out.splitlines() if l.strip() and not l.startswith(("Updating", "Repositories"))]
+        return "dnf needs-restarting: " + (next((l for l in lines if "Reboot" in l or "updated" in l), "reboot required"))
+    running, newest = os.uname().release, newest_kernel()
+    if newest and newest != running:
+        return f"kernel {newest} is installed, {running} runs"
+    return None
+
+
+def reboot(st, why):
+    st["reboot"] = {**st.get("reboot", {}), "rebooted_at": int(time.time()), "from_kernel": os.uname().release,
+                    "why": why}
+    save_state(st)
+    util.notify("info", "upgrade.reboot", f"rebooting: {why}")
+    log(f"rebooting: {why}")
+    rc, _, err = util.run("systemctl", "reboot")
+    if rc:
+        util.notify("fail", "upgrade.reboot", f"systemctl reboot failed: {err.strip()[:120]}")
+    return rc
+
+
+def in_window(cfg, now=None):
+    now = now or datetime.datetime.now()
+    h, m = (int(x) for x in cfg["upgrade"]["window_end"].split(":"))
+    return now.time() < datetime.time(h, m)
+
+
+def do_run(cfg, manual=False, now=None):
+    """One pass of the night's work. Every step is done at most once per night; reruns pick up
+    what is left (a busy snap refresh or reboot)."""
+    if not manual and not in_window(cfg, now):
+        log(f"outside the window (before {cfg['upgrade']['window_end']}): nothing to do")
+        return 0
+    st, night = load_state(), datetime.date.today().isoformat()
+    if st.get("night") != night:
+        st = {"night": night, "reboot": st.get("reboot", {})}
+    if "dnf" not in st:
+        snapshot(cfg)
+        dnf_upgrade(st)
+        save_state(st)
+    busy = util.busy()
+    if cfg["upgrade"]["snaps"] and "snaps" not in st:
+        if busy and not (manual and util.ask(f"busy ({busy[0]}); refresh snaps anyway?")):
+            st["snaps_busy"] = busy[0]
+            log(f"snap refresh waits: {busy[0]}")
+        else:
+            snap_refresh(cfg, st)
+        save_state(st)
+    why = reboot_reason()
+    r = st.setdefault("reboot", {})
+    if not why:
+        r.pop("needed_since", None)
+        r.pop("busy", None)
+        save_state(st)
+        log("no reboot needed")
+        return 0 if st["dnf"]["rc"] == 0 else 2
+    r.setdefault("needed_since", int(time.time()))
+    r["why"] = why
+    waited = (time.time() - r["needed_since"]) / 86400
+    busy = util.busy()
+    force = cfg["upgrade"]["force_after_days"]
+    if manual:
+        log(f"a reboot is needed: {why}" + (f"; busy: {'; '.join(busy)}" if busy else ""))
+        if util.ask("reboot now?"):
+            return reboot(st, why)
+        save_state(st)
+        return 1
+    if busy and not (force and waited >= force):
+        r["busy"] = busy[0]
+        save_state(st)
+        log(f"reboot waits ({why}): {busy[0]}")
+        return 0
+    if busy:
+        util.notify("warn", "upgrade.reboot", f"rebooting although busy ({busy[0]}): waited {waited:.0f} days")
+    return reboot(st, why)
+
+
+# --- verdicts ---------------------------------------------------------------------------------
+
+def summary(st):
+    d = st.get("dnf")
+    if not d:
+        return "no upgrade yet"
+    when = datetime.datetime.fromtimestamp(d["at"])
+    text = f"{when:%d %b %H:%M} dnf: {len(d.get('changed', []))} packages" + (" (failed)" if d.get("rc") else "")
+    s = st.get("snaps")
+    if s:
+        text += f"; snaps: {s.get('out') or 'refreshed'}"
+    elif st.get("snaps_busy"):
+        text += f"; snap refresh waited ({st['snaps_busy']})"
+    return text
+
+
+def verdict(cfg):
+    if not cfg["upgrade"]["enabled"]:
+        return 0, "ok: not managed"
+    rc, line = chk_snaps(cfg)
+    if rc:
+        return rc, f"{['ok', 'warn', 'fail'][rc]}: snaps: {line}"
+    st = load_state()
+    d = st.get("dnf")
+    if d and d.get("rc"):
+        return 2, f"fail: dnf upgrade failed {datetime.datetime.fromtimestamp(d['at']):%d %b}: {d.get('error', '')}"
+    if not d or time.time() - d["at"] > 2 * 86400:
+        return 1, "warn: no upgrade in 2 days: is hb-upgrade.timer running?"
+    r = st.get("reboot", {})
+    if r.get("needed_since"):
+        days = (time.time() - r["needed_since"]) / 86400
+        wait = f"reboot waiting {days:.0f} days" if days >= 1 else "reboot waiting"
+        busy = f" (busy: {r['busy']})" if r.get("busy") else ""
+        if days >= WAIT_WARN_DAYS:
+            return 1, f"warn: {wait}{busy}: {r.get('why', '')}"
+        return 0, f"ok: {summary(st)}; {wait}{busy}"
+    return 0, f"ok: {summary(st)}"
+
+
+def do_status(cfg):
+    worst = 0
+    for name, chk, _ in ITEMS:
+        rc, line = chk(cfg)
+        worst = max(worst, rc)
+        print(f"{['ok', 'todo', 'FAIL'][rc]:<5} {name:<8} {line}")
+    rc, line = verdict(cfg)
+    print(line)
+    st = load_state()
+    r = st.get("reboot", {})
+    if r.get("rebooted_at"):
+        print(f"last reboot by hb: {datetime.datetime.fromtimestamp(r['rebooted_at']):%d %b %H:%M}, "
+              f"from {r.get('from_kernel', '?')} ({r.get('why', '')})")
+    busy = util.busy()
+    print("busy now: " + ("; ".join(busy) if busy else "no (a reboot could happen)"))
+    return max(worst, rc)
+
+
+def do_plan(cfg, apply=False, yes=False):
+    worst, todo = 0, 0
+    for name, chk, fix in ITEMS:
+        rc, line = chk(cfg)
+        if rc == 0:
+            continue
+        todo += 1
+        print(f"{name}: {line}")
+        if rc == 2 or not apply:
+            worst = max(worst, rc)
+            continue
+        if not yes and not util.ask(f"  apply {name}?"):
+            worst = max(worst, 1)
+            continue
+        err = fix(cfg)
+        rc, line = chk(cfg)
+        print(f"  now: {line}" if not err else f"  failed: {err}")
+        worst = max(worst, rc if not err else 2)
+    if not todo:
+        print("nothing to change")
+    return worst
+
+
+def do_hold(arg):
+    path = os.path.join(util.STATE, "hold")
+    if arg == "off":
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        print("hold off")
+        return 0
+    m = re.fullmatch(r"(\d+)([mhd])", arg or "8h")
+    secs = int(m.group(1)) * {"m": 60, "h": 3600, "d": 86400}[m.group(2)] if m else 0
+    if not 0 < secs <= HOLD_MAX:
+        print("hold for 30m, 8h, 2d ... (at most 7d), or off")
+        return 2
+    until = int(time.time()) + secs
+    util.write_atomic(path, f"{until}\n", mode=0o644)
+    print(f"no reboots or snap refreshes until {datetime.datetime.fromtimestamp(until):%d %b %H:%M}")
+    return 0
+
+
+def main(argv):
+    verb = argv[1] if len(argv) > 1 else "status"
+    if verb in ("help", "-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if os.geteuid() != 0:
+        print("error: run with sudo", file=sys.stderr)
+        return 2
+    cfg = config.load()
+    if verb == "check":
+        rc, line = verdict(cfg)
+        print(line)
+        return rc
+    if verb == "hold":
+        return do_hold(argv[2] if len(argv) > 2 else "")
+    if not cfg["upgrade"]["enabled"]:
+        print("not managed (upgrade.enabled is false)")
+        return 0
+    if verb == "status":
+        return do_status(cfg)
+    with util.Lock(os.path.join(util.state_dir("upgrade"), "lock")):
+        if verb == "plan":
+            return do_plan(cfg)
+        if verb == "apply":
+            return do_plan(cfg, apply=True, yes="--yes" in argv[2:])
+        if verb == "run":
+            return do_run(cfg)
+        if verb == "now":
+            return do_run(cfg, manual=True)
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -12,7 +12,9 @@
 #           ones such as hb.toml or local/)
 #   link    /usr/local/bin/hb points at /opt/hb/hb
 #   config  /etc/hb/hb.toml is root's and matches the checkout's hb.toml, if any
-#   units   units/* are installed in /etc/systemd/system
+#   units   units/* are installed in /etc/systemd/system. A unit that leaves
+#           units/ is removed only if it carries units/' first line ("# Managed
+#           by hb install"); units other tools write (hb-webshell.service) stay.
 #   timers  the timers in install.timers are enabled, other hb timers are not
 #
 # Run apply from the checkout: sudo ./hb install apply. Run it again after
@@ -108,11 +110,14 @@ fix_config() {
 
 # --- units ----------------------------------------------------------------------
 unit_files() { local f; for f in "$PREFIX"/units/hb-*.service "$PREFIX"/units/hb-*.timer; do [ -f "$f" ] && echo "$f"; done; }
+# Ours: installed from units/, whose files all start with this line.
+MARK="# Managed by hb install"
 stale_units() {
   local f
   for f in "$UNITDIR"/hb-*.service "$UNITDIR"/hb-*.timer; do
-    [ -f "$f" ] && [ ! -f "$PREFIX/units/${f##*/}" ] && echo "$f"
+    [ -f "$f" ] && [ ! -f "$PREFIX/units/${f##*/}" ] && [[ "$(head -n1 "$f")" == "$MARK"* ]] && echo "$f"
   done
+  return 0
 }
 chk_units() {
   [ -d "$PREFIX/units" ] || { echo "install code first"; return 1; }

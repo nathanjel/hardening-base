@@ -1,3 +1,4 @@
+# Managed by hb install from units/; changes made here are overwritten.
 [Unit]
 Description=hb: run every check, refresh the login banner, notify on changes
 

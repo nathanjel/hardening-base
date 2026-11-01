@@ -1,0 +1,180 @@
+#!/usr/bin/python3 -IB
+"""hb-digest — the morning summary: what happened overnight, what needs you.
+
+  hb digest run       write today's digest (hb-digest.timer, 06:45)
+  hb digest [show]    the latest digest
+  hb digest check     one-line verdict
+
+It reads what is already there: the status cache (every tool's check, from
+hb-status), last night's upgrade (hb upgrade), the event log (hb notify) and
+digest.reminders. It writes /var/lib/hb/digest/<date>.txt (30 kept) and a short
+line the login banner shows under "last night". Reminders are "YYYY-MM-DD text"
+lines in hb.toml, shown from that day on until you remove them.
+
+Config ([digest] in hb.toml): reminders.
+"""
+import datetime
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+from hbkit import config, util  # noqa: E402
+
+KEEP = 30
+
+
+def ddir():
+    return util.state_dir("digest")
+
+
+def due_reminders(cfg, today=None):
+    today = today or datetime.date.today()
+    out = []
+    for line in cfg["digest"]["reminders"]:
+        day, _, text = str(line).partition(" ")
+        try:
+            if datetime.date.fromisoformat(day) <= today:
+                out.append(f"{day}: {text.strip()}")
+        except ValueError:
+            out.append(f"(not a date: {line!r})")
+    return out
+
+
+def detail(cache, key):
+    v = cache.get("checks", {}).get(key)
+    if not v:
+        return ""
+    d = v.get("detail", "")
+    for p in ("ok: ", "warn: ", "fail: "):
+        if d.startswith(p):
+            d = d[len(p):]
+    return d
+
+
+def upgrade_line(now):
+    st = util.read_json(os.path.join(util.STATE, "upgrade", "state.json"), {})
+    if not isinstance(st, dict) or not st.get("dnf"):
+        return "", []
+    notes, d = [], st["dnf"]
+    if now - d["at"] > 30 * 3600:
+        return f"no upgrade since {datetime.datetime.fromtimestamp(d['at']):%d %b}", ["the nightly upgrade didn't run"]
+    n = len(d.get("changed", []))
+    parts = [f"upgrade: {n} package{'s' if n != 1 else ''}" + (" (FAILED)" if d.get("rc") else "")]
+    kernels = [c for c in d.get("changed", []) if c.startswith("kernel-core.")]
+    if kernels:
+        parts.append("new kernel")
+    r = st.get("reboot", {})
+    if r.get("rebooted_at") and now - r["rebooted_at"] < 30 * 3600:
+        parts.append(f"rebooted {datetime.datetime.fromtimestamp(r['rebooted_at']):%H:%M} "
+                     f"({r.get('from_kernel', '?')} → {os.uname().release})")
+    elif r.get("needed_since"):
+        days = (now - r["needed_since"]) / 86400
+        parts.append(f"reboot waiting{f' {days:.0f} days' if days >= 1 else ''}" +
+                     (f" (busy: {r['busy']})" if r.get("busy") else ""))
+        if days >= 7:
+            notes.append(f"A REBOOT HAS WAITED {days:.0f} DAYS: {r.get('why', '')}. "
+                         "Free the box (or run sudo hb upgrade now) so it can happen.")
+    if d.get("rc"):
+        notes.append(f"dnf upgrade failed: {d.get('error', '')}")
+    return ", ".join(parts), notes
+
+
+def compose(cfg, now=None):
+    """(the digest's text, the banner's short line, due reminders)."""
+    now = now or time.time()
+    host = os.uname().nodename.split(".")[0]
+    cache = util.read_json(os.path.join(util.STATE, "status.json"), {}) or {}
+    checks = cache.get("checks", {})
+    bad = sorted(((k, v) for k, v in checks.items() if v.get("level") in ("warn", "fail")),
+                 key=lambda kv: (kv[1]["level"] != "fail", kv[0]))
+    up, notes = upgrade_line(now)
+    short = [p for p in (up, f"backup {detail(cache, 'backup')}" if detail(cache, "backup") else "",
+                         f"cleanup {detail(cache, 'clean')}" if detail(cache, "clean") else "") if p]
+    events = [e for e in util.read_events() if e["ts"] >= now - 86400]
+    counts = {lvl: sum(1 for e in events if e["level"] == lvl) for lvl in ("fail", "warn", "info")}
+    reminders = due_reminders(cfg, datetime.date.fromtimestamp(now))
+    lines = [f"hb digest for {host}, {datetime.datetime.fromtimestamp(now):%a %d %b %Y %H:%M}", ""]
+    lines += [f"!! {n}" for n in notes]
+    lines += [f"overnight: {p}" for p in short] or ["overnight: nothing recorded"]
+    if detail(cache, "health.disk"):
+        lines.append(f"disk:      {detail(cache, 'health.disk')}")
+    lines.append(f"kernel:    {os.uname().release}, up {uptime_text()}")
+    lines.append(f"checks:    {len(checks) - len(bad)} ok, " + ", ".join(
+        f"{sum(1 for _, v in bad if v['level'] == lvl)} {lvl}" for lvl in ("warn", "fail")))
+    lines += [f"  {v['level'].upper():4}  {k}: {v.get('detail', '')}" for k, v in bad]
+    lines.append(f"events:    {counts['fail']} fail, {counts['warn']} warn, {counts['info']} info in 24 h"
+                 " (hb notify events)")
+    if reminders:
+        lines.append("reminders:")
+        lines += [f"  {r}" for r in reminders]
+    return "\n".join(lines) + "\n", "; ".join(short) or "nothing recorded", reminders
+
+
+def uptime_text():
+    try:
+        with open("/proc/uptime") as f:
+            secs = float(f.read().split()[0])
+    except (OSError, ValueError):
+        return "?"
+    days, rest = divmod(int(secs), 86400)
+    return f"{days} d {rest // 3600} h" if days else f"{rest // 3600} h {rest % 3600 // 60} min"
+
+
+def do_run(cfg):
+    text, short, reminders = compose(cfg)
+    d = ddir()
+    today = datetime.date.today().isoformat()
+    util.write_atomic(os.path.join(d, f"{today}.txt"), text)
+    util.write_json(os.path.join(d, "latest.json"), {"ts": int(time.time()), "short": short,
+                                                     "reminders": reminders, "file": f"{today}.txt"}, mode=0o644)
+    for name in sorted(n for n in os.listdir(d) if n.endswith(".txt"))[:-KEEP]:
+        os.remove(os.path.join(d, name))
+    util.run(util.HB, "status", "banner", timeout=30)
+    print(text, end="")
+    return 0
+
+
+def do_show():
+    latest = util.read_json(os.path.join(ddir(), "latest.json"), {})
+    try:
+        with open(os.path.join(ddir(), latest.get("file", ""))) as f:
+            print(f.read(), end="")
+        return 0
+    except OSError:
+        print("no digest yet: hb-digest.timer writes one at 06:45")
+        return 1
+
+
+def verdict():
+    latest = util.read_json(os.path.join(util.STATE, "digest", "latest.json"), {})
+    if not latest:
+        return 0, "ok: no digest yet"
+    age = (time.time() - latest.get("ts", 0)) / 3600
+    if age > 50:
+        return 1, f"warn: last digest {age:.0f} h ago: is hb-digest.timer running?"
+    return 0, f"ok: {latest.get('short', '')}"
+
+
+def main(argv):
+    verb = argv[1] if len(argv) > 1 else "show"
+    if verb in ("help", "-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if os.geteuid() != 0:
+        print("error: run with sudo", file=sys.stderr)
+        return 2
+    if verb == "check":
+        rc, line = verdict()
+        print(line)
+        return rc
+    if verb == "show":
+        return do_show()
+    if verb == "run":
+        return do_run(config.load())
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

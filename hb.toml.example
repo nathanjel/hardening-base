@@ -141,3 +141,22 @@ namespace = "default"         # where the Service, EndpointSlice, Certificate an
 issuer = ""                   # cert-manager ClusterIssuer for host, e.g. "letsencrypt"
 middlewares = ""              # traefik router.middlewares annotation, e.g. "default-redirect-https@kubernetescrd"
 max_hours = 12                # the longest window hb webshell open allows
+
+[upgrade]
+# Nightly at 04:30 (hb-upgrade.timer, add it to install.timers), retried every 30 minutes until
+# window_end while the box is busy: a snapshot, dnf upgrade, then snap refresh and a reboot only when idle.
+enabled = false
+window_end = "07:00"
+snaps = []                    # snaps whose auto-refresh is held and done here instead, e.g. ["microk8s", "snapd", "core22"]
+snapshot_days = 3             # how long the pre-upgrade snapshots stay
+force_after_days = 0          # 0: never reboot while busy; N: reboot anyway once it has waited N days
+
+[busy]
+# What busy.d counts as "someone is working": hb upgrade waits, and so do disruptive hb k8s steps.
+idle_minutes = 60             # typing in any terminal or the web shell within this long
+max_load = 2.0                # 5-minute load average
+processes = ["make", "cargo", "rustc", "cc1", "cc1plus", "go", "gradle", "mvn", "npm", "pytest", "buildkitd", "dnf", "rpm"]
+
+[digest]
+# The morning summary (hb-digest.timer, 06:45). Reminders show in it and in the banner from their date on.
+reminders = []                # "YYYY-MM-DD text"

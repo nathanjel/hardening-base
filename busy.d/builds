@@ -1,0 +1,27 @@
+#!/usr/bin/python3 -IB
+"""Busy while a build, test or package job runs: a process named in busy.processes, or an
+image build (docker build, docker buildx, podman build)."""
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+from hbkit import config  # noqa: E402
+
+PROC = os.environ.get("HB_PROC", "/proc")
+names = set(config.load()["busy"]["processes"])
+for pid in (p for p in os.listdir(PROC) if p.isdigit()):
+    try:
+        with open(os.path.join(PROC, pid, "comm")) as f:
+            comm = f.read().strip()
+        with open(os.path.join(PROC, pid, "cmdline"), "rb") as f:
+            argv = f.read().split(b"\0")
+    except OSError:
+        continue
+    if comm in names:
+        print(f"{comm} is running (pid {pid})")
+        sys.exit(1)
+    words = [os.path.basename(argv[0]).decode(errors="replace")] + [a.decode(errors="replace") for a in argv[1:3]]
+    if words[0] in ("docker", "podman") and ("build" in words[1:] or "buildx" in words[1:]):
+        print(f"an image build is running (pid {pid})")
+        sys.exit(1)
+sys.exit(0)

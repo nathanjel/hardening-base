@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Busy while `hb upgrade hold` is in effect (the file holds "UNTIL_EPOCH").
+read -r until _ 2>/dev/null < "${HB_STATE:-/var/lib/hb}/hold" || exit 0
+[[ $until =~ ^[0-9]+$ ]] && [ "$until" -gt "$(date +%s)" ] || exit 0
+echo "hb upgrade hold until $(date -d "@$until" '+%d %b %H:%M')"
+exit 1

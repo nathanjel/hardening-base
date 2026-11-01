@@ -1,0 +1,24 @@
+#!/usr/bin/python3 -IB
+"""Busy while any tmux pane, of any user, runs something other than a shell: a long agent
+run, an editor, a running job. Every tmux server under /tmp/tmux-<uid>/ is asked."""
+import glob
+import os
+import stat
+import subprocess
+import sys
+
+SHELLS = {"bash", "zsh", "sh", "dash", "fish", "ksh", "tcsh", "csh"}
+for sock in sorted(glob.glob(os.path.join(os.environ.get("HB_TMUX_DIR", "/tmp"), "tmux-*", "*"))):
+    try:
+        if not stat.S_ISSOCK(os.stat(sock).st_mode):
+            continue
+        p = subprocess.run(["tmux", "-S", sock, "list-panes", "-a", "-F", "#{session_name} #{pane_current_command}"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        continue
+    for line in p.stdout.splitlines():
+        session, _, cmd = line.partition(" ")
+        if cmd.lstrip("-") not in SHELLS:
+            print(f"tmux session {session} runs {cmd}")
+            sys.exit(1)
+sys.exit(0)

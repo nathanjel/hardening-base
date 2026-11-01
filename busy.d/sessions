@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Busy while someone typed in a terminal (SSH, the consoles, tmux panes) or in the web
+# shell within busy.idle_minutes. A terminal's atime is its last input, as `w` shows it.
+mins="$("${HB_ROOT:?}/tools/hb-config" get busy.idle_minutes 2>/dev/null)"
+mins="${mins:-60}"
+now="$(date +%s)"
+newest=0 where=""
+if [ -n "${HB_PTS:-}" ]; then terms=("$HB_PTS"/[0-9]*); else terms=(/dev/pts/[0-9]* /dev/tty[0-9]* /dev/ttyS[0-9]*); fi
+for t in "${terms[@]}"; do
+  [ -c "$t" ] || continue
+  a="$(stat -c %X "$t" 2>/dev/null)" || continue
+  [ "$a" -gt "$newest" ] && { newest="$a"; where="$t"; }
+done
+act="$(head -c 20 "${HB_WEBSHELL_STATE:-/var/lib/hb-webshell}/activity" 2>/dev/null | tr -dc 0-9)"
+[ -n "$act" ] && [ "$act" -gt "$newest" ] && { newest="$act"; where="the web shell"; }
+[ "$newest" -ge $((now - mins * 60)) ] || exit 0
+echo "input on $where $(( (now - newest) / 60 )) min ago (busy.idle_minutes $mins)"
+exit 1

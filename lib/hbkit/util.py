@@ -79,6 +79,20 @@ def notify(level, key, text):
     run(HB, "notify", "send", level, key, text, timeout=120)
 
 
+def busy():
+    """Why the box is busy now: the first line of each busy.d check that says so (empty: idle)."""
+    d = os.path.join(HB_ROOT, "busy.d")
+    reasons = []
+    for name in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        path = os.path.join(d, name)
+        if name.startswith(".") or not os.access(path, os.X_OK):
+            continue
+        rc, out, err = run(path, timeout=60, env=dict(os.environ, HB_ROOT=HB_ROOT))
+        if rc != 0:
+            reasons.append(((out.strip() or err.strip() or name).splitlines() or [name])[0])
+    return reasons
+
+
 def sudo_user():
     """Who ran sudo, or None."""
     u = os.environ.get("SUDO_USER", "")

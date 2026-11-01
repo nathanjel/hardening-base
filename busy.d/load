@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Busy while the 5-minute load average is at or above busy.max_load.
+max="$("${HB_ROOT:?}/tools/hb-config" get busy.max_load 2>/dev/null)"
+max="${max:-2}"
+read -r _ l5 _ < "${HB_LOADAVG:-/proc/loadavg}"
+awk -v l="$l5" -v m="$max" 'BEGIN { exit !(l + 0 >= m + 0) }' || exit 0
+echo "5-minute load $l5 (busy.max_load $max)"
+exit 1

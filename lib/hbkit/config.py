@@ -129,6 +129,22 @@ DEFAULTS = {
         "middlewares": "",
         "max_hours": 12,
     },
+    "upgrade": {
+        "enabled": False,
+        "window_end": "07:00",
+        "snaps": [],
+        "snapshot_days": 3,
+        "force_after_days": 0,
+    },
+    "busy": {
+        "idle_minutes": 60,
+        "max_load": 2.0,
+        "processes": ["make", "cargo", "rustc", "cc1", "cc1plus", "go", "gradle", "mvn", "npm", "pytest",
+                      "buildkitd", "dnf", "rpm"],
+    },
+    "digest": {
+        "reminders": [],
+    },
 }
 
 

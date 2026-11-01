@@ -1,3 +1,4 @@
+# Managed by hb install from units/; changes made here are overwritten.
 [Unit]
 Description=hb: restic prune and check, Saturdays at 01:30
 

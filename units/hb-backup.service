@@ -1,3 +1,4 @@
+# Managed by hb install from units/; changes made here are overwritten.
 [Unit]
 Description=hb: nightly restic backup
 Wants=network-online.target

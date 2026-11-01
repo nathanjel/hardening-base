@@ -1,0 +1,12 @@
+# Managed by hb install from units/; changes made here are overwritten.
+[Unit]
+Description=hb: nightly upgrade at 04:30, retried every 30 minutes while the box is busy
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+OnCalendar=*-*-* 05,06:00,30:00
+# A missed night isn't caught up at boot: the window is the point.
+Persistent=false
+
+[Install]
+WantedBy=timers.target
