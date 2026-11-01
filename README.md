@@ -17,7 +17,7 @@ upgrades and cleanup jobs. They arrive in phases.
 
 ## Status
 
-Phases 1 to 5 are written, and phase 6 is in progress (runbooks:
+Phases 1 to 6 are written (runbooks:
 [docs/PHASE1.md](docs/PHASE1.md), [docs/PHASE2.md](docs/PHASE2.md),
 [docs/PHASE3.md](docs/PHASE3.md), [docs/PHASE4.md](docs/PHASE4.md),
 [docs/PHASE5.md](docs/PHASE5.md), [docs/PHASE6.md](docs/PHASE6.md)). Start from `hb.toml.example`, which lists every
@@ -47,7 +47,7 @@ timers run) and the config to `/etc/hb/hb.toml`.
 | `hb-notify` | events for the banner; failures also as SMS through any command you name (rate-limited) |
 | `hb-alerts` | mdadm and smartd report through hb-notify, no mail server needed |
 | `hb-backup` | restic from a read-only btrfs snapshot, plus a state dump for rebuilding |
-| `hb-clean` | build output in idle projects, stale caches, Docker leftovers; dry-run first |
+| `hb-clean` | build output in idle projects, stale caches, Docker leftovers; dry-run first. Measures the image registry, never cleans it |
 | `phase0/inventory.sh` | read-only system inventory (becomes `hb-inventory`) |
 
 ## Conventions

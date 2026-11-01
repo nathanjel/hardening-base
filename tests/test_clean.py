@@ -7,7 +7,7 @@ import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
-from tools import load_tool  # noqa: E402
+from tools import load_tool, temp_state  # noqa: E402
 
 clean = load_tool("clean")
 OLD = time.time() - 40 * 86400
@@ -156,6 +156,56 @@ class HelpersTest(unittest.TestCase):
         write(os.path.join(other, "f"))
         clean.remove([other, os.path.join(parent, "..", os.path.basename(other))], parent)()
         self.assertTrue(os.path.exists(os.path.join(other, "f")))
+
+
+def fake_registry(root, repos):
+    """A registry storage tree: repos = {name: (tags, manifests)}, plus one blob."""
+    v2 = os.path.join(root, "docker", "registry", "v2")
+    write(os.path.join(v2, "blobs", "sha256", "ab", "ab01", "data"), "x" * 5000)
+    for name, (tags, manifests) in repos.items():
+        m = os.path.join(v2, "repositories", name, "_manifests")
+        for t in range(tags):
+            write(os.path.join(m, "tags", f"t{t}", "current", "link"), "sha256:ab01")
+        for i in range(manifests):
+            write(os.path.join(m, "revisions", "sha256", f"d{i}", "link"), f"sha256:d{i}")
+        write(os.path.join(v2, "repositories", name, "_layers", "sha256", "ab01", "link"), "sha256:ab01")
+
+
+class RegistryTest(unittest.TestCase):
+    def setUp(self):
+        temp_state(self)
+        self.base = tempfile.mkdtemp()
+        fake_registry(os.path.join(self.base, "registry-claim-pvc-1"),
+                      {"app": (2, 6), "team/web": (1, 3)})
+        self.cfg = {"registry_dir": os.path.join(self.base, "registry-claim-*"), "registry_warn": "10GB"}
+
+    def test_measured(self):
+        reg = clean.registry_size(self.cfg)
+        self.assertEqual((reg["images"], reg["tags"], reg["manifests"]), (2, 3, 9))
+        self.assertGreaterEqual(reg["bytes"], 5000)
+        self.assertIn("2 images, 3 tags, 9 manifests (watched, not cleaned; warns past 10GB)",
+                      clean.registry_note(reg, self.cfg))
+
+    def test_no_registry(self):
+        self.assertIsNone(clean.registry_size(dict(self.cfg, registry_dir=os.path.join(self.base, "none-*"))))
+        self.assertIsNone(clean.registry_size(dict(self.cfg, registry_dir="")))
+
+    def check(self, warn):
+        util = clean.util
+        util.write_json(clean.report_paths()[0], {"ts": int(time.time()), "dry_run": True, "bytes": 2 * 10**9,
+                                                  "actions": 1, "errors": [], "registry": clean.registry_size(self.cfg)})
+        return clean.cmd_check(dict(self.cfg, registry_warn=warn))
+
+    def test_check_mentions_size_and_warns_past_the_limit(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        for warn, rc, start, has in (("10GB", 0, "ok: 2.0 GB reclaimable (dry run) on ", "; registry "),
+                                     ("1kB", 1, "warn: registry ", "(9 manifests), past clean.registry_warn 1kB")):
+            out = StringIO()
+            with redirect_stdout(out):
+                self.assertEqual(self.check(warn), rc)
+            self.assertTrue(out.getvalue().startswith(start), out.getvalue())
+            self.assertIn(has, out.getvalue())
 
 
 if __name__ == "__main__":

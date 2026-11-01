@@ -76,6 +76,9 @@ docker_container_days = 7
 docker_image_days = 14
 docker_build_cache = "15GB"
 heavy_weekday = 6             # docker cleanup day once live: 1 = Monday ... 7 = Sunday
+# The image registry is only measured: its size is in the report, and the check warns past registry_warn.
+registry_dir = "/var/snap/microk8s/common/default-storage/container-registry-registry-claim-*"
+registry_warn = "10GB"
 
 [wg]
 interface = "wg0"

@@ -82,6 +82,9 @@ DEFAULTS = {
         "docker_image_days": 14,
         "docker_build_cache": "15GB",
         "heavy_weekday": 6,
+        # microk8s' registry addon on hostpath-storage; "" to not watch a registry
+        "registry_dir": "/var/snap/microk8s/common/default-storage/container-registry-registry-claim-*",
+        "registry_warn": "10GB",
     },
     "wg": {
         "interface": "wg0",

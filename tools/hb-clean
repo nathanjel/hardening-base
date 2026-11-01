@@ -23,12 +23,17 @@ Targets:
             older than docker_image_days, build cache above docker_build_cache.
             Volumes are listed, never removed. Only with clean.docker = true.
 
+The local image registry (clean.registry_dir) is measured, never cleaned: its
+size goes in the report, and the check warns once it passes clean.registry_warn.
+
 Config ([clean] in hb.toml): dry_run, users, project_roots, idle_days,
 venv_idle_days, build_dirs, cache_idle_days, docker, docker_container_days,
-docker_image_days, docker_build_cache, heavy_weekday (1 = Monday ... 7 = Sunday).
+docker_image_days, docker_build_cache, heavy_weekday (1 = Monday ... 7 = Sunday),
+registry_dir, registry_warn.
 """
 import datetime
 import fnmatch
+import glob
 import json
 import os
 import pwd
@@ -310,6 +315,37 @@ def plan_docker(cfg, now):
 PLANNERS = {"projects": plan_projects, "caches": plan_caches, "docker": plan_docker}
 
 
+# --- registry (watched, not cleaned) ------------------------------------------------
+
+def registry_size(cfg):
+    """{bytes, images, tags, manifests} of the registry's storage, or None if there is none.
+    Its images are multi-platform indexes, and registry 2.8's garbage collection breaks kept
+    ones when told to remove untagged manifests, so hb only watches the size."""
+    roots = sorted(glob.glob(cfg["registry_dir"])) if cfg.get("registry_dir") else []
+    found = {"bytes": 0, "images": 0, "tags": 0, "manifests": 0}
+    for root in roots:
+        v2 = os.path.join(root, "docker", "registry", "v2")
+        if not os.path.isdir(v2):
+            continue
+        found["bytes"] += walk_stats(root)[0]
+        for path, dirs, _ in os.walk(os.path.join(v2, "repositories")):
+            if "_manifests" in dirs:
+                m = os.path.join(path, "_manifests")
+                found["images"] += 1
+                for key, sub in (("tags", "tags"), ("manifests", os.path.join("revisions", "sha256"))):
+                    try:
+                        found[key] += len(os.listdir(os.path.join(m, sub)))
+                    except OSError:
+                        pass
+            dirs[:] = [d for d in dirs if not d.startswith("_")]
+    return found if found["images"] or found["bytes"] else None
+
+
+def registry_note(reg, cfg):
+    return (f"registry: {human(reg['bytes'])}, {reg['images']} images, {reg['tags']} tags, "
+            f"{reg['manifests']} manifests (watched, not cleaned; warns past {cfg['registry_warn']})")
+
+
 def make_plan(cfg, targets):
     now, actions, notes = time.time(), [], []
     for t in targets:
@@ -377,6 +413,9 @@ def cmd_auto(full):
              or disk_pct() >= full["health"]["disk_warn_pct"])
     targets = ["projects", "caches"] + (["docker"] if dry or heavy else [])
     actions, notes = make_plan(cfg, targets)
+    reg = registry_size(cfg)
+    if reg:
+        notes.append(registry_note(reg, cfg))
     stamp = time.strftime("%Y-%m-%d %H:%M")
     text = format_plan(actions, notes, f"hb clean {'DRY RUN, nothing removed' if dry else 'run'}, {stamp}")
     errors = [] if dry else apply(actions, yes=True)
@@ -386,11 +425,11 @@ def cmd_auto(full):
     jpath, tpath = report_paths()
     util.write_atomic(tpath, text)
     util.write_json(jpath, {"ts": int(time.time()), "dry_run": dry, "bytes": sum(a.size for a in actions),
-                            "actions": len(actions), "errors": errors})
+                            "actions": len(actions), "errors": errors, "registry": reg})
     return 1 if errors else 0
 
 
-def cmd_check():
+def cmd_check(cfg):
     jpath, _ = report_paths()
     rep = util.read_json(jpath, None)
     if not rep:
@@ -400,8 +439,13 @@ def cmd_check():
     if rep["errors"]:
         print(f"warn: {len(rep['errors'])} cleanup actions failed on {when} (hb clean report)")
         return 1
+    reg = rep.get("registry")
+    if reg and reg["bytes"] > parse_size(cfg["registry_warn"]):
+        print(f"warn: registry {human(reg['bytes'])} ({reg['manifests']} manifests), "
+              f"past clean.registry_warn {cfg['registry_warn']}")
+        return 1
     verb = "reclaimable (dry run)" if rep["dry_run"] else "removed"
-    print(f"ok: {human(rep['bytes'])} {verb} on {when}")
+    print(f"ok: {human(rep['bytes'])} {verb} on {when}" + (f"; registry {human(reg['bytes'])}" if reg else ""))
     return 0
 
 
@@ -418,7 +462,7 @@ def main(argv):
     if verb == "auto":
         return cmd_auto(full)
     if verb == "check":
-        return cmd_check()
+        return cmd_check(full["clean"])
     if verb == "report":
         try:
             with open(report_paths()[1]) as f:
@@ -434,6 +478,9 @@ def main(argv):
         print(f"hb-clean: unknown target {' '.join(bad)} (targets: {' '.join(TARGETS)})", file=sys.stderr)
         return 2
     actions, notes = make_plan(full["clean"], targets)
+    reg = registry_size(full["clean"]) if not args else None
+    if reg:
+        notes.append(registry_note(reg, full["clean"]))
     if verb == "plan":
         print(format_plan(actions, notes, "hb clean plan (nothing removed)"), end="")
         return 0

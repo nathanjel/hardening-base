@@ -85,6 +85,13 @@ The banner shows its "last night" line from then on.
 
 Put them in `digest.reminders` with their dates.
 
+**The image registry** is measured, not cleaned. Its images are
+multi-platform indexes, and garbage collection in registry 2.8 breaks kept
+ones when asked to remove untagged manifests. So `hb clean` reports its size
+(`registry: 1.3 GB, 4 images, 23 tags, 267 manifests`), the digest carries
+it, and `hb check` warns once it passes `clean.registry_warn` (10GB). If it
+ever does, delete old tags by hand or build the cleanup then.
+
 ## Living with it
 
 - Planning an evening of work that mustn't be interrupted at 04:30?
