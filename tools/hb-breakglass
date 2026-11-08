@@ -19,7 +19,9 @@ Items:
 
 The kit (`kit`, again to rotate) is made in root's own folder, then written to
 DIR (default ~/hb-kit-DATE of the person running sudo, mode 700), which must be
-new and whose path may not go through a link:
+new and whose path may not go through a link. DIR is made first, so one that
+can't take the kit fails before anything changes; if writing to it fails
+later, the new kit stays in root's folder and the command says where:
   rescue.key   a new ed25519 key with a passphrase; its public half goes into
                /etc/ssh/authorized_keys/<user>, replacing the previous kit's
   kit.html     the page to print, kit.txt the same as text: how to log in from
@@ -45,6 +47,7 @@ import os
 import pwd
 import re
 import secrets
+import shutil
 import socket
 import stat
 import subprocess
@@ -412,35 +415,58 @@ def open_dir(path):
         raise
 
 
-def publish(to, files, owner):
-    """Write the finished kit to the new folder `to`: created here, in the parent opened by open_dir,
-    and checked to be this run's (root's, empty) before anything goes in. Only that folder and the
-    files written into it are given to owner, each through its own descriptor."""
+def reserve(to):
+    """Make the kit's folder before anything changes: created in the parent opened by open_dir, and
+    checked to be this run's (root's, mode 700, empty). Returns (parent fd, folder fd)."""
     parent, name = os.path.split(to)
     pfd = open_dir(parent)
-    kfd, written = None, []
+    kfd = None
     try:
         os.mkdir(name, 0o700, dir_fd=pfd)
         kfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=pfd)
         st = os.fstat(kfd)
         if st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != 0o700 or os.listdir(kfd):
-            raise RuntimeError(f"{to} was replaced while the kit was being written")
+            raise RuntimeError(f"{to} was replaced while it was being made")
+        return pfd, kfd
+    except BaseException as e:
+        if kfd is not None:
+            os.close(kfd)
+        os.close(pfd)
+        if isinstance(e, OSError):
+            raise RuntimeError(f"{to}: {e.strerror or e}") from None
+        raise
+
+
+def release(pfd, kfd, name):
+    """Take the reserved folder away again, if it is still the one made here and still empty."""
+    try:
+        here, mine = os.stat(name, dir_fd=pfd, follow_symlinks=False), os.fstat(kfd)
+        if (here.st_dev, here.st_ino) == (mine.st_dev, mine.st_ino) and not os.listdir(kfd):
+            os.rmdir(name, dir_fd=pfd)
+    except OSError:
+        pass
+    finally:
+        os.close(kfd)
+        os.close(pfd)
+
+
+def fill(kfd, files, owner):
+    """Write the kit's files into the reserved folder, then give the folder to owner. Only that folder
+    and the files written into it change hands, each through its own descriptor."""
+    written = []
+    try:
         for fname, data, mode in files:
             kit_put(kfd, fname, data, mode, owner)
             written.append(fname)
         if owner:
             os.fchown(kfd, *owner)
     except OSError as e:
-        for fname in written:                        # only what this run wrote, in the folder it made
+        for fname in written:
             try:
                 os.unlink(fname, dir_fd=kfd)
             except OSError:
                 pass
-        raise RuntimeError(f"{to}: {e.strerror or e}") from None
-    finally:
-        if kfd is not None:
-            os.close(kfd)
-        os.close(pfd)
+        raise RuntimeError(e.strerror or str(e)) from None
 
 
 def do_kit(cfg, to):
@@ -468,19 +494,60 @@ def do_kit(cfg, to):
     if not util.ask(q):
         print("nothing changed")
         return 1
+    # The destination first, so a path that can't take the kit fails while the old kit still works.
+    # It stays root's (mode 700) until the kit is in it.
+    try:
+        pfd, kfd = reserve(to)
+    except RuntimeError as e:
+        print(f"{e}\nnothing changed")
+        return 2
+    try:
+        return make_kit(cfg, st, user, owner, to, kfd)
+    finally:
+        release(pfd, kfd, os.path.basename(to))      # only does something when the folder is still empty
+
+
+def keep_secrets(staging, k):
+    """Write the kit's secrets down in root's folder, so a run that stops part-way loses none of them."""
+    util.write_atomic(os.path.join(staging, "secrets.json"), json.dumps(
+        {key: k[key] for key in ("user", "made", "phrase", "password", "restic_password", "codes") if key in k},
+        indent=1) + "\n", mode=0o600)
+
+
+def make_kit(cfg, st, user, owner, to, kfd):
     wl = words()
     k = {"host": kit_host(cfg), "user": user, "made": datetime.date.today().isoformat(),
          "note": cfg["breakglass"]["note"].strip(), "fingerprint": host_fingerprint(),
-         "repo": cfg["backup"]["repo"], "restic_password": "",
-         "phrase": passphrase(wl), "password": passphrase(wl)}
+         "repo": cfg["backup"]["repo"], "phrase": passphrase(wl), "password": passphrase(wl)}
+    k["restic_password"] = passphrase(wl) if k["repo"] else ""
+    before = st.get("rotation")                      # left by earlier runs that didn't finish
+    earlier = ([before["staging"]] + before.get("earlier", [])) if before else []
+
+    # Every secret is written down in root's own folder before it goes live, and the state says a
+    # rotation is under way until a whole kit exists: whatever fails part-way, nothing made is lost,
+    # and hb breakglass check fails until a kit is complete.
+    staging = tempfile.mkdtemp(prefix=f"kit-{k['made']}-", dir=util.state_dir("breakglass"))
+    try:
+        pub = make_ssh_key(os.path.join(staging, "rescue.key"), k["phrase"], f"{user} kit {k['made']}")
+        keep_secrets(staging, k)
+        st["rotation"] = {"since": int(time.time()), "staging": staging, "earlier": earlier}
+        save_state(st)
+    except (RuntimeError, OSError) as e:
+        shutil.rmtree(staging, ignore_errors=True)
+        print(f"{e}\nnothing changed")
+        return 2
 
     # The backup key first: it is the step most likely to fail (the share), and
     # nothing else has changed yet. Its id is kept at once so a later run removes it.
     if k["repo"]:
-        k["restic_password"] = passphrase(wl)
         try:
             new_id = restic_add_key(cfg, k["restic_password"], user)
         except RuntimeError as e:
+            st.pop("rotation", None)
+            if before:
+                st["rotation"] = before
+            save_state(st)
+            shutil.rmtree(staging, ignore_errors=True)
             print(f"{e}\nnothing changed")
             return 2
         old_id = st.get("restic_key")
@@ -491,30 +558,53 @@ def do_kit(cfg, to):
             if err:
                 print(f"note: couldn't remove the previous kit's backup key {old_id[:8]}: {err}")
 
-    # The kit is made in root's own folder, and only the finished files go to `to` (often in
-    # the owner's home, where anything along the path can be renamed or replaced meanwhile).
-    files = []
     try:
-        with tempfile.TemporaryDirectory(dir=util.state_dir("breakglass")) as tmp:
-            pub = make_ssh_key(os.path.join(tmp, "rescue.key"), k["phrase"], f"{user} kit {k['made']}")
-            for n in ("rescue.key", "rescue.key.pub"):
-                with open(os.path.join(tmp, n), "rb") as f:
-                    files.append((n, f.read(), os.fstat(f.fileno()).st_mode & 0o777))
         util.write_atomic(os.path.join(KEYDIR, user),
                           f"# Managed by hb-breakglass: the kit made {k['made']}.\n{pub}\n", mode=0o644)
         rc, _, err = util.run("chpasswd", input=f"{user}:{k['password']}\n")
         if rc != 0:
             raise RuntimeError(f"chpasswd: {err.strip()}")
         rc, out, err = util.run(util.HB, "totp", "codes", user, "--plain")
-        k["codes"] = out.split()
-        if rc != 0 or len(k["codes"]) != 10:
+        codes = out.split()
+        if rc != 0 or len(codes) != 10:
             raise RuntimeError(f"hb totp codes: {(err or out).strip()[:120]}")
-        files += [("kit.txt", kit_txt(k).encode(), 0o600), ("kit.html", kit_html(k).encode(), 0o600)]
-        pw = pwd.getpwnam(owner) if owner else None
-        publish(to, files, (pw.pw_uid, pw.pw_gid) if pw else None)
+        k["codes"] = codes                           # live now: written down before anything else
+        try:
+            keep_secrets(staging, k)
+        except OSError:
+            print("couldn't write down the new recovery codes, which already work; copy them now:\n  "
+                  + "  ".join(codes))
+            raise
+        util.write_atomic(os.path.join(staging, "kit.txt"), kit_txt(k), mode=0o600)
+        util.write_atomic(os.path.join(staging, "kit.html"), kit_html(k), mode=0o600)
     except (RuntimeError, OSError) as e:
-        print(f"{e}\nthe kit is incomplete; run hb breakglass kit again (to a new --to)")
+        util.notify("fail", "breakglass.kit", f"a new break-glass kit for {user} didn't finish")
+        print(f"{e}\nThe kit is incomplete, and part of the old one may no longer work. What was made is in "
+              f"{staging} (root's only; secrets.json has the passwords and codes).\n"
+              "Run sudo hb breakglass kit again (to a new --to); hb breakglass check fails until then.")
         return 2
+
+    files = []
+    for n in ("rescue.key", "rescue.key.pub", "kit.txt", "kit.html"):
+        with open(os.path.join(staging, n), "rb") as f:
+            files.append((n, f.read(), os.fstat(f.fileno()).st_mode & 0o777))
+    for old in earlier:                              # earlier unfinished runs: their secrets no longer work
+        shutil.rmtree(old, ignore_errors=True)
+    st.pop("rotation", None)
+    pw = pwd.getpwnam(owner) if owner else None
+    try:
+        fill(kfd, files, (pw.pw_uid, pw.pw_gid) if pw else None)
+    except RuntimeError as e:
+        # The new kit is whole and live, and the old one is not: keep it where it was made, and say so.
+        st.update(kit_made=k["made"], kit_made_ts=time.time(), kit_dir=staging)
+        save_state(st)
+        util.notify("warn", "breakglass.kit", f"new break-glass kit made for {user}, but not delivered")
+        print(f"couldn't write the kit to {to}: {e}\n"
+              f"The new kit is made (the old one no longer works) and is in {staging}, root's only.\n"
+              f"Copy it from there, e.g.  sudo cp -r {staging} ~/hb-kit  and  sudo chown -R $USER ~/hb-kit,"
+              f" then:  sudo rm -r {staging}")
+        return 2
+    shutil.rmtree(staging, ignore_errors=True)
     st.update(kit_made=k["made"], kit_made_ts=time.time(), kit_dir=to)
     save_state(st)
     util.notify("info", "breakglass.kit", f"new break-glass kit made for {user}")
@@ -529,6 +619,11 @@ def do_kit(cfg, to):
 
 def kit_verdict(cfg):
     st = load_state()
+    rot = st.get("rotation")
+    if rot:
+        also = f", and from earlier tries in {', '.join(rot['earlier'])}" if rot.get("earlier") else ""
+        return 2, (f"a new kit started {datetime.date.fromtimestamp(rot['since'])} didn't finish; what was made is "
+                   f"in {rot['staging']}{also} (root's only); run sudo hb breakglass kit again")
     if not st.get("kit_made"):
         return 1, "no kit yet: sudo hb breakglass kit"
     if st.get("kit_dir") and os.path.exists(st["kit_dir"]):

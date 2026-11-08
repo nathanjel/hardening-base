@@ -258,6 +258,13 @@ Empty `notify.sms_fallback` and `k8s.keep_restarting` in `hb.toml`, then
     sudo hb ssh check              # ok, as before
     sudo hb check
 
+A third and a fourth review found three more, also fixed:
+
+| Piece | Tool | What changes |
+|---|---|---|
+| Break-glass kit | `hb breakglass kit` | the destination folder is made and checked first, before the key, the password, the codes or the backup key change, so a `--to` that can't take the kit fails while the old kit still works. Every new secret is written down in root's folder (`/var/lib/hb/breakglass/kit-.../secrets.json`) before it goes live, and the recovery codes the moment they exist. Until a whole kit exists, `hb breakglass check` fails and says where that folder is; once one exists but couldn't be delivered, it stays there and the check reminds you |
+| Evicted pods | `hb health` | an evicted pod is a warning only when its controller has all the pods it wants available again (the Deployment above a ReplicaSet, a StatefulSet's replicas, a DaemonSet's nodes, a Job's completions). Another pod of the same controller being up isn't enough |
+
 Don't make a kit just to test it: a new kit voids the one you have.
 `tests/test_boundary.py` covers the kit with two real uids, including a folder above
 the kit being swapped for a link while it is made.

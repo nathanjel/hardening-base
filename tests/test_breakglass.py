@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+import stat
 import pwd
 import subprocess
 import sys
@@ -137,6 +138,106 @@ class KitTest(unittest.TestCase):
         bg.save_state({**bg.load_state(), "last_login": time.time() - 200 * 86400,
                        "kit_made_ts": time.time() - 300 * 86400})
         self.assertIn("test it again", bg.kit_verdict(c)[1])
+
+    def rotations(self):
+        return [c for c in self.calls if c[0] == "chpasswd" or c[:3] == ("restic", "key", "add")
+                or (c[0].endswith("/hb") and c[1:3] == ("totp", "codes"))]
+
+    def test_a_destination_that_cant_take_the_kit_changes_nothing(self):
+        old_key = "# the kit made 2026-11-01\nssh-ed25519 AAAAold rescue kit\n"
+        with open(os.path.join(self.keydir, "rescue"), "w") as f:
+            f.write(old_key)
+        bg.save_state({"kit_made": "2026-11-01", "restic_key": "old"})
+        before = bg.load_state()
+        d = tempfile.mkdtemp()
+        os.mkdir(os.path.join(d, "real"))
+        os.symlink(os.path.join(d, "real"), os.path.join(d, "link"))
+        with open(os.path.join(d, "file"), "w"):
+            pass
+        for to in (f"{d}/link/kit", f"{d}/no/such/kit", f"{d}/file/kit"):
+            self.assertEqual(bg.do_kit(cfg(), to), 2, to)
+            self.assertEqual(self.rotations(), [], to)                  # no key, password, codes or backup key
+            with open(os.path.join(self.keydir, "rescue")) as f:
+                self.assertEqual(f.read(), old_key, to)
+            self.assertEqual(bg.load_state(), before, to)
+        self.assertEqual(os.listdir(os.path.join(d, "real")), [])
+        self.assertFalse([x for x in os.listdir(bg.util.state_dir("breakglass")) if x.startswith("kit-")])
+
+    def test_a_failed_delivery_keeps_the_new_kit(self):
+        real = bg.kit_put
+        self.addCleanup(setattr, bg, "kit_put", real)
+
+        def full(dfd, name, *a, **kw):
+            if name == "kit.html":
+                raise OSError(28, "No space left on device")
+            real(dfd, name, *a, **kw)
+        bg.kit_put = full
+        self.assertEqual(bg.do_kit(cfg(), self.out), 2)
+        self.assertFalse(os.path.exists(self.out))                       # nothing half-written left there
+        staged = bg.load_state()["kit_dir"]
+        self.assertTrue(staged.startswith(bg.util.state_dir("breakglass")), staged)
+        self.assertEqual(sorted(os.listdir(staged)),
+                         ["kit.html", "kit.txt", "rescue.key", "rescue.key.pub", "secrets.json"])
+        self.assertEqual(stat.S_IMODE(os.stat(staged).st_mode), 0o700)
+        self.assertIn(f"kit files still on the server: {staged}", bg.kit_verdict(cfg())[1])
+        self.assertNotIn("rotation", bg.load_state())                     # the kit is whole, just not delivered
+        self.assertEqual(self.notes[-1][:2], ("warn", "breakglass.kit"))
+
+    def failing_write(self, suffix):
+        """util.write_atomic, refusing paths that end in suffix with a full disk."""
+        real = bg.util.write_atomic
+        self.addCleanup(setattr, bg.util, "write_atomic", real)
+
+        def write(path, *a, **kw):
+            if path.endswith(suffix):
+                raise OSError(28, "No space left on device")
+            return real(path, *a, **kw)
+        bg.util.write_atomic = write
+        return lambda: setattr(bg.util, "write_atomic", real)
+
+    def test_a_failed_write_while_staging_keeps_what_was_made(self):
+        undo = self.failing_write("/kit.html")
+        self.assertEqual(bg.do_kit(cfg(), self.out), 2)
+        self.assertTrue(self.rotations())                                 # the credentials did change
+        rot = bg.load_state()["rotation"]
+        staged = rot["staging"]
+        self.assertTrue(set(os.listdir(staged)) >= {"rescue.key", "rescue.key.pub", "secrets.json", "kit.txt"})
+        with open(os.path.join(staged, "secrets.json")) as f:
+            secrets = json.load(f)
+        self.assertEqual(len(secrets["codes"]), 10)
+        self.assertTrue(secrets["password"] and secrets["phrase"] and secrets["restic_password"])
+        rc, line = bg.kit_verdict(cfg())
+        self.assertEqual(rc, 2)                                           # never "ok" after a half rotation
+        self.assertIn(f"didn't finish; what was made is in {staged}", line)
+        self.assertEqual(self.notes[-1][:2], ("fail", "breakglass.kit"))
+        self.assertFalse(os.path.exists(self.out))
+        # the next run makes a whole kit, clears the record and the earlier try's secrets
+        undo()
+        self.assertEqual(bg.do_kit(cfg(), self.out + "2"), 0)
+        self.assertNotIn("rotation", bg.load_state())
+        self.assertFalse(os.path.exists(staged))
+        self.assertNotEqual(bg.kit_verdict(cfg())[0], 2)
+
+    def test_two_unfinished_runs_are_both_named(self):
+        undo = self.failing_write("/kit.html")
+        self.assertEqual(bg.do_kit(cfg(), self.out), 2)
+        first = bg.load_state()["rotation"]["staging"]
+        self.assertEqual(bg.do_kit(cfg(), self.out + "2"), 2)
+        rc, line = bg.kit_verdict(cfg())
+        self.assertIn(first, line)
+        undo()
+        self.assertEqual(bg.do_kit(cfg(), self.out + "3"), 0)
+        self.assertFalse(os.path.exists(first))
+
+    def test_nothing_changes_if_the_secrets_cant_be_written_down(self):
+        bg.save_state({"kit_made": "2026-11-01", "restic_key": "old"})
+        before = bg.load_state()
+        self.failing_write("/secrets.json")
+        self.assertEqual(bg.do_kit(cfg(), self.out), 2)
+        self.assertEqual(self.rotations(), [])
+        self.assertEqual(bg.load_state(), before)
+        self.assertFalse([x for x in os.listdir(bg.util.state_dir("breakglass")) if x.startswith("kit-")])
+        self.assertFalse(os.path.exists(self.out))
 
     def test_kit_refused_before_hb_ssh(self):
         bg.KEYDIR = "/elsewhere"

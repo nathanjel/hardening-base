@@ -166,10 +166,10 @@ def check_k8s(cfg):
         pods = None
     if pods is None:
         return FAIL, "cannot list pods"
-    parents = {}
+    ctl = None
     if any(p.get("status", {}).get("reason") == "Evicted" for p in pods):
-        parents = replicaset_parents()
-    bad, evicted, fine = pod_states(pods, parents)
+        ctl = controllers()
+    bad, evicted, fine = pod_states(pods, ctl)
     left = (f"; {evicted} evicted pods left over (kubectl delete pod -A --field-selector=status.phase=Failed)"
             if evicted else "")
     if bad:
@@ -177,44 +177,67 @@ def check_k8s(cfg):
     return (WARN if evicted else OK), f"node Ready, {fine} pods fine" + left
 
 
-def replicaset_parents():
-    """{ReplicaSet uid: its Deployment's uid}, so pods from before and after a rollout count as one workload."""
-    rc, out = run(*KUBECTL, "get", "replicasets", "-A", "-o", "json")
+CONTROLLERS = "deployments,replicasets,statefulsets,daemonsets,jobs"
+
+
+def controllers():
+    """{uid: controller as kubectl gives it} for everything that owns pods, or None if unreadable."""
+    rc, out = run(*KUBECTL, "get", CONTROLLERS, "-A", "-o", "json")
     try:
-        items = json.loads(out)["items"] if rc == 0 else []
+        items = json.loads(out)["items"] if rc == 0 else None
     except (ValueError, KeyError):
-        items = []
-    parents = {}
-    for rs in items:
-        meta = rs.get("metadata", {})
-        refs = meta.get("ownerReferences") or []
-        ref = next((r for r in refs if r.get("controller")), None)
-        if ref and meta.get("uid"):
-            parents[meta["uid"]] = ref.get("uid")
-    return parents
+        items = None
+    return None if items is None else {c["metadata"]["uid"]: c for c in items if c.get("metadata", {}).get("uid")}
 
 
-def workload(p, parents):
-    """The uid of what runs this pod (its controller, or the Deployment above that), or None."""
-    refs = p.get("metadata", {}).get("ownerReferences") or []
-    ref = next((r for r in refs if r.get("controller")), None)
-    return parents.get(ref.get("uid"), ref.get("uid")) if ref else None
+def controller_ref(obj):
+    refs = obj.get("metadata", {}).get("ownerReferences") or []
+    return next((r for r in refs if r.get("controller")), None)
 
 
-def pod_states(pods, parents=None):
+def recovered(p, ctl):
+    """(True, "") when what runs this pod has as many pods available as it wants again, else (False, why).
+    A sibling pod being up is not enough: one replica of three, or db-0 without db-1, is not recovered."""
+    ref = controller_ref(p)
+    if not ref:
+        return False, "and no controller to replace it"
+    if ctl is None:
+        return False, "and its controller couldn't be read"
+    c = ctl.get(ref.get("uid"))
+    if c and c.get("kind") == "ReplicaSet":
+        up = controller_ref(c)                        # a Deployment's: judge the Deployment (rollouts included)
+        if up and up.get("uid") in ctl:
+            c = ctl[up["uid"]]
+    if not c:
+        return False, f"and its {ref.get('kind', 'controller')} {ref.get('name', '')} is gone"
+    kind, name, spec, st = c.get("kind"), c["metadata"].get("name"), c.get("spec", {}), c.get("status", {})
+    if kind in ("Deployment", "ReplicaSet", "StatefulSet"):
+        want = spec.get("replicas", 1)
+        have = st.get("availableReplicas", st.get("readyReplicas", 0)) or 0
+    elif kind == "DaemonSet":
+        want, have = st.get("desiredNumberScheduled", 0), st.get("numberAvailable", 0) or 0
+    elif kind == "Job":
+        want, have = spec.get("completions", 1) or 1, st.get("succeeded", 0) or 0
+    else:
+        return False, f"and hb can't tell whether {kind} {name} replaced it"
+    if have >= want:
+        return True, ""
+    return False, f"{kind} {name} has {have} of {want} available"
+
+
+def pod_states(pods, ctl=None):
     """([pods that are down, as "ns/name why have/want"], evicted pods left over, pods fine).
 
     A pod the kubelet evicted (disk or memory pressure) stays as a Failed record. Once
-    its workload runs again (a pod of the same controller, or of the same Deployment
-    after a rollout, is up or has completed), the record is only worth a warning; an
-    evicted pod nothing has replaced is a pod that is down."""
-    parents = parents or {}
-    bad, evicted, fine, up = [], [], 0, set()
+    its controller has all the pods it wants available again (the Deployment above a
+    ReplicaSet, so rollouts count; a StatefulSet's replicas; a DaemonSet's nodes; a
+    Job's completions), the record is only worth a warning. Otherwise the evicted pod
+    is a pod that is down."""
+    bad, evicted, fine = [], [], 0
     for p in pods:
         st, meta = p.get("status", {}), p.get("metadata", {})
         phase = st.get("phase")
         if phase == "Succeeded":
-            up.add(workload(p, parents))
             continue
         if phase == "Failed" and st.get("reason") == "Evicted":
             evicted.append(p)
@@ -224,18 +247,17 @@ def pod_states(pods, parents=None):
         want = len(cs) or len(p.get("spec", {}).get("containers", []))
         if phase == "Running" and cs and ready == want:
             fine += 1
-            up.add(workload(p, parents))
             continue
         why = next((c["state"]["waiting"].get("reason") for c in cs if "waiting" in c.get("state", {})), None)
         bad.append(f"{meta.get('namespace')}/{meta.get('name')} {why or st.get('reason') or phase} {ready}/{want}")
     left = 0
     for p in evicted:
-        meta, w = p.get("metadata", {}), workload(p, parents)
-        if w is not None and w in up:
+        ok, why = recovered(p, ctl)
+        if ok:
             left += 1
         else:
-            bad.append(f"{meta.get('namespace')}/{meta.get('name')} Evicted, "
-                       + ("nothing has replaced it" if w else "and no controller to replace it"))
+            meta = p.get("metadata", {})
+            bad.append(f"{meta.get('namespace')}/{meta.get('name')} Evicted, {why}")
     return bad, left, fine
 
 
