@@ -14,7 +14,7 @@ status = load_tool("status")
 
 
 def cfg(**over):
-    c = {"sms_command": [], "sms_fallback": [], "sms_per_day": 5, "repeat_hours": 24, "retry_minutes": 60}
+    c = {"name": "", "sms_command": [], "sms_fallback": [], "sms_per_day": 5, "repeat_hours": 24, "retry_minutes": 60}
     c.update(over)
     return c
 
@@ -39,6 +39,11 @@ class NotifyTest(unittest.TestCase):
         self.assertTrue(t.isascii())
         self.assertIn("FAIL health.raid: degraded: md2", t)
         self.assertTrue(t.endswith("..."))
+
+    def test_texts_start_with_the_box_name(self):
+        self.assertTrue(notify.sms_text("fail", "health.k8s", "x", "sandbox").startswith("sandbox FAIL health.k8s: x"))
+        host = notify.socket.gethostname().split(".")[0]
+        self.assertTrue(notify.sms_text("fail", "health.k8s", "x").startswith(f"{host} FAIL"))   # unset: the hostname
 
     def test_same_key_once_per_repeat_window(self):
         c = cfg(sms_command=self.sender)

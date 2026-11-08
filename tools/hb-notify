@@ -67,8 +67,9 @@ def trouble(p, what, key, error):
     util.write_json(p["trouble"], {"ts": int(time.time()), "what": what, "key": key, "error": error})
 
 
-def sms_text(level, key, text):
-    host = socket.gethostname().split(".")[0]
+def sms_text(level, key, text, name=""):
+    """One SMS: the box's name (notify.name, else the short hostname), the level, the key, the text."""
+    host = name or socket.gethostname().split(".")[0]
     line = f"{host} {level.upper()} {key}: {' '.join(text.split())}"
     line = line.encode("ascii", "replace").decode()
     return line if len(line) <= SMS_CHARS else line[:SMS_CHARS - 3] + "..."
@@ -140,7 +141,7 @@ def cmd_send(cfg, level, key, text):
     with util.Lock(p["lock"]):
         record(level, key, text)
         if level == "fail" and cfg["sms_command"]:
-            queue(p, cfg, key, sms_text(level, key, text))
+            queue(p, cfg, key, sms_text(level, key, text, cfg["name"]))
             flush(p, cfg)
     refresh_banner()
     return 0
@@ -153,7 +154,7 @@ def cmd_test(cfg):
     p = paths()
     with util.Lock(p["lock"]):
         record("info", "notify.test", "test SMS requested")
-        queue(p, cfg, "notify.test", sms_text("info", "notify", "test message from hb"), force=True)
+        queue(p, cfg, "notify.test", sms_text("info", "notify", "test message from hb", cfg["name"]), force=True)
         flush(p, cfg)
         left = util.read_json(p["outbox"], [])
     stuck = [m for m in left if m["key"] == "notify.test"]
@@ -178,7 +179,7 @@ def cmd_test_fallback(cfg):
     p = paths()
     with util.Lock(p["lock"]):
         record("info", "notify.test", "test SMS by the fallback requested")
-        rc, _, err = util.run(*cfg["sms_fallback"], input=sms_text("info", "notify", "test of the fallback route")
+        rc, _, err = util.run(*cfg["sms_fallback"], input=sms_text("info", "notify", "test of the fallback route", cfg["name"])
                               + "\n", timeout=60)
         if rc == 0:
             sent = util.read_json(p["sent"], [])

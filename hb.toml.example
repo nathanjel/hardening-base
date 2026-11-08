@@ -42,6 +42,7 @@ keep_days = 14                # hb snapshot check warns about older ones. A snap
 timers = []                   # e.g. ["hb-status", "hb-backup", "hb-backup-maintain", "hb-clean"]
 
 [notify]
+name = ""                     # how this box's texts start; empty: its short hostname
 sms_command = []              # argv that gets the text on stdin and exits 0 once queued,
                               # e.g. ["/usr/local/bin/send-sms", "<your number>"]; empty: banner only
 sms_fallback = []             # tried when sms_command fails: a route that doesn't share its failures, e.g.

@@ -46,6 +46,7 @@ DEFAULTS = {
         "timers": [],
     },
     "notify": {
+        "name": "",
         "sms_command": [],
         "sms_fallback": [],
         "sms_per_day": 5,
