@@ -35,7 +35,7 @@ timers run) and the config to `/etc/hb/hb.toml`.
 | `hb-wg` | WireGuard endpoint for your PCs: config from `hb.toml`, each PC keeps its own private key |
 | `hb-fw` | firewalld zones from `hb.toml`, applied with a revert timer you cancel from a new session |
 | `hb-probe` | stdlib-only outside scan (TCP and a few UDP services) to run from another network |
-| `hb-ssh` | who may log in and how: root-owned keys from `hb.toml`, one allowed group, key plus code from the internet and key only over WireGuard; applied with a revert timer |
+| `hb-ssh` | who may log in and how: root-owned keys from `hb.toml`, one allowed group, key plus code from the internet and key only over WireGuard; applied with a revert timer, and checked against what sshd itself says it would do (`sshd -T`) |
 | `hb-totp` | the code behind the key: RFC 6238 codes from an authenticator app and single-use recovery codes, checked by PAM through `pam_exec` |
 | `hb-webshell` | your shell (tmux) in a browser: over WireGuard always, from the internet only for a window you open (`hb webshell open 2h`); own password and code, rate limits, stdlib daemon, pinned xterm.js |
 | `hb-upgrade` | nightly dnf upgrade and held snap refresh, a pre-upgrade snapshot, a reboot only when needed and nobody is working (`busy.d`) |

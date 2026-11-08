@@ -21,10 +21,19 @@ What it manages:
   /etc/pam.d/sshd                  with ssh.codes, the code check takes the place
                                    of Fedora's password step
 
-After apply, the previous files come back by themselves after
-ssh.revert_minutes unless `hb ssh confirm` runs first. Sessions already open
-stay open either way. apply refuses when the person running it has no key in
-ssh.keys, or, with ssh.codes, when someone listed isn't enrolled in hb totp.
+The drop-in also switches off every other way sshd can accept a key: a key
+command, principals, certificate authorities, host-based login. sshd keeps the
+first value it reads, but a Match block in another file still wins, an earlier
+file comes first, and AllowGroups lines add up. So apply (before it reloads
+sshd) and check ask sshd itself (sshd -T) what it would do for each user from
+the internet and from each ssh.key_only_from network, answered on the address
+this box would use, and fail on any difference, naming the files that set it.
+
+apply starts the revert timer before it changes anything, the group included:
+after ssh.revert_minutes the previous files and the group's previous members
+come back unless `hb ssh confirm` runs first. Sessions already open stay open
+either way. apply refuses when the person running it has no key in ssh.keys,
+or, with ssh.codes, when someone listed isn't enrolled in hb totp.
 
 Config ([ssh] in hb.toml): keys ("USER TYPE KEY [COMMENT]"), codes,
 key_only_from, revert_minutes.
@@ -32,6 +41,7 @@ key_only_from, revert_minutes.
 import base64
 import binascii
 import difflib
+import glob
 import grp
 import hashlib
 import ipaddress
@@ -45,7 +55,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.
 from hbkit import config, guard, util  # noqa: E402
 
 KEYDIR = "/etc/ssh/authorized_keys"
+SSHD_CONFIG = "/etc/ssh/sshd_config"
 DROPIN = "/etc/ssh/sshd_config.d/10-hb-ssh.conf"
+SSHD = ["sshd"]                                        # tests add -f and -h
+INTERNET = (("the internet (IPv4)", "192.0.2.1"), ("the internet (IPv6)", "2001:db8::1"))  # documentation addresses
 PAM = "/etc/pam.d/sshd"
 GROUP = "hb-ssh"
 GUARD = guard.Guard("ssh")
@@ -168,6 +181,11 @@ def render_dropin(codes, key_only_from):
     lines = [HEADER,
              "# sshd reads its drop-ins in name order and keeps the first value it sees.",
              f"AuthorizedKeysFile {KEYDIR}/%u",
+             "AuthorizedKeysCommand none",
+             "AuthorizedPrincipalsFile none",
+             "AuthorizedPrincipalsCommand none",
+             "TrustedUserCAKeys none",
+             "HostbasedAuthentication no",
              f"AllowGroups {GROUP}",
              "PasswordAuthentication no",
              "PermitEmptyPasswords no",
@@ -203,7 +221,7 @@ def pam_want(text, codes):
 
 
 def describe_dropin(codes, key_only_from):
-    out = [f"keys only from {KEYDIR}/<user>, owned by root",
+    out = [f"keys only from {KEYDIR}/<user>, owned by root; no key command, principals, CAs or host-based login",
            f"only members of {GROUP}; no passwords, no GSSAPI, no X11 forwarding; 3 tries"]
     if codes:
         out.append("from the internet: the key, then a code from hb totp (the prompt says Password:)")
@@ -227,6 +245,103 @@ def not_root_owned(path):
         if p == os.path.dirname(p):
             return bad
         p = os.path.dirname(p)
+
+
+# --- what sshd itself would do ------------------------------------------------------
+
+OPTIONAL = {"gssapiauthentication"}                    # not printed by builds without GSSAPI
+
+
+def wanted(codes, key_only):
+    """sshd -T's lines (lower-case keys) that hb's drop-in promises for one kind of client."""
+    w = {"authorizedkeysfile": f"{KEYDIR}/%u", "authorizedkeyscommand": "none",
+         "authorizedprincipalsfile": "none", "authorizedprincipalscommand": "none",
+         "trustedusercakeys": "none", "hostbasedauthentication": "no", "pubkeyauthentication": "yes",
+         "passwordauthentication": "no", "permitemptypasswords": "no", "allowgroups": GROUP,
+         "gssapiauthentication": "no", "x11forwarding": "no", "maxauthtries": "3"}
+    if codes and not key_only:
+        w.update(authenticationmethods="publickey,keyboard-interactive:pam",
+                 kbdinteractiveauthentication="yes", usepam="yes")
+    else:
+        w["authenticationmethods"] = "publickey"
+    return w
+
+
+def local_addr(peer):
+    """The address this box would answer peer from, or None when there's no route."""
+    rc, out, _ = util.run("ip", "-o", "route", "get", peer)
+    m = re.search(r"\bsrc (\S+)", out) if rc == 0 else None
+    return m.group(1) if m else None
+
+
+def sshd_view(spec=None):
+    """({key: [values]}, None) from sshd -T, or (None, error)."""
+    rc, out, err = util.run(*SSHD, "-T", *(["-C", spec] if spec else []), timeout=30)
+    if rc != 0:
+        return None, ((err or out).strip().splitlines() or [f"exit {rc}"])[-1]
+    view = {}
+    for line in out.splitlines():
+        key, _, value = line.partition(" ")
+        view.setdefault(key, []).append(value.strip())
+    return view, None
+
+
+def clients(sv):
+    """[(where, peer address, key only)]: the internet, and one address in each key_only_from network."""
+    nets = [ipaddress.ip_network(n) for n in sv.get("nets", [])]
+    out = [(where, a, False) for where, a in INTERNET if not any(ipaddress.ip_address(a) in n for n in nets)]
+    for n in nets:                                     # the last host: the first is usually the box itself
+        out.append((str(n), str(n.broadcast_address - 1 if n.num_addresses > 2 else n.network_address), True))
+    return out
+
+
+def set_in(key):
+    """sshd config files other than hb's with a line for key (or a Match block), by name."""
+    files = [SSHD_CONFIG] + sorted(glob.glob(os.path.join(os.path.dirname(DROPIN), "*.conf")))
+    found = []
+    for path in files:
+        if path == DROPIN:
+            continue
+        try:
+            with open(path) as f:
+                words = {l.split()[0].lower() for l in f if l.strip() and not l.lstrip().startswith("#")}
+        except (OSError, IndexError):
+            continue
+        if key in words:
+            found.append(path)
+    return found
+
+
+def sshd_mismatches(cfg, sv):
+    """Where sshd's own view differs from what the drop-in promises: [text], empty when it holds."""
+    codes = cfg["ssh"]["codes"]
+    rescue = cfg["breakglass"]["user"]
+    users = sv.get("users", []) + ([rescue] if rescue and sv["group"] and rescue in sv["group"][1] else [])
+    plain, err = sshd_view()
+    if err:
+        return [f"sshd -T: {err}"]
+    lport = (plain.get("port") or ["22"])[0]
+    diffs = {}                                         # (key, have, want) -> ["nathan from ..."]
+    for where, peer, key_only in clients(sv):
+        laddr = local_addr(peer)
+        if laddr is None:
+            continue                                   # no route: such clients can't reach the box
+        for user in users:
+            view, err = sshd_view(f"user={user},host={peer},addr={peer},laddr={laddr},lport={lport}")
+            if err:
+                return [f"sshd -T for {user} from {where}: {err}"]
+            for key, want in wanted(codes, key_only).items():
+                if key not in view and key in OPTIONAL:
+                    continue
+                have = " ".join(view.get(key, ["(not set)"]))
+                if have != want:
+                    diffs.setdefault((key, have, want), []).append(f"{user} from {where}")
+    out = []
+    for (key, have, want), who in diffs.items():
+        where = sorted(set(set_in(key)) | set(set_in("match")))
+        out.append(f"{key} is {have!r} for {', '.join(who)}, hb wants {want!r}"
+                   + (f" (see {', '.join(where)})" if where else ""))
+    return out
 
 
 # --- survey -------------------------------------------------------------------------
@@ -409,9 +524,34 @@ def set_group(have, want):
     return None
 
 
+def restore_group(pend):
+    """Give the group the members it had before the change (or remove it again); error text or None."""
+    if "group_before" not in pend:                     # recorded by older versions without it
+        return None
+    before = pend["group_before"]
+    if before is None:
+        if group_members() is None:
+            return None
+        rc, _, err = util.run("groupdel", GROUP)
+        return None if rc == 0 else f"groupdel {GROUP}: {err.strip()}"
+    rc, _, err = util.run("gpasswd", "-M", ",".join(before), GROUP)
+    return None if rc == 0 else f"gpasswd {GROUP}: {err.strip()}"
+
+
 def reload_sshd():
     rc, _, err = util.run("systemctl", "reload", "sshd", timeout=60)
     return None if rc == 0 else f"systemctl reload sshd: {err.strip()}"
+
+
+def put_back(pend, by_timer=False):
+    """Undo a change: files, then the group, then sshd. [errors]."""
+    if not by_timer:
+        GUARD.stop_timer()
+    GUARD.restore(pend)
+    errs = [restore_group(pend)]
+    if pend.get("files"):
+        errs.append(reload_sshd())
+    return [e for e in errs if e]
 
 
 def do_apply(cfg, yes):
@@ -436,37 +576,38 @@ def do_apply(cfg, yes):
         print("nothing changed")
         return 1
 
-    # The group first: on its own it changes nothing (sshd doesn't look at it yet).
-    err = set_group(*sv["group"])
+    # The timer first, so that every change below, the group's members included, comes back on its own.
+    have, want = sv["group"]
+    paths = [f[0] for f in sv["files"]]
+    pend, err = GUARD.begin(paths, minutes, "put back an unconfirmed sshd change", files_changed=paths,
+                            group_before=None if have is None else sorted(have))
     if err:
-        print(f"{err}; nothing else changed")
+        print(f"{err}; nothing changed")
         return 2
-    if not sv["files"]:
-        print("group updated; no files to change")
-        return 0
-    pend, err = GUARD.begin([f[0] for f in sv["files"]], minutes, "put back an unconfirmed sshd change",
-                            files_changed=[f[0] for f in sv["files"]])
+    err = set_group(have, want)
+    if not err and sv["files"]:
+        os.makedirs(KEYDIR, mode=0o755, exist_ok=True)
+        os.chmod(KEYDIR, 0o755)
+        for path, _, new, mode, _ in sv["files"]:
+            if new is None:
+                os.unlink(path)
+            else:
+                util.write_atomic(path, new, mode=mode)
+        rc, out, e = util.run(*SSHD, "-t", timeout=30)
+        err = None if rc == 0 else f"sshd -t: {(out + e).strip()}"
+    if not err:
+        bad = sshd_mismatches(cfg, sv)
+        err = ("sshd would not do what hb promises:\n  " + "\n  ".join(bad)) if bad else None
+    if not err and sv["files"]:
+        err = reload_sshd()
     if err:
-        print(f"{err}; files unchanged")
-        return 2
-    os.makedirs(KEYDIR, mode=0o755, exist_ok=True)
-    os.chmod(KEYDIR, 0o755)
-    for path, _, want, mode, _ in sv["files"]:
-        if want is None:
-            os.unlink(path)
-        else:
-            util.write_atomic(path, want, mode=mode)
-    rc, out, err = util.run("sshd", "-t", timeout=30)
-    err = None if rc == 0 else f"sshd -t: {(out + err).strip()}"
-    err = err or reload_sshd()
-    if err:
-        print(f"{err}\nputting the old files back")
-        GUARD.stop_timer()
-        GUARD.restore(pend)
-        reload_sshd()
+        print(f"{err}\nputting everything back")
+        for e in put_back(pend):
+            print(e)
         return 2
 
-    print(f"\napplied; the old files come back at {guard.until_text(pend)} unless confirmed.")
+    print(f"\napplied; {'the old files and group come' if sv['files'] else 'the old group comes'} back at "
+          f"{guard.until_text(pend)} unless confirmed.")
     print("Keep this session open. Open a NEW session from the internet"
           + (" (key, then the 6-digit code at the Password: prompt)" if cfg["ssh"]["codes"] else ""))
     if sv.get("nets") and cfg["ssh"]["codes"]:
@@ -484,7 +625,8 @@ def do_confirm():
         print("nothing waiting for confirmation")
         return 0
     util.notify("info", "ssh.change", "sshd change confirmed")
-    print(f"confirmed. The previous files stay in {util.STATE}/backup/{pend.get('run')}/")
+    print("confirmed." + (f" The previous files stay in {util.STATE}/backup/{pend.get('run')}/"
+                          if any(pend.get("files", {}).values()) else ""))
     return 0
 
 
@@ -493,14 +635,11 @@ def do_revert(by_timer):
     if pend is None:
         print("nothing to revert")
         return 0
-    if not by_timer:
-        GUARD.stop_timer()
-    GUARD.restore(pend)
-    err = reload_sshd()
+    errs = put_back(pend, by_timer)
     text = "sshd change not confirmed in time: previous files restored" if by_timer else "sshd change reverted by hand"
-    util.notify("warn" if by_timer else "info", "ssh.revert", text + ("; reload failed" if err else ""))
-    print(text + (f"; {err}" if err else ""))
-    return 2 if err else 0
+    util.notify("warn" if by_timer else "info", "ssh.revert", text + ("; " + "; ".join(errs) if errs else ""))
+    print(text + ("; " + "; ".join(errs) if errs else ""))
+    return 2 if errs else 0
 
 
 def summary(cfg, sv):
@@ -526,6 +665,9 @@ def verdict(cfg):
     if pending_changes(sv):
         what = ([f"group {GROUP}"] if group_changes(sv["group"]) else []) + [f[0] for f in sv["files"]]
         return 1, "pending: " + ", ".join(what)
+    bad = sshd_mismatches(cfg, sv)
+    if bad:
+        return 2, "fail: sshd: " + bad[0] + (f"; and {len(bad) - 1} more (hb ssh status)" if len(bad) > 1 else "")
     return 0, "ok: " + summary(cfg, sv)
 
 
@@ -536,7 +678,10 @@ def do_status(cfg):
         return 0
     rc, line = verdict(cfg)
     print(line)
-    if rc:
+    if rc == 2 and line.startswith("fail: sshd: "):
+        for b in sshd_mismatches(cfg, sv):
+            print(f"    {b}")
+    elif rc:
         show_plan(sv)
     return rc
 

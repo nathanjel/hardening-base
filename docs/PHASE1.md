@@ -28,7 +28,8 @@ and copies whatever it changes to `/var/lib/hb/backup/<run>/` first.
 
     sudo ./hb snapshot create phase1
 
-This makes a read-only copy of `/`, kept for `snapshot.keep_days`. It needs `/` on btrfs. A file comes back with
+This makes a read-only copy of `/`, kept for `snapshot.keep_days`. It needs `/` on btrfs. It keeps everything
+deleted or rewritten after it on the same disk, so don't keep it longer than you need. A file comes back with
 `sudo cp -a /.hb-snapshots/phase1-<stamp>/etc/whatever /etc/whatever`.
 
 ## 2. Host doors

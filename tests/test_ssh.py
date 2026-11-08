@@ -30,6 +30,7 @@ session    include      postlogin
 FAKE = """#!/bin/sh
 echo "$(basename "$0") $*" >> {log}
 [ "$(basename "$0")" = sshd ] && [ -e {fail} ] && {{ echo "bad config"; exit 1; }}
+[ -e "{fail}.$(basename "$0")" ] && {{ echo "refused" >&2; exit 1; }}
 exit 0
 """
 
@@ -179,23 +180,91 @@ class PamStackTest(unittest.TestCase):
 
 @unittest.skipUnless(os.path.exists(SSHD), "no sshd")
 class SshdTest(unittest.TestCase):
-    """What sshd itself makes of the drop-in, per client address."""
+    """What sshd itself makes of the drop-in, per client address, and hb's check of that (real sshd -T)."""
 
-    def effective(self, dropin, addr):
-        d = tempfile.mkdtemp()
+    def setUp(self):
+        self.d = d = tempfile.mkdtemp()
         subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", f"{d}/hostkey"], check=True)
         os.makedirs(f"{d}/conf.d")
-        with open(f"{d}/conf.d/10-hb-ssh.conf", "w") as f:
-            f.write(dropin)
         with open(f"{d}/conf.d/50-redhat.conf", "w") as f:
             f.write("X11Forwarding yes\nGSSAPIAuthentication yes\nUsePAM yes\n")
         with open(f"{d}/main", "w") as f:
             f.write(f"Include {d}/conf.d/*.conf\nAuthorizedKeysFile .ssh/authorized_keys\n"
                     "Subsystem sftp /usr/libexec/openssh/sftp-server\n")
-        out = subprocess.run([SSHD, "-T", "-f", f"{d}/main", "-h", f"{d}/hostkey", "-C",
+        saved = {n: getattr(ssh, n) for n in ("SSHD", "SSHD_CONFIG", "DROPIN", "local_addr")}
+        self.addCleanup(lambda: [setattr(ssh, n, v) for n, v in saved.items()])
+        ssh.SSHD = [SSHD, "-f", f"{d}/main", "-h", f"{d}/hostkey"]
+        ssh.SSHD_CONFIG, ssh.DROPIN = f"{d}/main", f"{d}/conf.d/10-hb-ssh.conf"
+        # the box answers the internet on 198.51.100.7 / 2001:db8:1::7 and the tunnel on 10.77.0.1
+        ssh.local_addr = lambda peer: ("10.77.0.1" if peer.startswith("10.77.") else
+                                       "2001:db8:1::7" if ":" in peer else "198.51.100.7")
+
+    def write(self, name, text):
+        with open(f"{self.d}/conf.d/{name}", "w") as f:
+            f.write(text)
+
+    def effective(self, dropin, addr):
+        self.write("10-hb-ssh.conf", dropin)
+        out = subprocess.run([SSHD, "-T", "-f", f"{self.d}/main", "-h", f"{self.d}/hostkey", "-C",
                               f"user={ME},host=x,addr={addr},laddr=192.0.2.1,lport=22"],
                              capture_output=True, text=True, check=True).stdout
         return dict(line.split(" ", 1) for line in out.splitlines() if " " in line)
+
+    def mismatches(self, codes=True, dropin=None, files=None):
+        self.write("10-hb-ssh.conf", dropin or ssh.render_dropin(codes, ["10.77.0.0/24"]))
+        for name, text in (files or {}).items():
+            self.write(name, text)
+        cfg = {"ssh": {"codes": codes}, "breakglass": {"user": ""}}
+        sv = {"users": [ME], "nets": ["10.77.0.0/24"], "group": (None, {ME})}
+        return ssh.sshd_mismatches(cfg, sv)
+
+    def test_the_dropin_holds(self):
+        self.assertEqual(self.mismatches(codes=True), [])
+        self.assertEqual(self.mismatches(codes=False), [])
+
+    def test_later_globals_lose_to_the_pins(self):
+        later = ("AuthorizedKeysCommand /usr/bin/true\nAuthorizedKeysCommandUser nobody\n"
+                 "TrustedUserCAKeys /etc/ssh/ca.pub\nAuthorizedPrincipalsFile /etc/ssh/p/%u\n"
+                 "HostbasedAuthentication yes\n")
+        self.assertEqual(self.mismatches(files={"60-later.conf": later}), [])
+        # without the pins, the later file would have added those ways in
+        old = "\n".join(l for l in ssh.render_dropin(True, ["10.77.0.0/24"]).splitlines()
+                        if not l.startswith(("AuthorizedKeysCommand", "AuthorizedPrincipals", "TrustedUserCAKeys",
+                                             "HostbasedAuthentication"))) + "\n"
+        bad = " ".join(self.mismatches(dropin=old, files={"60-later.conf": later}))
+        for key in ("authorizedkeyscommand", "trustedusercakeys", "authorizedprincipalsfile", "hostbased"):
+            self.assertIn(key, bad)
+
+    def test_a_later_match_block_is_caught(self):
+        bad = self.mismatches(files={"60-later.conf": f"Match User {ME}\n    AuthorizedKeysCommand /usr/bin/true\n"
+                                                      "    AuthorizedKeysCommandUser nobody\n"})
+        self.assertEqual(len(bad), 1, bad)
+        self.assertIn("authorizedkeyscommand is '/usr/bin/true'", bad[0])
+        self.assertIn("the internet (IPv4)", bad[0])
+        self.assertIn("10.77.0.0/24", bad[0])
+        self.assertIn("60-later.conf", bad[0])
+
+    def test_a_match_on_the_tunnel_address_is_caught_there_only(self):
+        bad = self.mismatches(files={"60-later.conf": "Match LocalAddress 10.77.0.1\n    PasswordAuthentication yes\n"})
+        self.assertEqual(len(bad), 1, bad)
+        self.assertIn(f"{ME} from 10.77.0.0/24", bad[0])
+        self.assertNotIn("internet", bad[0])
+
+    def test_an_earlier_file_is_caught(self):
+        bad = self.mismatches(files={"05-early.conf": "TrustedUserCAKeys /etc/ssh/ca.pub\n"})
+        self.assertEqual(len(bad), 1, bad)
+        self.assertIn("trustedusercakeys", bad[0])
+        self.assertIn("05-early.conf", bad[0])
+
+    def test_allow_groups_add_up_and_are_caught(self):
+        bad = self.mismatches(files={"60-later.conf": "AllowGroups wheel\n"})
+        self.assertEqual(len(bad), 1, bad)
+        self.assertIn("allowgroups is 'hb-ssh wheel'", bad[0])
+
+    def test_sshd_errors_are_reported(self):
+        bad = self.mismatches(files={"60-later.conf": "NoSuchOption yes\n"})
+        self.assertEqual(len(bad), 1, bad)
+        self.assertTrue(bad[0].startswith("sshd -T: "), bad)
 
     def test_codes_except_from_wireguard(self):
         dropin = ssh.render_dropin(True, ["10.77.0.0/24"])
@@ -228,11 +297,11 @@ class ApplyTest(unittest.TestCase):
         bin_dir = os.path.join(root, "bin")
         os.makedirs(bin_dir)
         os.makedirs(os.path.join(root, "sshd_config.d"))
-        self.log, self.fail = os.path.join(root, "calls.log"), os.path.join(root, "fail")
-        for cmd in ("systemd-run", "systemctl", "sshd", "groupadd", "gpasswd"):
+        self.log, self.flag = os.path.join(root, "calls.log"), os.path.join(root, "fail")
+        for cmd in ("systemd-run", "systemctl", "sshd", "groupadd", "gpasswd", "groupdel"):
             p = os.path.join(bin_dir, cmd)
             with open(p, "w") as f:
-                f.write(FAKE.format(log=self.log, fail=self.fail))
+                f.write(FAKE.format(log=self.log, fail=self.flag))
             os.chmod(p, stat.S_IRWXU)
         self.addCleanup(os.environ.__setitem__, "PATH", os.environ["PATH"])
         os.environ["PATH"] = bin_dir + os.pathsep + os.environ["PATH"]
@@ -242,12 +311,15 @@ class ApplyTest(unittest.TestCase):
         with open(self.pam, "w") as f:
             f.write(FEDORA_PAM)
         saved = {n: getattr(ssh, n) for n in ("KEYDIR", "DROPIN", "PAM", "totp_missing", "not_root_owned",
-                                               "group_members")}
+                                               "group_members", "sshd_mismatches")}
         self.addCleanup(lambda: [setattr(ssh, n, v) for n, v in saved.items()])
         self.addCleanup(setattr, ssh.util, "notify", ssh.util.notify)
         self.notes = []
         ssh.util.notify = lambda *a: self.notes.append(a)
-        ssh.group_members = lambda: None                                 # no hb-ssh group yet
+        self.group = None                                                # no hb-ssh group yet
+        ssh.group_members = lambda: None if self.group is None else set(self.group)
+        self.mismatch = []                                               # sshd -T agrees (SshdTest checks it)
+        ssh.sshd_mismatches = lambda cfg, sv: list(self.mismatch)
         ssh.KEYDIR, ssh.DROPIN, ssh.PAM = (os.path.join(root, "authorized_keys"),
                                            os.path.join(root, "sshd_config.d", "10-hb-ssh.conf"), self.pam)
         self.missing = ""
@@ -295,7 +367,7 @@ class ApplyTest(unittest.TestCase):
         self.assertIn("hb-totp verify", self.read(self.pam))
 
     def test_rejected_config_is_put_back_at_once(self):
-        open(self.fail, "w").close()
+        open(self.flag, "w").close()
         self.assertEqual(ssh.do_apply(self.cfg, yes=True), 2)
         self.assertEqual(self.read(self.pam), FEDORA_PAM)
         self.assertFalse(os.path.exists(ssh.DROPIN))
@@ -311,6 +383,77 @@ class ApplyTest(unittest.TestCase):
         self.missing = ""
         self.assertEqual(ssh.do_apply(self.cfg, yes=True), 2)
         self.assertFalse(os.path.exists(self.log))                       # nothing ran at all
+
+    def lines(self):
+        return self.calls().splitlines()
+
+    def test_the_timer_comes_before_any_change(self):
+        self.assertEqual(ssh.do_apply(self.cfg, yes=True), 0)
+        names = [l.split()[0] for l in self.lines()]
+        self.assertLess(names.index("systemd-run"), names.index("groupadd"))
+
+    def test_no_timer_no_change(self):
+        open(self.flag + ".systemd-run", "w").close()
+        self.assertEqual(ssh.do_apply(self.cfg, yes=True), 2)
+        self.assertNotIn("groupadd", self.calls())
+        self.assertNotIn("gpasswd", self.calls())
+        self.assertEqual(self.read(self.pam), FEDORA_PAM)
+        self.assertFalse(os.path.exists(ssh.DROPIN))
+        self.assertIsNone(ssh.GUARD.pending())
+
+    def settled(self):
+        """Files as hb.toml wants them, confirmed; the group then has the members given."""
+        self.assertEqual(ssh.do_apply(self.cfg, yes=True), 0)
+        self.assertEqual(ssh.do_confirm(), 0)
+        self.group = {ME}
+        os.unlink(self.log)
+
+    def test_a_group_change_alone_waits_for_confirm_and_reverts(self):
+        self.settled()
+        self.group = {ME, "olduser"}                                     # someone added by hand
+        self.assertEqual(ssh.do_plan(self.cfg), 1)
+        self.assertEqual(ssh.do_apply(self.cfg, yes=True), 0)
+        self.assertIn("systemd-run --unit=hb-ssh-revert", self.calls())
+        self.assertIn(f"gpasswd -M {ME} hb-ssh", self.calls())
+        self.assertNotIn("reload", self.calls())                         # sshd reads groups at each login
+        self.assertEqual(ssh.verdict(self.cfg)[0], 1)                   # waiting for confirmation
+        self.assertEqual(ssh.do_revert(by_timer=True), 0)
+        self.assertEqual(self.lines()[-1], f"gpasswd -M {','.join(sorted([ME, 'olduser']))} hb-ssh")
+        self.assertIsNone(ssh.GUARD.pending())
+
+    def test_revert_removes_a_group_it_made(self):
+        self.assertEqual(ssh.do_apply(self.cfg, yes=True), 0)
+        self.group = {ME}                                                # what groupadd + gpasswd did
+        self.assertEqual(ssh.do_revert(by_timer=False), 0)
+        self.assertIn("groupdel hb-ssh", self.calls())
+        self.assertFalse(os.path.exists(ssh.DROPIN))
+
+    def test_a_failed_group_change_puts_back(self):
+        open(self.flag + ".gpasswd", "w").close()
+        self.assertEqual(ssh.do_apply(self.cfg, yes=True), 2)
+        self.assertIn("systemctl stop hb-ssh-revert.timer", self.calls())
+        self.assertFalse(os.path.exists(ssh.DROPIN))                    # never written
+        self.assertIsNone(ssh.GUARD.pending())
+
+    def test_what_sshd_would_do_decides_before_the_reload(self):
+        self.mismatch = ["authorizedkeyscommand is '/usr/bin/x' for you from the internet, hb wants 'none'"]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(ssh.do_apply(self.cfg, yes=True), 2)
+        self.assertIn("authorizedkeyscommand", out.getvalue())
+        self.assertEqual(self.read(self.pam), FEDORA_PAM)
+        self.assertFalse(os.path.exists(ssh.DROPIN))
+        self.assertIsNone(ssh.GUARD.pending())
+        self.assertEqual(self.calls().count("systemctl reload sshd"), 1)   # only the one after putting back
+
+    def test_check_asks_sshd_once_settled(self):
+        self.settled()
+        self.assertEqual(ssh.verdict(self.cfg)[0], 0)
+        self.mismatch = ["allowgroups is 'hb-ssh wheel' for you from the internet, hb wants 'hb-ssh'", "x"]
+        rc, line = ssh.verdict(self.cfg)
+        self.assertEqual(rc, 2)
+        self.assertTrue(line.startswith("fail: sshd: allowgroups"), line)
+        self.assertIn("1 more", line)
 
     def test_stray_key_file_goes(self):
         os.makedirs(ssh.KEYDIR)

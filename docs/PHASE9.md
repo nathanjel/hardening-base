@@ -5,7 +5,7 @@ An outside review of hb, cross-checked against the code, led to three parts:
 | Part | What | Status |
 |---|---|---|
 | 9a | Root and users: root stops acting with its own rights on things a user can change | this runbook |
-| 9b | SSH: rollback that covers group membership, the effective sshd settings checked | to follow |
+| 9b | SSH: rollback that covers group membership, the effective sshd settings checked | this runbook |
 | 9c | Honest reporting: backup coverage, a reboot check that can say "unknown", unmanaged tools listed | to follow |
 
 Keep a filled-in copy of this runbook in `local/`.
@@ -95,3 +95,93 @@ Close any public window, check out the previous commit, then:
 
     sudo ./hb install apply
     sudo hb webshell apply
+
+## 9b: SSH
+
+`hb ssh` promised "key from root's file, then a code; key alone over WireGuard",
+and checked that promise by comparing its own files' text. Two gaps:
+
+- **The rollback.** The `hb-ssh` group changed before the revert timer started.
+  A change to the group alone started no timer, and a revert brought the files
+  back but not the members.
+- **sshd's own view.** sshd keeps the first value it reads for most settings, so
+  hb's `10-` drop-in wins against later files' plain lines. But a `Match` block in
+  a later file still wins, a file that sorts before `10-` comes first, and
+  `AllowGroups` lines add up rather than the first one winning. hb never
+  said which way of accepting keys sshd should leave out, either.
+
+| Piece | What changes |
+|---|---|
+| Rollback | the timer starts before anything changes, the group's members are saved with the files, a revert puts them back (and removes the group if apply made it). A change to the group alone waits for `hb ssh confirm` too |
+| The drop-in | five more lines: no key command, no principals file or command, no certificate authorities, no host-based login |
+| sshd's own view | `apply` (before it reloads sshd) and `check` run `sshd -T` for each user, once per kind of client: from the internet (IPv4 and IPv6) and from each `ssh.key_only_from` network, with the local address this box would answer on. Any difference from what hb promises fails, with the files that set it |
+
+**Risk.** Medium, as with any sshd change: one apply with the revert timer, so
+keep a session open and confirm from a new one.
+
+### 0. Before you start
+
+    sudo ls /etc/ssh/sshd_config.d/                   # which drop-ins exist besides hb's
+    sudo sh -c "grep -il '^[[:space:]]*match' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf"
+                                   # sh -c: the folder is root's, so the * has to expand as root
+
+Work in tmux and keep a second session open.
+
+### 1. Install
+
+    sudo ./hb install apply        # y to code
+    sudo hb ssh check              # pending: /etc/ssh/sshd_config.d/10-hb-ssh.conf
+
+### 2. Apply
+
+    sudo hb ssh plan               # + AuthorizedKeysCommand none, ... (five lines)
+    sudo hb ssh apply              # y; it asks sshd first, then reloads
+
+If sshd would do something else, apply says what and where, and puts
+everything back at once.
+
+### 3. Confirm from new sessions
+
+From the internet (key, then the code at the Password: prompt), and over
+WireGuard (key only). In one of them:
+
+    sudo hb ssh confirm
+
+### 4. Check
+
+    sudo hb ssh check              # ok: <users>; key + code, key only from <networks>
+    sudo hb check
+
+From now on `hb check` asks sshd every time. A drop-in that some package adds
+later and that changes one of these settings shows up as a failure, with its file
+named. `sudo hb ssh status` lists every difference.
+
+### Rolling back
+
+Within the revert time: `sudo hb ssh revert`. Later: check out the previous
+commit, `sudo ./hb install apply`, `sudo hb ssh apply` (same timer, same confirm).
+
+## Snapshots on a busy disk
+
+A btrfs snapshot of `/` keeps every block that was deleted or rewritten after
+it, on the same disk. On a box whose disk churns (build caches, container
+images, a cleanup), a few days of snapshots can hold more than the cleanup
+frees. Moving them to the backup share isn't possible: a snapshot is part of
+the filesystem it was taken from, and sending one elsewhere needs a parent kept
+locally. The off-disk copy with its own retention is the restic backup.
+
+| Setting | Effect |
+|---|---|
+| `upgrade.snapshot_days = 0` | no snapshot before the nightly upgrade, and any old `upgrade-*` ones go at the next run. The night's backup (before the upgrade) is the way back |
+| `snapshot.keep_days = 1` | snapshots you take by hand (`hb snapshot create`) show as a warning in `hb check` after a day |
+| `hb snapshot delete NAME` | removes one now |
+
+`hb backup` still reads from a snapshot it deletes when the run ends; that one
+costs little, because it only lives for the length of the backup.
+
+    sudo ./hb install apply        # y to code and config
+    sudo hb snapshot list
+    sudo hb snapshot prune         # everything older than keep_days
+    sudo hb snapshot delete <name> # any newer one, as listed
+    sudo btrfs subvolume sync /    # waits until btrfs has freed the space
+    df -h /

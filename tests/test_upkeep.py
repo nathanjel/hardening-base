@@ -150,6 +150,17 @@ class UpgradeTest(unittest.TestCase):
         deleted = [x[3] for x in self.fake.calls if x[:3] == ("btrfs", "subvolume", "delete")]
         self.assertEqual([os.path.basename(p) for p in deleted], [f"upgrade-{old}"])
 
+    def test_zero_days_means_no_snapshot_and_none_left(self):
+        c = cfg(snapshot_days=0)
+        old = (datetime.datetime.now() - datetime.timedelta(days=5)).strftime("%Y%m%d-%H%M")
+        new = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+        for n in (f"upgrade-{old}", f"upgrade-{new}", f"phase1-{old}"):
+            os.mkdir(os.path.join(c["snapshot"]["dir"], n))
+        up.snapshot(c)
+        self.assertFalse(any("create" in x for x in self.fake.calls), self.fake.calls)
+        deleted = sorted(os.path.basename(x[3]) for x in self.fake.calls if x[:3] == ("btrfs", "subvolume", "delete"))
+        self.assertEqual(deleted, sorted([f"upgrade-{old}", f"upgrade-{new}"]))   # hb snapshot's own stay
+
     def test_hold(self):
         self.assertEqual(up.do_hold("2h"), 0)
         r = subprocess.run([os.path.join(BUSY, "hold")], env={**os.environ, "HB_STATE": up.util.STATE},
@@ -160,6 +171,68 @@ class UpgradeTest(unittest.TestCase):
         up.do_hold("off")
         r = subprocess.run([os.path.join(BUSY, "hold")], env={**os.environ, "HB_STATE": up.util.STATE})
         self.assertEqual(r.returncode, 0)
+
+
+def can_fake_root():
+    return shutil.which("unshare") is not None and subprocess.run(
+        ["unshare", "-r", "true"], capture_output=True).returncode == 0
+
+
+@unittest.skipUnless(can_fake_root(), "needs unprivileged user namespaces (unshare -r)")
+class SnapshotToolTest(unittest.TestCase):
+    """tools/hb-snapshot as (namespace) root, with btrfs faked: prune and delete."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.snaps, self.bin = os.path.join(self.d, "snaps"), os.path.join(self.d, "bin")
+        os.makedirs(self.snaps)
+        os.makedirs(self.bin)
+        self.log = os.path.join(self.d, "btrfs.log")
+        with open(os.path.join(self.bin, "btrfs"), "w") as f:
+            f.write(f'#!/bin/sh\necho "$*" >> {self.log}\n'
+                    '[ "$1 $2" = "subvolume delete" ] && rmdir "$3"\nexit 0\n')
+        os.chmod(os.path.join(self.bin, "btrfs"), 0o755)
+        self.toml = os.path.join(self.d, "hb.toml")
+        with open(self.toml, "w") as f:
+            f.write(f'[snapshot]\ndir = "{self.snaps}"\nkeep_days = 1\n')
+        now = datetime.datetime.now()
+        self.old = f"phase1-{(now - datetime.timedelta(days=8)).strftime('%Y%m%d-%H%M')}"
+        self.new = f"upgrade-{now.strftime('%Y%m%d-%H%M')}"
+        for n in (self.old, self.new, "backup-run"):
+            os.mkdir(os.path.join(self.snaps, n))
+
+    def tool(self, *args):
+        env = {**os.environ, "HB_CONFIG": self.toml, "PATH": self.bin + os.pathsep + os.environ["PATH"]}
+        return subprocess.run(["unshare", "-r", os.path.join(REPO, "tools", "hb-snapshot"), *args],
+                              env=env, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+                              start_new_session=True)   # no terminal: confirm can't prompt anyone
+
+    def left(self):
+        return sorted(os.listdir(self.snaps))
+
+    def test_check_warns_and_prune_takes_only_the_old(self):
+        r = self.tool("check")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("1 snapshots older than 1 days", r.stdout)
+        self.assertEqual(self.tool("prune", "--yes").returncode, 0)
+        self.assertEqual(self.left(), sorted([self.new, "backup-run"]))
+
+    def test_delete_one(self):
+        r = self.tool("delete", self.new, "--yes")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.left(), sorted([self.old, "backup-run"]))
+
+    def test_delete_refuses_what_isnt_a_snapshot(self):
+        for name in ("backup-run", "../x-20261108-0430", "nope-20261108-0430", ""):
+            r = self.tool("delete", name, "--yes")
+            self.assertEqual(r.returncode, 2, (name, r.stdout, r.stderr))
+        self.assertFalse(os.path.exists(self.log))
+        self.assertEqual(len(self.left()), 3)
+
+    def test_delete_asks(self):
+        r = self.tool("delete", self.new)                # no tty, no --yes: no
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn(self.new, self.left())
 
 
 class BusyChecksTest(unittest.TestCase):

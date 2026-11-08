@@ -16,7 +16,9 @@ Items:
 
 Each night, once:
   1. a read-only snapshot of / (hb snapshot, label "upgrade"), kept
-     upgrade.snapshot_days
+     upgrade.snapshot_days. A snapshot keeps everything deleted or rewritten
+     after it, so on a busy disk set 0: no snapshot, old ones go, and the
+     night's backup is the way back
   2. dnf upgrade --refresh -y (Fedora, Docker, any repo you added)
   3. snap refresh of upgrade.snaps, only when the box is idle
   4. a reboot when dnf needs-restarting -r asks for one (or a newer kernel is
@@ -113,14 +115,18 @@ def changes(before, after):
 
 
 def snapshot(cfg):
-    """A read-only snapshot before the upgrade; older "upgrade" ones beyond snapshot_days go."""
-    rc, out, err = util.run(util.HB, "snapshot", "create", "upgrade", timeout=300)
-    if rc:
-        log(f"snapshot failed (going on without it): {(err or out).strip()[:200]}")
-    else:
-        m = re.search(r"in '([^']+)'", out)
-        log(f"snapshot: {m.group(1) if m else 'taken'}")
+    """A read-only snapshot before the upgrade; older "upgrade" ones beyond snapshot_days go.
+    snapshot_days = 0: none is taken, and every "upgrade" one goes."""
     d, keep = cfg["snapshot"]["dir"], cfg["upgrade"]["snapshot_days"]
+    if keep <= 0:
+        log("no snapshot (upgrade.snapshot_days = 0); the night's backup is the way back")
+    else:
+        rc, out, err = util.run(util.HB, "snapshot", "create", "upgrade", timeout=300)
+        if rc:
+            log(f"snapshot failed (going on without it): {(err or out).strip()[:200]}")
+        else:
+            m = re.search(r"in '([^']+)'", out)
+            log(f"snapshot: {m.group(1) if m else 'taken'}")
     cutoff = datetime.datetime.now() - datetime.timedelta(days=keep)
     try:
         names = os.listdir(d)

@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # hb-snapshot — read-only btrfs snapshots of / to take before risky changes.
-# A snapshot costs almost nothing at first and grows as files change after it.
+# A snapshot costs almost nothing at first, then keeps everything deleted or
+# rewritten after it, on the same disk: on a busy box, keep them for a day or two.
 #
 #   hb snapshot create LABEL   e.g. hb snapshot create phase1
 #   hb snapshot list
 #   hb snapshot prune [--yes]  delete snapshots older than snapshot.keep_days
+#   hb snapshot delete NAME [--yes]   delete one, e.g. upgrade-20261108-0430
 #   hb snapshot check          warn when old snapshots are waiting to be pruned
+#
+# btrfs frees the space in the background; `btrfs subvolume sync /` waits for it.
 #
 # Snapshots live in snapshot.dir (default /.hb-snapshots), named LABEL-YYYYmmdd-HHMM.
 # To get a file back: cp -a /.hb-snapshots/<name>/etc/whatever /etc/whatever
@@ -49,11 +53,19 @@ case "${1:-list}" in
     confirm "delete these ${#old[@]} snapshots?" || exit 1
     for s in "${old[@]}"; do btrfs subvolume delete "$s"; done
     ;;
+  delete)
+    name="${2:-}"
+    [[ $name =~ ^[a-z0-9][a-z0-9-]*-[0-9]{8}-[0-9]{4}$ ]] || die "usage: hb snapshot delete NAME (as hb snapshot list shows it)"
+    [ -d "$DIR/$name" ] || die "no snapshot $name in $DIR"
+    [ "${3:-}" = --yes ] && HB_YES=1
+    confirm "delete $DIR/$name?" || exit 1
+    btrfs subvolume delete "$DIR/$name"
+    ;;
   check)
     n="$(old_snapshots | wc -l)"
     if [ "$n" -gt 0 ]; then echo "warn: $n snapshots older than $KEEP_DAYS days (hb snapshot prune)"; exit 1; fi
     echo "ok: $(find "$DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l) snapshots"
     ;;
   help|-h|--help) sed -n '2,/^$/s/^# \{0,1\}//p' "$0" ;;
-  *) die "unknown verb '$1' (create, list, prune, check)" ;;
+  *) die "unknown verb '$1' (create, list, prune, delete, check)" ;;
 esac

@@ -33,7 +33,8 @@ nvme_wear_warn_pct = 80       # warn when an NVMe drive reports this much wear
 
 [snapshot]
 dir = "/.hb-snapshots"
-keep_days = 14
+keep_days = 14                # hb snapshot check warns about older ones. A snapshot keeps everything
+                              # deleted after it on the same disk: on a busy disk, 1 or 2
 
 [install]
 timers = []                   # e.g. ["hb-status", "hb-backup", "hb-backup-maintain", "hb-clean"]
@@ -180,7 +181,8 @@ max_hours = 12                # the longest window hb webshell open allows
 enabled = false
 window_end = "07:00"
 snaps = []                    # snaps whose auto-refresh is held and done here instead, e.g. ["microk8s", "snapd", "core22"]
-snapshot_days = 3             # how long the pre-upgrade snapshots stay
+snapshot_days = 3             # how long the pre-upgrade snapshots stay; 0: none (on a busy disk,
+                              # where they'd hold days of deleted files: the backup is the way back)
 force_after_days = 0          # 0: never reboot while busy; N: reboot anyway once it has waited N days
 
 [busy]

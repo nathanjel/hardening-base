@@ -13,7 +13,8 @@ runbook in `local/`.
 | Idle checks | `busy.d/` | nothing; they only answer "busy?" |
 
 **How a night goes.** At 04:30 `hb upgrade run` takes a read-only snapshot
-of `/` (kept `upgrade.snapshot_days`), runs `dnf upgrade --refresh -y`, then
+of `/` (kept `upgrade.snapshot_days`; with 0 there is none, and the backup
+at 04:00 is the way back), runs `dnf upgrade --refresh -y`, then
 refreshes the held snaps and reboots, each only if the box is idle. A microk8s
 refresh restarts Kubernetes, so it waits like a reboot. A reboot happens only
 when `dnf needs-restarting -r` asks for one (or a newer kernel is installed).
