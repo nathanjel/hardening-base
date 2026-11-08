@@ -31,7 +31,9 @@ hb check and the digest; with upgrade.force_after_days set it then happens even
 when busy. Fedora release upgrades stay manual.
 
 Config ([upgrade] in hb.toml): enabled, window_end, snaps, snapshot_days,
-force_after_days. The busy checks read [busy].
+force_after_days. The busy checks read [busy]. With enabled false and snaps
+listed, only the hold is managed: no nightly run, and the snaps refresh when you
+refresh them (sudo snap refresh microk8s), at a moment you choose.
 """
 import datetime
 import os
@@ -86,9 +88,11 @@ def chk_snaps(cfg):
     if missing:
         return 2, f"upgrade.snaps names {', '.join(missing)}, not installed"
     loose = [s for s in want if not have[s]]
+    when = "they refresh in the upgrade window" if cfg["upgrade"]["enabled"] else "you refresh them when you choose"
     if loose:
-        return 1, f"will hold auto-refresh for {', '.join(loose)} (they refresh in the upgrade window instead)"
-    return 0, f"{', '.join(want)} held; refreshed in the upgrade window"
+        return 1, f"will hold auto-refresh for {', '.join(loose)} ({when} instead)"
+    return 0, f"{', '.join(want)} held; " + ("refreshed in the upgrade window" if cfg["upgrade"]["enabled"]
+                                            else "nothing refreshes them until you do (sudo snap refresh NAME)")
 
 
 def fix_snaps(cfg):
@@ -281,10 +285,10 @@ def summary(st):
 
 
 def verdict(cfg):
-    if not cfg["upgrade"]["enabled"]:
+    if not cfg["upgrade"]["enabled"] and not cfg["upgrade"]["snaps"]:
         return 0, "ok: not managed"
     rc, line = chk_snaps(cfg)
-    if rc:
+    if rc or not cfg["upgrade"]["enabled"]:       # only the hold is managed: nothing else to say
         return rc, f"{['ok', 'warn', 'fail'][rc]}: snaps: {line}"
     st = load_state()
     d = st.get("dnf")
@@ -313,6 +317,8 @@ def do_status(cfg):
         print(f"{['ok', 'todo', 'FAIL'][rc]:<5} {name:<8} {line}")
     rc, line = verdict(cfg)
     print(line)
+    if not cfg["upgrade"]["enabled"]:
+        return max(worst, rc)
     st = load_state()
     r = st.get("reboot", {})
     if r.get("rebooted_at"):
@@ -381,8 +387,8 @@ def main(argv):
         return rc
     if verb == "hold":
         return do_hold(argv[2] if len(argv) > 2 else "")
-    if not cfg["upgrade"]["enabled"]:
-        print("not managed (upgrade.enabled is false)")
+    if not cfg["upgrade"]["enabled"] and (verb in ("run", "now") or not cfg["upgrade"]["snaps"]):
+        print("not managed (upgrade.enabled is false)" + ("; only the snap hold is" if cfg["upgrade"]["snaps"] else ""))
         return 0
     if verb == "status":
         return do_status(cfg)

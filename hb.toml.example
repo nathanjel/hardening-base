@@ -185,7 +185,8 @@ max_hours = 12                # the longest window hb webshell open allows
 # window_end while the box is busy: a snapshot, dnf upgrade, then snap refresh and a reboot only when idle.
 enabled = false
 window_end = "07:00"
-snaps = []                    # snaps whose auto-refresh is held and done here instead, e.g. ["microk8s", "snapd", "core22"]
+snaps = []                    # snaps whose auto-refresh is held and done here instead, e.g. ["microk8s", "snapd", "core22"];
+                              # with enabled = false only the hold: they refresh when you refresh them
 snapshot_days = 3             # how long the pre-upgrade snapshots stay; 0: none (on a busy disk,
                               # where they'd hold days of deleted files: the backup is the way back)
 force_after_days = 0          # 0: never reboot while busy; N: reboot anyway once it has waited N days

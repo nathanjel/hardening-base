@@ -85,6 +85,24 @@ class UpgradeTest(unittest.TestCase):
         self.assertEqual(up.chk_snaps(cfg(snaps=["microk8s"]))[0], 0)
         self.assertEqual(up.chk_snaps(cfg(snaps=["lxd"]))[0], 2)
 
+    def test_with_upgrade_off_only_the_hold_is_managed(self):
+        # a box that updates some other way still wants microk8s held, refreshed when someone chooses
+        off = cfg(enabled=False, snaps=["microk8s", "snapd"])
+        self.assertEqual(up.verdict(off), (1, "warn: snaps: will hold auto-refresh for snapd "
+                                              "(you refresh them when you choose instead)"))
+        self.assertEqual(up.do_plan(off, apply=True, yes=True), 1)    # the fake snap list doesn't change
+        self.assertTrue(self.fake.did("snap", "refresh", "--hold", "microk8s", "snapd"))
+        self.assertEqual(up.verdict(cfg(enabled=False, snaps=["microk8s"])),
+                         (0, "ok: snaps: microk8s held; nothing refreshes them until you do (sudo snap refresh NAME)"))
+        self.assertEqual(up.verdict(cfg(enabled=False, snaps=[])), (0, "ok: not managed"))
+        old = (up.os.geteuid, up.config.load)
+        self.addCleanup(lambda: (setattr(up.os, "geteuid", old[0]), setattr(up.config, "load", old[1])))
+        up.os.geteuid, up.config.load = (lambda: 0), (lambda: off)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(up.main(["hb-upgrade", "run"]), 0)
+        self.assertEqual(out.getvalue(), "not managed (upgrade.enabled is false); only the snap hold is\n")
+        self.assertFalse(self.fake.did("dnf", "upgrade", "--refresh", "-y"))
+
     def test_reboot_reason(self):
         why, unknown = up.reboot_reason()
         self.assertIn("Reboot is required", why)
