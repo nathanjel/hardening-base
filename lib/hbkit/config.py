@@ -24,6 +24,7 @@ DEFAULTS = {
         "token_off_namespaces": [],
         "freeze_certs": False,
         "cluster_agent_bind": "",
+        "keep_restarting": [],
     },
     "health": {
         "containers": [],
@@ -46,6 +47,7 @@ DEFAULTS = {
     },
     "notify": {
         "sms_command": [],
+        "sms_fallback": [],
         "sms_per_day": 5,
         "repeat_hours": 24,
         "retry_minutes": 60,

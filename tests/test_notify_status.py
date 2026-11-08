@@ -1,4 +1,6 @@
-"""hb-notify (SMS dedupe, daily cap, retries) and hb-status (when to notify, banner)."""
+"""hb-notify (SMS dedupe, daily cap, retries, the fallback route) and hb-status (when to notify, banner)."""
+import contextlib
+import io
 import os
 import sys
 import time
@@ -12,7 +14,7 @@ status = load_tool("status")
 
 
 def cfg(**over):
-    c = {"sms_command": [], "sms_per_day": 5, "repeat_hours": 24, "retry_minutes": 60}
+    c = {"sms_command": [], "sms_fallback": [], "sms_per_day": 5, "repeat_hours": 24, "retry_minutes": 60}
     c.update(over)
     return c
 
@@ -67,6 +69,65 @@ class NotifyTest(unittest.TestCase):
         notify.flush(self.p, c)
         self.assertEqual(util.read_json(self.p["outbox"], None), [])
         self.assertIn("gave up on the SMS for k after 1 tries", util.read_events()[-1]["text"])
+        rc, out = self.check(c)
+        self.assertEqual(rc, 1)                                         # no more "ok" after dropping one
+        self.assertIn("gave up on the SMS for k: gateway down", out)
+
+    def check(self, c):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = notify.cmd_check(c)
+        return rc, out.getvalue()
+
+    DOWN = ["sh", "-c", "echo 'error: dial tcp 127.0.0.1:16443: connection refused' >&2; exit 1"]
+
+    def test_the_fallback_takes_over_and_check_says_so(self):
+        c = cfg(sms_command=self.DOWN, sms_fallback=self.sender)
+        notify.queue(self.p, c, "health.k8s", "k8s down")
+        self.assertEqual(notify.flush(self.p, c), 1)
+        self.assertEqual(self.sent_lines(), ["k8s down"])
+        self.assertEqual(util.read_json(self.p["sent"], [])[-1]["route"], "fallback")
+        self.assertIn("went by notify.sms_fallback", util.read_events()[-1]["text"])
+        rc, out = self.check(c)
+        self.assertEqual(rc, 1)
+        self.assertIn("sent by the fallback the SMS for health.k8s: error: dial tcp", out)
+        t = util.read_json(self.p["trouble"], None)                      # a day later: ok again
+        t["ts"] -= 86401
+        util.write_json(self.p["trouble"], t)
+        self.assertEqual(self.check(c), (0, "ok: SMS for failures (with a fallback), banner for everything\n"))
+
+    def test_the_main_route_goes_first(self):
+        other = os.path.join(util.STATE, "fallback.txt")
+        c = cfg(sms_command=self.sender, sms_fallback=["sh", "-c", f"cat >> {other}"])
+        notify.queue(self.p, c, "k", "text")
+        self.assertEqual(notify.flush(self.p, c), 1)
+        self.assertEqual(self.sent_lines(), ["text"])
+        self.assertFalse(os.path.exists(other))
+        self.assertEqual(self.check(c)[0], 0)
+
+    def test_both_routes_down_keeps_both_errors(self):
+        c = cfg(sms_command=self.DOWN, sms_fallback=["sh", "-c", "echo 'supervoip 401' >&2; exit 1"])
+        notify.queue(self.p, c, "k", "text")
+        self.assertEqual(notify.flush(self.p, c), 0)
+        self.assertEqual(util.read_json(self.p["outbox"], [])[0]["error"],
+                         "error: dial tcp 127.0.0.1:16443: connection refused; fallback: supervoip 401")
+
+    def test_test_fallback_uses_only_the_fallback(self):
+        c = cfg(sms_command=self.DOWN, sms_fallback=self.sender)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(notify.cmd_test_fallback(c), 0)
+            self.assertEqual(notify.cmd_test_fallback(cfg(sms_command=self.sender)), 1)   # none set
+        self.assertEqual(len(self.sent_lines()), 1)
+        self.assertIn("test of the fallback route", self.sent_lines()[0])
+
+    def test_test_takes_no_options_it_doesnt_know(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(notify.main(["hb-notify", "test", "--help"]), 0)          # help, not an SMS
+            self.assertEqual(notify.main(["hb-notify", "test", "--fallback", "--sender", "SMS"]), 2)
+        self.assertIn("hb notify test [--fallback]", out.getvalue())
+        self.assertIn("unknown --sender SMS", err.getvalue())
+        self.assertEqual(self.sent_lines(), [])
 
     def test_send_records_every_level_and_texts_only_fail(self):
         notify.refresh_banner = lambda: None

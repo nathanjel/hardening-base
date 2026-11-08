@@ -18,6 +18,8 @@ token_off_namespaces = []     # namespaces whose pods never call the Kubernetes 
 freeze_certs = false          # true: microk8s stops reissuing its API certificate (and
                               # restarting every container) whenever the host gains an address
 cluster_agent_bind = ""       # e.g. "127.0.0.1:25000": the join agent, unused on one box
+keep_restarting = []          # e.g. ["kubelite", "k8s-dqlite", "containerd"]: retry every 10 s for as
+                              # long as it takes, where snapd's units give up after 5 quick failures
 
 [health]
 containers = []               # docker containers that must be running
@@ -42,6 +44,8 @@ timers = []                   # e.g. ["hb-status", "hb-backup", "hb-backup-maint
 [notify]
 sms_command = []              # argv that gets the text on stdin and exits 0 once queued,
                               # e.g. ["/usr/local/bin/send-sms", "<your number>"]; empty: banner only
+sms_fallback = []             # tried when sms_command fails: a route that doesn't share its failures, e.g.
+                              # ["/opt/hb/hooks/sms-supervoip", "--to", "+48...", "--sender", "<your sender>"]
 sms_per_day = 5               # at most this many SMS in 24 hours
 repeat_hours = 24             # the same alert again only after this long
 retry_minutes = 60            # keep retrying an SMS that can't go out for this long

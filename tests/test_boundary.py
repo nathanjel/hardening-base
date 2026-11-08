@@ -218,7 +218,7 @@ chmod +x .hb-clean""")
     age(first, second)
     actions, _ = clean.plan_projects(clean_cfg(first, second), time.time())
     assert len(actions) == 3, [a.desc for a in actions]
-    errors = clean.apply(actions, yes=True)
+    errors, _ = clean.apply(actions, yes=True)
     assert len(errors) == 2 and all("changed since the plan" in e for e in errors), errors
     assert_untouched(f"{outside}/build/keep")
     assert not os.path.exists(f"{TMP}/ran"), "a file from the swapped-in folder ran"
@@ -262,7 +262,7 @@ def case_clean_foreign():
     actions, notes = clean.plan_projects(clean_cfg(root), time.time())
     assert [os.path.basename(a.desc.split(":")[0]) for a in actions] == ["goes"], [a.desc for a in actions]
     assert any(n.startswith(f"kept {root}/kept/build") and "from-a-container" in n for n in notes), notes
-    assert clean.apply(actions, yes=True) == []
+    assert clean.apply(actions, yes=True)[0] == []
     assert not os.path.exists(f"{root}/goes/build")
     assert_untouched(f"{root}/kept/build/from-a-container/o")
 
@@ -303,7 +303,7 @@ def case_clean_caches():
     actions, notes = clean.plan_caches(clean_cfg(), time.time())
     assert [a.desc.split(" ")[0] for a in actions] == [f"{home}/.cache/old"], [a.desc for a in actions]
     assert any(n.startswith(f"kept {home}/.cache/mixed") for n in notes), notes
-    assert clean.apply(actions, yes=True) == []
+    assert clean.apply(actions, yes=True)[0] == []
     assert not os.path.exists(f"{home}/.cache/old")
     assert_untouched(f"{home}/.cache/mixed/roots/f")
 

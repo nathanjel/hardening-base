@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # hb-k8s — microk8s plug-in: keep NodePorts off public addresses, keep
 # service-account tokens out of pods that never talk to the Kubernetes API,
-# stop certificate reissues that restart every container, and keep the
-# cluster agent (for joining nodes, unused on one box) on localhost.
+# stop certificate reissues that restart every container, keep the
+# cluster agent (for joining nodes, unused on one box) on localhost, and keep
+# microk8s's daemons retrying after a failure instead of giving up.
 #
 #   hb k8s status        one line per item
 #   hb k8s plan          what apply would change (changes nothing)
@@ -24,9 +25,14 @@
 #                  the moment: sudo microk8s refresh-certs --cert server.crt).
 #   agent          --bind in the cluster agent's args file
 #   agent_live     the agent listens there (fix: restart it; pods are unaffected)
+#   restart        a systemd drop-in for each daemon in k8s.keep_restarting (e.g.
+#                  kubelite, k8s-dqlite, containerd): retry every 10 s with no limit.
+#                  snapd's units give up after 5 failures in 10 s, 100 ms apart, so
+#                  a full disk for a few minutes left Kubernetes down for good.
+#                  Live at once (daemon-reload); nothing restarts.
 #
 # Config ([k8s] in hb.toml): nodeport_addresses, token_off_namespaces,
-# freeze_certs, cluster_agent_bind.
+# freeze_certs, cluster_agent_bind, keep_restarting.
 set -u
 source "$(dirname "$(readlink -f "$0")")/../lib/hb.sh"
 need_root
@@ -35,7 +41,7 @@ need_config
 [ "$(cfg k8s.flavour)" = microk8s ] || die "only microk8s is supported"
 command -v /snap/bin/microk8s >/dev/null || { echo "ok: microk8s not installed"; exit 0; }
 
-ITEMS=(nodeport nodeport_live tokens tokens_live certs agent agent_live)
+ITEMS=(nodeport nodeport_live tokens tokens_live certs agent agent_live restart)
 SNAPDATA=/var/snap/microk8s/current
 ARGS=$SNAPDATA/args/kube-proxy
 AGENT_ARGS=$SNAPDATA/args/cluster-agent
@@ -48,6 +54,9 @@ mapfile -t TOKEN_OFF_NS < <(cfg k8s.token_off_namespaces)
 WANT_NODEPORT="--nodeport-addresses=$(IFS=,; echo "${NODEPORT_ADDRS[*]}")"
 FREEZE="$(cfg k8s.freeze_certs)"
 AGENT_BIND="$(cfg k8s.cluster_agent_bind)"
+mapfile -t KEEP_RESTARTING < <(cfg k8s.keep_restarting)
+UNITDIR="${HB_SYSTEMD_DIR:-/etc/systemd/system}"
+RESTART_SEC=10
 WARN_DAYS="$(cfg health.cert_warn_days)"
 
 # --- nodeport -------------------------------------------------------------------
@@ -214,6 +223,42 @@ fix_agent_live() {
   local i
   for i in $(seq 15); do [ "$(agent_listening)" = "$AGENT_BIND" ] && return 0; sleep 2; done
   log "  the cluster agent isn't listening on $AGENT_BIND after 30 s"; return 1
+}
+
+# --- restart --------------------------------------------------------------------
+restart_unit()   { echo "snap.microk8s.daemon-$1.service"; }
+restart_dropin() { echo "$UNITDIR/$(restart_unit "$1").d/10-hb-keep-restarting.conf"; }
+restart_text() {
+  printf '%s\n' "# Managed by hb k8s (k8s.keep_restarting); changes made here are overwritten." \
+    "# Retry every ${RESTART_SEC} s for as long as it takes, instead of giving up after 5 quick failures." \
+    "[Unit]" "StartLimitIntervalSec=0" "[Service]" "RestartSec=${RESTART_SEC}s"
+}
+# what systemd has loaded for a unit: "<start limit interval> <restart delay>"
+restart_loaded() {
+  systemctl show "$(restart_unit "$1")" -p StartLimitIntervalUSec -p RestartUSec 2>/dev/null \
+    | awk -F= '{v[$1]=$2} END {print v["StartLimitIntervalUSec"], v["RestartUSec"]}'
+}
+chk_restart() {
+  [ ${#KEEP_RESTARTING[@]} -eq 0 ] && { echo "not managed"; return 0; }
+  local d todo=()
+  for d in "${KEEP_RESTARTING[@]}"; do
+    [[ $d =~ ^[a-z0-9-]+$ ]] || { echo "k8s.keep_restarting: '$d' is not a daemon name (e.g. kubelite)"; return 2; }
+    if [ "$(cat "$(restart_dropin "$d")" 2>/dev/null)" != "$(restart_text)" ]; then
+      todo+=("$d: no drop-in"); continue
+    fi
+    [ "$(restart_loaded "$d")" = "0 ${RESTART_SEC}s" ] || todo+=("$d: not loaded ($(restart_loaded "$d"))")
+  done
+  [ ${#todo[@]} -eq 0 ] && { echo "${KEEP_RESTARTING[*]}: retry every ${RESTART_SEC} s, no limit"; return 0; }
+  local out; out="$(printf '%s; ' "${todo[@]}")"; echo "${out%; }"; return 1
+}
+fix_restart() {
+  local d f
+  for d in "${KEEP_RESTARTING[@]}"; do
+    f="$(restart_dropin "$d")"
+    keep_copy "$f"
+    mkdir -p "$(dirname "$f")" && chmod 755 "$(dirname "$f")" && restart_text > "$f" && chmod 644 "$f" || return 1
+  done
+  systemctl daemon-reload
 }
 
 item_main "$@"

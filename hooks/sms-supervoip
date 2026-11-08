@@ -1,0 +1,145 @@
+#!/usr/bin/python3 -IB
+"""sms-supervoip — send one SMS through supervoip.pl's REST API; the text comes on stdin.
+
+A notify.sms_fallback for hosts whose main SMS route can fail along with what it
+reports on (e.g. one that runs through Kubernetes):
+
+    sms_fallback = ["/opt/hb/hooks/sms-supervoip", "--to", "+48600000000"]
+
+  --to NUMBER          recipient, international form (+48...)
+  --sender WHO         SMS (default), random or 2Way; the name of one of the account's
+                       SMS senders (looked up on each send); or an IRI:
+                       /api/sms_senders/ID, /api/voip_numbers/ID
+  --list-senders       print the account's SMS senders and voip numbers, then exit
+  --country IRI        the recipient's country, e.g. /api/countries/96; default: looked
+                       up from the number's prefix
+  --token-file PATH    the API token, alone in a root-only file
+                       (default /etc/hb/secrets/supervoip-token)
+  --api URL            default https://restapi.supervoip.pl
+
+Exits 0 once supervoip has queued the message. Errors go to stderr as one line;
+the text itself is never printed or logged. Uses the API as supervoip's schema
+(/api/docs.json, SmsMessage) has it: recipients is a list, the body is "text",
+country is required, and a 2xx answer with no queuedMessages was not sent.
+"""
+import argparse
+import json
+import re
+import sys
+import urllib.error
+import urllib.request
+
+TOKEN_FILE = "/etc/hb/secrets/supervoip-token"
+API = "https://restapi.supervoip.pl"
+KINDS = ("SMS", "random", "2Way")
+
+
+def call(api, token, method, path, body=None):
+    req = urllib.request.Request(api.rstrip("/") + path, method=method,
+                                 data=None if body is None else json.dumps(body).encode(),
+                                 headers={"Authorization": f"Bearer {token}", "Accept": "application/ld+json",
+                                          **({"Content-Type": "application/json"} if body is not None else {})})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        detail = e.read()[:200].decode("utf-8", "replace")      # the API's own feedback, not our text
+        raise RuntimeError(f"supervoip {e.code} on {path}: {' '.join(detail.split())}") from None
+    except (urllib.error.URLError, OSError) as e:
+        raise RuntimeError(f"supervoip unreachable: {getattr(e, 'reason', e)}") from None
+    try:
+        return json.loads(raw) if raw else {}
+    except ValueError:
+        raise RuntimeError(f"supervoip answered {path} with something that isn't JSON") from None
+
+
+def members(data):
+    return data.get("hydra:member", []) if isinstance(data, dict) else data if isinstance(data, list) else []
+
+
+def country_for(api, token, number):
+    digits = number[1:]
+    best, best_len = None, 0
+    for c in members(call(api, token, "GET", "/api/countries")):
+        p = str(c.get("prefix", ""))
+        if p and digits.startswith(p) and len(p) > best_len:
+            best, best_len = c.get("@id"), len(p)
+    if not best:
+        raise RuntimeError(f"no supervoip country for the prefix of {number[:4]}...; pass --country")
+    return best
+
+
+def sender_named(api, token, name):
+    want = name.strip().lower()
+    for m in members(call(api, token, "GET", "/api/sms_senders")):
+        if str(m.get("name", "")).strip().lower() == want:
+            return m.get("@id") or f"/api/sms_senders/{m.get('id')}"
+    raise RuntimeError(f"the account has no SMS sender named {name!r} (bought and accepted?)")
+
+
+def list_senders(api, token):
+    for m in members(call(api, token, "GET", "/api/sms_senders")):
+        print(f"sender  {m.get('name', '?'):20} {m.get('@id', '')}")
+    for m in members(call(api, token, "GET", "/api/voip_numbers")):
+        print(f"number  {str(m.get('phoneNumber') or m.get('number') or '?'):20} {m.get('@id', '')}")
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="sms-supervoip", add_help=True)
+    ap.add_argument("--to")
+    ap.add_argument("--list-senders", action="store_true")
+    ap.add_argument("--sender", default="SMS")
+    ap.add_argument("--country")
+    ap.add_argument("--token-file", default=TOKEN_FILE)
+    ap.add_argument("--api", default=API)
+    a = ap.parse_args(argv[1:])
+    to = re.sub(r"[\s-]", "", a.to or "")
+    if not a.list_senders and not re.fullmatch(r"\+\d{8,15}", to):
+        print("sms-supervoip: --to wants an international number, +48...", file=sys.stderr)
+        return 2
+    try:
+        with open(a.token_file) as f:
+            token = next((line.strip() for line in f if line.strip()), "")
+    except OSError as e:
+        print(f"sms-supervoip: cannot read the token ({e.strerror}: {a.token_file})", file=sys.stderr)
+        return 2
+    if not token:
+        print(f"sms-supervoip: {a.token_file} is empty", file=sys.stderr)
+        return 2
+    if a.list_senders:
+        try:
+            list_senders(a.api, token)
+        except RuntimeError as e:
+            print(f"sms-supervoip: {e}", file=sys.stderr)
+            return 1
+        return 0
+    text = sys.stdin.read().strip()
+    if not text:
+        print("sms-supervoip: no text on stdin", file=sys.stderr)
+        return 2
+
+    body = {"recipients": [to], "text": text}
+    try:
+        if a.sender in KINDS:
+            body["sender"] = a.sender
+        elif re.fullmatch(r"/api/voip_numbers/\w+", a.sender):
+            body.update(sender="voipNumber", voipNumber=a.sender)
+        elif re.fullmatch(r"/api/sms_senders/\w+", a.sender):
+            body.update(sender="smsSender", smsSender=a.sender)
+        else:
+            body.update(sender="smsSender", smsSender=sender_named(a.api, token, a.sender))
+        body["country"] = a.country or country_for(a.api, token, to)
+        answer = call(a.api, token, "POST", "/api/sms_messages", body)
+    except RuntimeError as e:
+        print(f"sms-supervoip: {e}", file=sys.stderr)
+        return 1
+    queued = answer.get("queuedMessages") if isinstance(answer, dict) else None
+    if isinstance(queued, list) and not queued:
+        print("sms-supervoip: accepted but not sent (no queuedMessages): check the number and the sender",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

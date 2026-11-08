@@ -31,7 +31,7 @@ timers run) and the config to `/etc/hb/hb.toml`.
 | `hb-config` | read and validate `hb.toml` (bash tools call `hb config get KEY`) |
 | `hb-install` | root-owned copy in `/opt/hb`, `/etc/hb/hb.toml`, systemd units and timers |
 | `hb-harden` | unwanted accounts, stray files and folders, root login over SSH, NOPASSWD audit, kernel settings, LLMNR |
-| `hb-k8s` | microk8s: NodePorts on localhost only, no service-account tokens in app pods, no certificate reissue that restarts every container, cluster agent on localhost |
+| `hb-k8s` | microk8s: NodePorts on localhost only, no service-account tokens in app pods, no certificate reissue that restarts every container, cluster agent on localhost, daemons that keep retrying after a failure |
 | `hb-wg` | WireGuard endpoint for your PCs: config from `hb.toml`, each PC keeps its own private key |
 | `hb-fw` | firewalld zones from `hb.toml`, applied with a revert timer you cancel from a new session |
 | `hb-probe` | stdlib-only outside scan (TCP and a few UDP services) to run from another network |
@@ -45,7 +45,7 @@ timers run) and the config to `/etc/hb/hb.toml`.
 | `hb-snapshot` | read-only btrfs snapshots of `/` before risky changes |
 | `hb-health` | reboot pending, RAID, NVMe wear, btrfs, disk, mounts, containers, k8s, sites and certificates, registry, SIP trunk |
 | `hb-status` | runs every check every 15 minutes, writes the login banner, passes changes to hb-notify |
-| `hb-notify` | events for the banner; failures also as SMS through any command you name (rate-limited) |
+| `hb-notify` | events for the banner; failures also as SMS through any command you name (rate-limited), with a second route for when the first is down (`hooks/sms-supervoip`) |
 | `hb-alerts` | mdadm and smartd report through hb-notify, no mail server needed |
 | `hb-backup` | restic from a read-only btrfs snapshot, plus a state dump for rebuilding |
 | `hb-restore` | files back from the backup (into a folder, or over the live ones after a yes), and a quarterly drill that restores a random sample and compares it byte for byte with the live files |

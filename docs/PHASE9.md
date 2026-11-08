@@ -6,7 +6,8 @@ An outside review of hb, cross-checked against the code, led to three parts:
 |---|---|---|
 | 9a | Root and users: root stops acting with its own rights on things a user can change | this runbook |
 | 9b | SSH: rollback that covers group membership, the effective sshd settings checked | this runbook |
-| 9c | Honest reporting: backup coverage, a reboot check that can say "unknown", unmanaged tools listed | to follow |
+| 9c | After an outage: an SMS route that doesn't depend on Kubernetes, alerts that admit they failed, microk8s that keeps retrying, evicted pods as a warning, honest cleanup figures | this runbook |
+| 9d | Honest reporting: backup coverage, a reboot check that can say "unknown", unmanaged tools listed | to follow |
 
 Keep a filled-in copy of this runbook in `local/`.
 
@@ -185,3 +186,60 @@ costs little, because it only lives for the length of the backup.
     sudo hb snapshot delete <name> # any newer one, as listed
     sudo btrfs subvolume sync /    # waits until btrfs has freed the space
     df -h /
+
+## 9c: after an outage
+
+A build cache in a user's project filled `/` for a few minutes. Kubernetes
+evicted pods and started replacements, then kubelite died, and snapd's unit
+gave up restarting it after five failures in a second. hb saw it within 15
+minutes, but its SMS command ran through `kubectl exec`, so the text never went
+out, and `hb notify check` went on saying ok after it gave up. Once kubelite was
+back, `hb health` failed for good on the evicted pods' records.
+
+| Piece | Tool | What changes |
+|---|---|---|
+| A second SMS route | `hb notify`, `hooks/sms-supervoip` | `notify.sms_fallback`, tried when `sms_command` fails. The hook sends through supervoip.pl's REST API with a token from `/etc/hb/secrets/supervoip-token`; `--sender` takes one of the account's SMS sender names. `hb notify test --fallback` tests that route alone |
+| Alerts that admit it | `hb notify check` | warns for 24 hours after an SMS was dropped, or needed the fallback |
+| Keep retrying | `hb k8s`, item `restart` | a systemd drop-in for each daemon in `k8s.keep_restarting`: retry every 10 s, no limit. Live at once; nothing restarts |
+| Evicted pods | `hb health` | an evicted pod whose replacement runs is a warning with the count and the command to clear it, no longer a failure |
+| Cleanup figures | `hb clean` | the unused-image figure is capped at what Docker counts as reclaimable (images share layers); a run by hand writes the report too, so `hb clean check` and the digest show it |
+
+**Risk.** Low. Nothing restarts. The fallback costs one SMS to test.
+
+### 0. Before you start
+
+A token for the SMS provider in a root-only file. The hook reads the first line:
+
+    sudo sh -c 'umask 077; cat > /etc/hb/secrets/supervoip-token'    # paste, Enter, Ctrl-D
+
+In `hb.toml`: `notify.sms_fallback` and `k8s.keep_restarting` (see `hb.toml.example`).
+`sudo /opt/hb/hooks/sms-supervoip --list-senders` shows the account's sender names
+(after the install below).
+
+### 1. Install
+
+    sudo ./hb install apply        # y to code and config
+
+### 2. The second route
+
+    sudo hb notify test --fallback # sent by notify.sms_fallback; one SMS arrives
+    sudo hb notify check           # ok: SMS for failures (with a fallback), ...
+
+### 3. Keep retrying
+
+    sudo hb k8s plan               # would change restart: kubelite: no drop-in; ...
+    sudo hb k8s apply              # y to restart
+    systemctl show snap.microk8s.daemon-kubelite -p StartLimitIntervalUSec -p RestartUSec
+                                   # StartLimitIntervalUSec=0, RestartUSec=10s
+
+### 4. Check
+
+    sudo hb check
+    sudo hb clean plan             # docker: the capped image figure
+
+### Rolling back
+
+Empty `notify.sms_fallback` and `k8s.keep_restarting` in `hb.toml`, then
+`sudo ./hb install apply`, and remove the drop-ins:
+`sudo sh -c 'rm /etc/systemd/system/snap.microk8s.daemon-*.service.d/10-hb-keep-restarting.conf'`,
+`sudo systemctl daemon-reload`.

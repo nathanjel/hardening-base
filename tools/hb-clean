@@ -348,6 +348,10 @@ def plan_docker(cfg, now):
         actions.append(Action("docker", f"stopped containers older than {cdays} days: {' '.join(old)}", 0,
                               docker_fn("container", "prune", "-f", "--filter", f"until={cdays * 24}h")))
 
+    df = {}                                            # docker system df, by type: its own reclaimable counts
+    for line in docker("system", "df", "--format", "{{json .}}").splitlines():
+        row = json.loads(line)
+        df[row.get("Type")] = row
     ids = docker("ps", "-aq").split()
     used = set(docker("inspect", "--format", "{{.Image}}", *ids).split()) if ids else set()
     unused, size = [], 0
@@ -358,19 +362,22 @@ def plan_docker(cfg, now):
             unused.append(name)
             size += parse_size(sz)
     if unused:
+        # images share layers, so the sum of their sizes counts a layer once per image; Docker's own
+        # figure for what unused images hold is an honest ceiling
+        reclaim = parse_size(df.get("Images", {}).get("Reclaimable", ""))
+        size = min(size, reclaim) if reclaim else size
         shown = ", ".join(sorted(set(unused))[:8]) + (", ..." if len(set(unused)) > 8 else "")
         actions.append(Action("docker", f"{len(unused)} unused images older than {idays} days ({shown}); "
-                              "layers are shared, so less than the sum may come back", size,
+                              "at most what Docker counts as reclaimable", size,
                               docker_fn("image", "prune", "-a", "-f", "--filter", f"until={idays * 24}h")))
 
     cap = parse_size(cfg["docker_build_cache"])
-    for line in docker("system", "df", "--format", "{{json .}}").splitlines():
-        row = json.loads(line)
-        if row.get("Type") == "Build Cache" and parse_size(row.get("Size", "")) > cap:
-            have = parse_size(row["Size"])
-            actions.append(Action("docker", f"build cache {human(have)}, trimmed to {cfg['docker_build_cache']}",
-                                  have - cap, docker_fn("builder", "prune", "-f", "-a",
-                                                        "--max-used-space", cfg["docker_build_cache"])))
+    row = df.get("Build Cache", {})
+    have = parse_size(row.get("Size", ""))
+    if have > cap:
+        actions.append(Action("docker", f"build cache {human(have)}, trimmed to {cfg['docker_build_cache']}",
+                              have - cap, docker_fn("builder", "prune", "-f", "-a",
+                                                    "--max-used-space", cfg["docker_build_cache"])))
     dangling = docker("volume", "ls", "-q", "--filter", "dangling=true").split()
     if dangling:
         notes.append(f"docker: {len(dangling)} volumes no container uses (never removed): {' '.join(dangling)}")
@@ -447,7 +454,8 @@ def confirm(question):
 
 
 def apply(actions, yes):
-    errors = []
+    """([errors], [actions done])."""
+    errors, done = [], []
     for a in actions:
         print(f"\n{human(a.size):>9}  {a.desc}")
         if not yes and not confirm("  remove?"):
@@ -455,10 +463,21 @@ def apply(actions, yes):
             continue
         try:
             print(f"  {a.fn()}")
+            done.append(a)
         except Exception as e:
             errors.append(f"{a.desc}: {e}")
             print(f"  FAILED: {e}")
-    return errors
+    return errors, done
+
+
+def save_report(text, dry, actions, errors, reg, by_hand=False):
+    """The last run, for hb clean check and the digest. A run by hand counts too."""
+    jpath, tpath = report_paths()
+    if reg is None:                                    # a run on some targets only: keep the last size seen
+        reg = (util.read_json(jpath, None) or {}).get("registry")
+    util.write_atomic(tpath, text)
+    util.write_json(jpath, {"ts": int(time.time()), "dry_run": dry, "bytes": sum(a.size for a in actions),
+                            "actions": len(actions), "errors": errors, "registry": reg, "by_hand": by_hand})
 
 
 def report_paths():
@@ -483,14 +502,11 @@ def cmd_auto(full):
         notes.append(registry_note(reg, cfg))
     stamp = time.strftime("%Y-%m-%d %H:%M")
     text = format_plan(actions, notes, f"hb clean {'DRY RUN, nothing removed' if dry else 'run'}, {stamp}")
-    errors = [] if dry else apply(actions, yes=True)
+    errors, done = ([], actions) if dry else apply(actions, yes=True)
     if errors:
         text += "\nerrors:\n" + "".join(f"  {e}\n" for e in errors)
     print(text, end="")
-    jpath, tpath = report_paths()
-    util.write_atomic(tpath, text)
-    util.write_json(jpath, {"ts": int(time.time()), "dry_run": dry, "bytes": sum(a.size for a in actions),
-                            "actions": len(actions), "errors": errors, "registry": reg})
+    save_report(text, dry, done, errors, reg)
     return 1 if errors else 0
 
 
@@ -509,7 +525,7 @@ def cmd_check(cfg):
         print(f"warn: registry {human(reg['bytes'])} ({reg['manifests']} manifests), "
               f"past clean.registry_warn {cfg['registry_warn']}")
         return 1
-    verb = "reclaimable (dry run)" if rep["dry_run"] else "removed"
+    verb = "reclaimable (dry run)" if rep["dry_run"] else "removed" + (" by hand" if rep.get("by_hand") else "")
     print(f"ok: {human(rep['bytes'])} {verb} on {when}" + (f"; registry {human(reg['bytes'])}" if reg else ""))
     return 0
 
@@ -549,7 +565,12 @@ def main(argv):
     if verb == "plan":
         print(format_plan(actions, notes, "hb clean plan (nothing removed)"), end="")
         return 0
-    errors = apply(actions, yes)
+    errors, done = apply(actions, yes)
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    text = format_plan(done, notes, f"hb clean apply by hand, {stamp} (what was removed)")
+    if errors:
+        text += "\nerrors:\n" + "".join(f"  {e}\n" for e in errors)
+    save_report(text, False, done, errors, reg, by_hand=True)
     return 1 if errors else 0
 
 

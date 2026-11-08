@@ -159,18 +159,45 @@ def check_k8s(cfg):
         return FAIL, "API not answering"
     if any(ln.split()[1] != "Ready" for ln in out.splitlines()):
         return FAIL, "node not Ready"
-    rc, out = run(*KUBECTL, "get", "pods", "-A", "--no-headers")
-    bad = []
-    for ln in out.splitlines():
-        ns, name, ready, status = ln.split()[:4]
-        have, want = ready.split("/")
-        if status == "Completed":
-            continue
-        if status != "Running" or have != want:
-            bad.append(f"{ns}/{name} {status} {ready}")
+    rc, out = run(*KUBECTL, "get", "pods", "-A", "-o", "json")
+    try:
+        pods = json.loads(out)["items"] if rc == 0 else None
+    except (ValueError, KeyError):
+        pods = None
+    if pods is None:
+        return FAIL, "cannot list pods"
+    bad, evicted, fine = pod_states(pods)
+    left = (f"; {evicted} evicted pods left over (kubectl delete pod -A --field-selector=status.phase=Failed)"
+            if evicted else "")
     if bad:
-        return FAIL, "; ".join(bad)
-    return OK, f"node Ready, {len(out.splitlines())} pods fine"
+        return FAIL, "; ".join(bad) + left
+    return (WARN if evicted else OK), f"node Ready, {fine} pods fine" + left
+
+
+def pod_states(pods):
+    """([pods that are down, as "ns/name why have/want"], evicted pods, pods fine).
+
+    A pod the kubelet evicted (disk or memory pressure) stays as a Failed record
+    after its controller has started a replacement; the replacement shows here on
+    its own, so the record itself is only worth a warning."""
+    bad, evicted, fine = [], 0, 0
+    for p in pods:
+        st, meta = p.get("status", {}), p.get("metadata", {})
+        phase = st.get("phase")
+        if phase == "Succeeded":
+            continue
+        if phase == "Failed" and st.get("reason") == "Evicted":
+            evicted += 1
+            continue
+        cs = st.get("containerStatuses") or []
+        ready = sum(1 for c in cs if c.get("ready"))
+        want = len(cs) or len(p.get("spec", {}).get("containers", []))
+        if phase == "Running" and cs and ready == want:
+            fine += 1
+            continue
+        why = next((c["state"]["waiting"].get("reason") for c in cs if "waiting" in c.get("state", {})), None)
+        bad.append(f"{meta.get('namespace')}/{meta.get('name')} {why or st.get('reason') or phase} {ready}/{want}")
+    return bad, evicted, fine
 
 
 def http_status(url):

@@ -252,5 +252,64 @@ class RegistryTest(unittest.TestCase):
             self.assertIn(has, out.getvalue())
 
 
+
+class DockerFigureTest(unittest.TestCase):
+    """Images share layers: the sum of their sizes is capped at Docker's own reclaimable count."""
+
+    def setUp(self):
+        self.addCleanup(setattr, clean, "docker", clean.docker)
+        old = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 30 * 86400)) + " +0100 CET"
+        answers = {
+            "ps": "", "volume": "",
+            "image": "".join(f"sha256:{i}\tapp:v{i}\t{old}\t10GB\n" for i in range(6)),   # 60 GB summed
+            "system": '{"Type":"Images","Size":"34.7GB","Reclaimable":"17.88GB (51%)"}\n'
+                      '{"Type":"Build Cache","Size":"52.7GB","Reclaimable":"29.71GB"}\n',
+        }
+        clean.docker = lambda *args: answers[args[0]]
+        self.cfg = {"docker": True, "docker_container_days": 7, "docker_image_days": 14, "docker_build_cache": "15GB"}
+
+    def test_images_capped_and_build_cache_trimmed(self):
+        actions, _ = clean.plan_docker(self.cfg, time.time())
+        images, cache = actions
+        self.assertEqual(images.size, 17_880_000_000)
+        self.assertIn("6 unused images", images.desc)
+        self.assertEqual(cache.size, 52_700_000_000 - 15_000_000_000)
+
+
+class ReportTest(unittest.TestCase):
+    def setUp(self):
+        temp_state(self)
+
+    def check(self):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = clean.cmd_check({"registry_warn": "10GB"})
+        return rc, out.getvalue().strip()
+
+    def test_a_run_by_hand_is_what_check_shows(self):
+        reg = {"bytes": 1_700_000_000, "manifests": 312}
+        clean.save_report("nightly", True, [clean.Action("caches", "x", 114_600_000_000, None)], [], reg)
+        self.assertIn("114.6 GB reclaimable (dry run)", self.check()[1])
+        done = [clean.Action("caches", "y", 20_000_000_000, None)]
+        clean.save_report("by hand", False, done, [], None, by_hand=True)    # some targets only: no registry
+        rc, line = self.check()
+        self.assertEqual(rc, 0)
+        self.assertIn("20.0 GB removed by hand on", line)
+        self.assertIn("registry 1.7 GB", line)                              # kept from the run before
+
+    def test_apply_returns_what_it_did(self):
+        def boom():
+            raise RuntimeError("nope")
+        ok = clean.Action("caches", "fine", 5, lambda: "removed")
+        bad = clean.Action("caches", "broken", 7, boom)
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            errors, done = clean.apply([ok, bad], yes=True)
+        self.assertEqual(done, [ok])
+        self.assertEqual(errors, ["broken: nope"])
+
 if __name__ == "__main__":
     unittest.main()

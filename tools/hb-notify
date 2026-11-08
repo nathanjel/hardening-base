@@ -5,19 +5,23 @@ an SMS for failures.
   hb notify send LEVEL KEY TEXT   LEVEL is info, warn or fail; KEY names the
                                   source, e.g. health.raid or mdadm.Fail
   hb notify flush                 retry SMS that couldn't go out yet
-  hb notify test                  send a test SMS now
+  hb notify test [--fallback]     send a test SMS now (--fallback: by notify.sms_fallback only)
   hb notify events [N]            the last N events (default 20)
   hb notify check                 one-line verdict
 
 Only fail sends an SMS: the same KEY at most once per notify.repeat_hours, and
 no more than notify.sms_per_day in 24 hours. An SMS that can't go out is
 retried (hb-status flushes every 15 minutes) for notify.retry_minutes, then
-dropped with an event saying so. Texts are short ASCII status lines built
+dropped with an event saying so. Each try goes by sms_command first and, if
+that fails, by sms_fallback: a second route that doesn't depend on what the
+first one does (hooks/sms-supervoip, say, when the first runs through
+Kubernetes). A dropped SMS, or one that needed the fallback, makes
+`hb notify check` warn for 24 hours. Texts are short ASCII status lines built
 from check results; they never carry message, call or file content.
 
-Config ([notify] in hb.toml): sms_command, sms_per_day, repeat_hours,
-retry_minutes. sms_command is an argv list that gets the text on stdin and
-exits 0 once the SMS is queued or sent. Empty means banner only.
+Config ([notify] in hb.toml): sms_command, sms_fallback, sms_per_day,
+repeat_hours, retry_minutes. Both commands are argv lists that get the text on
+stdin and exit 0 once the SMS is queued or sent. Empty means banner only.
 """
 import json
 import os
@@ -36,7 +40,30 @@ SMS_CHARS = 160  # one GSM-7 segment
 def paths():
     d = util.state_dir("notify")
     return {"dir": d, "lock": os.path.join(d, "lock"), "outbox": os.path.join(d, "outbox.json"),
-            "sent": os.path.join(d, "sent.json")}
+            "sent": os.path.join(d, "sent.json"), "trouble": os.path.join(d, "trouble.json")}
+
+
+def last_line(err, rc):
+    return (err.strip().splitlines() or [f"exit {rc}"])[-1][:200]
+
+
+def send_one(cfg, text):
+    """(route, main route's error) once a route took it, or (None, error)."""
+    rc, _, err = util.run(*cfg["sms_command"], input=text + "\n", timeout=60)
+    if rc == 0:
+        return "main", None
+    main_err = last_line(err, rc)
+    if not cfg["sms_fallback"]:
+        return None, main_err
+    rc, _, err = util.run(*cfg["sms_fallback"], input=text + "\n", timeout=60)
+    if rc == 0:
+        return "fallback", main_err
+    return None, f"{main_err}; fallback: {last_line(err, rc)}"
+
+
+def trouble(p, what, key, error):
+    """Remember the last SMS that was dropped or needed the fallback, for hb notify check."""
+    util.write_json(p["trouble"], {"ts": int(time.time()), "what": what, "key": key, "error": error})
 
 
 def sms_text(level, key, text):
@@ -78,17 +105,22 @@ def flush(p, cfg):
     for m in outbox:
         if now - m["ts"] > cfg["retry_minutes"] * 60:
             record("warn", "notify", f"gave up on the SMS for {m['key']} after {m['tries']} tries: {m['error']}")
+            trouble(p, "gave up on", m["key"], m["error"])
             continue
         if sum(1 for s in sent if now - s["ts"] < 86400) >= cfg["sms_per_day"]:
             record("warn", "notify", f"no SMS for {m['key']}: {cfg['sms_per_day']} already sent in 24 h")
             continue
         m["tries"] += 1
-        rc, out, err = util.run(*cfg["sms_command"], input=m["text"] + "\n", timeout=60)
-        if rc == 0:
-            sent.append({"ts": int(now), "key": m["key"]})
+        route, error = send_one(cfg, m["text"])
+        if route:
+            sent.append({"ts": int(now), "key": m["key"], "route": route})
             delivered += 1
+            if route == "fallback":
+                record("warn", "notify", f"the SMS for {m['key']} went by notify.sms_fallback; "
+                                         f"the main route failed: {error}")
+                trouble(p, "sent by the fallback", m["key"], error)
         else:
-            m["error"] = (err.strip().splitlines() or [f"exit {rc}"])[-1][:200]
+            m["error"] = error
             keep.append(m)
     util.write_json(p["outbox"], keep)
     util.write_json(p["sent"], sent)
@@ -138,23 +170,49 @@ def cmd_events(n):
     return 0
 
 
+def cmd_test_fallback(cfg):
+    if not cfg["sms_fallback"]:
+        print("notify.sms_fallback is empty: nothing to test")
+        return 1
+    p = paths()
+    with util.Lock(p["lock"]):
+        record("info", "notify.test", "test SMS by the fallback requested")
+        rc, _, err = util.run(*cfg["sms_fallback"], input=sms_text("info", "notify", "test of the fallback route")
+                              + "\n", timeout=60)
+        if rc == 0:
+            sent = util.read_json(p["sent"], [])
+            util.write_json(p["sent"], sent + [{"ts": int(time.time()), "key": "notify.test", "route": "fallback"}])
+    print("sent by notify.sms_fallback" if rc == 0 else f"not sent: {last_line(err, rc)}")
+    return 0 if rc == 0 else 1
+
+
 def cmd_check(cfg):
     if not cfg["sms_command"]:
         print("ok: banner only (notify.sms_command is empty)")
         return 0
+    t = util.read_json(os.path.join(util.STATE, "notify", "trouble.json"), None)
+    if t and time.time() - t["ts"] < 86400:
+        when = time.strftime("%d %b %H:%M", time.localtime(t["ts"]))
+        print(f"warn: {when} {t['what']} the SMS for {t['key']}: {t['error']}")
+        return 1
     outbox = util.read_json(os.path.join(util.STATE, "notify", "outbox.json"), [])
     if outbox:
         print(f"warn: {len(outbox)} SMS waiting to go out (last error: {outbox[-1]['error'] or 'none yet'})")
         return 1
-    print("ok: SMS for failures, banner for everything")
+    print("ok: SMS for failures" + (" (with a fallback)" if cfg["sms_fallback"] else "") + ", banner for everything")
     return 0
 
 
 def main(argv):
     verb = argv[1] if len(argv) > 1 else "events"
-    if verb in ("help", "-h", "--help"):
+    if verb in ("help", "-h", "--help") or (verb != "send" and any(a in ("-h", "--help") for a in argv[2:])):
         print(__doc__.strip())
         return 0
+    extra = [a for a in argv[2:] if a != "--fallback"] if verb == "test" else []
+    if extra:
+        print(f"hb notify test: unknown {' '.join(extra)}; it takes only --fallback and sends with the command "
+              "in hb.toml. To try other options, run that command itself.", file=sys.stderr)
+        return 2
     if os.geteuid() != 0:
         print("error: run with sudo", file=sys.stderr)
         return 2
@@ -171,7 +229,7 @@ def main(argv):
             flush(p, cfg)
         return 0
     if verb == "test":
-        return cmd_test(cfg)
+        return cmd_test_fallback(cfg) if "--fallback" in argv[2:] else cmd_test(cfg)
     print(__doc__.strip(), file=sys.stderr)
     return 2
 
