@@ -300,6 +300,15 @@ A review of 9d found four gaps, all fixed:
 - **Names with spaces**, of subvolumes and of mounts, are kept whole.
 - **`hb upgrade`**: `rpm` unable to list kernels is a "can't tell", as in `hb health`.
 
+And from the review after that:
+
+- **A path inside a mount** other than `/` itself (a bind mount of the root filesystem
+  included) is read live: the snapshot holds what lies under such a mount, not what is
+  mounted there. The containing mount is asked for (`findmnt -T`), and if it can't be
+  told, the path is read live too.
+- **The root subvolume's own path** (`findmnt -o FSROOT /`), which subvolume paths are
+  measured from, is checked as well; if it can't be read, coverage says so.
+
     sudo ./hb install apply        # y to code
     sudo hb backup run             # or wait for the night's
     sudo hb backup status          # covered: from the snapshot: ... (as before on this box)

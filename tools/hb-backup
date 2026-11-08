@@ -99,8 +99,16 @@ boundaries() {
     printf '?findmnt: %s\n' "${out##*$'\n'}"
   fi
   if [ "$(stat -f -c %T /)" = btrfs ]; then
-    fsroot="$(findmnt -no FSROOT / 2>/dev/null)"; fsroot="${fsroot%/}"
-    if out="$(btrfs subvolume list -o / 2>&1)"; then
+    # subvolume paths are relative to the filesystem's top; / may be a subvolume of it (FSROOT)
+    if ! fsroot="$(findmnt -no FSROOT / 2>&1)" || [[ $fsroot != /* ]]; then
+      printf '?findmnt FSROOT of /: %s\n' "${fsroot##*$'\n'}"
+      fsroot=""; out=""
+    elif ! out="$(btrfs subvolume list -o / 2>&1)"; then
+      printf '?btrfs subvolume list: %s\n' "${out##*$'\n'}"
+      out=""
+    fi
+    fsroot="${fsroot%/}"
+    if [ -n "$out" ]; then
       while IFS= read -r t; do
         [ -n "$t" ] || continue
         if [[ $t =~ ^ID\ [0-9]+\ gen\ [0-9]+\ top\ level\ [0-9]+\ path\ (.+)$ ]]; then
@@ -111,8 +119,6 @@ boundaries() {
           printf '?btrfs subvolume list: a line it can'"'"'t read: %s\n' "${t:0:80}"
         fi
       done <<< "$out"
-    else
-      printf '?btrfs subvolume list: %s\n' "${out##*$'\n'}"
     fi
   fi
   snapdir="$(cfg snapshot.dir)"
@@ -132,8 +138,15 @@ excluded() {
   return 1
 }
 
-# boundary PATH — a mount point (bind mounts included), or not on the root filesystem's device
-boundary() { mountpoint -q "$1" 2>/dev/null || [ "$(stat -c %d "$1")" != "$rootdev" ]; }
+# boundary PATH — PATH is in some mount other than / itself (it is one, or lies inside one, bind
+# mounts of the root filesystem included), or on another device (a subvolume). The snapshot of /
+# holds what is below such a mount, not what is mounted there. If findmnt can't say, it counts as
+# one: reading live is the safe side.
+boundary() {
+  local m
+  m="$(findmnt -n -o TARGET -T "$1" 2>/dev/null)" || return 0
+  [ "$m" != / ] || [ "$(stat -c %d "$1")" != "$rootdev" ]
+}
 
 # backup_paths [restic flags] — restic sees the snapshot's files at their real paths:
 # in a private mount namespace, every path on the root filesystem gets the

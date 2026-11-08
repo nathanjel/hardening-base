@@ -24,12 +24,21 @@ exit 0
 BTRFS = """#!/bin/sh
 case "$1 $2" in
   "subvolume list") [ -e {fail} ] && {{ echo "ERROR: can't access '/'" >&2; exit 1; }}
-                    echo "ID 300 gen 9 top level 5 path {subvol}"
-                    echo "ID 301 gen 9 top level 5 path {subvol2}" ;;
+                    p="$(cat {prefix} 2>/dev/null)"         # / as a subvolume: paths carry its name
+                    echo "ID 300 gen 9 top level 5 path ${{p}}{subvol}"
+                    echo "ID 301 gen 9 top level 5 path ${{p}}{subvol2}" ;;
   "subvolume snapshot") mkdir -p "$5" && [ -d {seed} ] && cp -a {seed}/. "$5" ;;
   "subvolume delete") rm -rf "$3" ;;
 esac
 exit 0
+"""
+# findmnt as it is, except FSROOT of /, which can fail or name a root subvolume
+FINDMNT = """#!/bin/sh
+case "$*" in
+  *FSROOT*) [ -e {fail} ] && {{ echo "findmnt: can't read /proc/self/mountinfo" >&2; exit 1; }}
+            [ -e {answer} ] && {{ cat {answer}; exit 0; }} ;;
+esac
+exec {real} "$@"
 """
 
 
@@ -48,10 +57,13 @@ class CoverageTest(unittest.TestCase):
         open(f"{d}/repo/config", "w").close()
         self.log = f"{d}/restic.log"
         self.flag, self.seed = f"{d}/btrfs-fails", f"{d}/seed"
+        self.prefix, self.fsroot_fail, self.fsroot = f"{d}/subvol-prefix", f"{d}/fsroot-fails", f"{d}/fsroot"
         os.makedirs(f"{d}/a/data archive")
         for name, text in (("restic", RESTIC.format(log=self.log)),
                            ("btrfs", BTRFS.format(subvol=f"{d}/a/subvol".lstrip("/"), fail=self.flag, seed=self.seed,
-                                                  subvol2=f"{d}/a/data archive".lstrip("/")))):
+                                                  subvol2=f"{d}/a/data archive".lstrip("/"), prefix=self.prefix)),
+                           ("findmnt", FINDMNT.format(fail=self.fsroot_fail, answer=self.fsroot,
+                                                      real=shutil.which("findmnt")))):
             with open(f"{d}/bin/{name}", "w") as f:
                 f.write(text)
             os.chmod(f"{d}/bin/{name}", 0o755)
@@ -131,6 +143,30 @@ class CoverageTest(unittest.TestCase):
         self.assertEqual(self.tool("run", mounts=False).returncode, 0)
         self.assertIn("unknown findmnt: findmnt: cannot open /proc/self/mountinfo", self.coverage())
 
+    def test_a_root_subvolume_prefix_is_taken_off(self):
+        d = self.d
+        with open(self.fsroot, "w") as f:
+            f.write("/root\n")
+        with open(self.prefix, "w") as f:
+            f.write("root/")
+        self.config([f"{d}/a"], exclude=[f"{d}/a/inner"])
+        self.assertEqual(self.tool("run").returncode, 0)
+        self.assertIn(f"left-out {d}/a/subvol", self.coverage())        # found through the prefix
+
+    def test_a_failed_root_subvolume_lookup_is_unknown(self):
+        d = self.d
+        open(self.fsroot_fail, "w").close()                             # the mount table itself still reads
+        with open(self.prefix, "w") as f:
+            f.write("root/")
+        self.config([f"{d}/a"], exclude=[f"{d}/a/inner"])
+        self.assertEqual(self.tool("run").returncode, 0)
+        cov = self.coverage()
+        self.assertIn("unknown findmnt FSROOT of /: findmnt: can't read /proc/self/mountinfo", cov)
+        self.assertNotIn(f"left-out {d}/a/inner", cov)                   # mounts were still checked
+        r = self.tool("check", mounts=False)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("couldn't tell what it left out", r.stdout)
+
     def test_a_listed_child_mount_is_covered_and_a_spaced_name_is_whole(self):
         d = self.d
         os.makedirs(f"{d}/a/my mount")
@@ -191,6 +227,19 @@ class SnapshotReadTest(CoverageTest.__base__):
         self.assertIn(f"snapshot {h}/b", cov)
         self.assertIn(f"live {h}/a", cov)                                   # said as it is: read live
         self.assertIn(f"live {h}/a/inner", cov)
+
+    def test_a_folder_inside_a_bind_mount_is_read_live(self):
+        h = self.h
+        os.makedirs(f"{h}/realsrc/sub")
+        open(f"{h}/realsrc/sub/live-file", "w").close()
+        os.makedirs(f"{h}/srv/sub")                                          # what lies under the mount
+        os.makedirs(f"{self.seed}{h}/srv/sub", exist_ok=True)
+        open(f"{self.seed}{h}/srv/sub/snapshot-file", "w").close()
+        self.config([f"{h}/srv/sub"])
+        r = self.tool("run", mounts=False, extra=f"mount --bind {h}/realsrc {h}/srv && ")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.sees(f"{h}/srv/sub"), ["live-file"])        # what is mounted there, not below it
+        self.assertIn(f"live {h}/srv/sub", self.coverage())
 
 if __name__ == "__main__":
     unittest.main()
