@@ -40,7 +40,7 @@ class Fake:
 
     def __init__(self):
         self.calls, self.restart = [], 1        # dnf needs-restarting -r: 1 = reboot needed
-        self.dnf_rc, self.kernel = 0, os.uname().release
+        self.dnf_rc, self.kernel, self.rpm_fails = 0, os.uname().release, False
         self.rpm = ["bash.x86_64 5.2-1", "kernel-core.x86_64 7.2.13-200"]
 
     def __call__(self, *cmd, **kw):
@@ -54,6 +54,8 @@ class Fake:
         if cmd[:2] == ("dnf", "needs-restarting"):
             return self.restart, "Reboot is required to fully utilize these updates.\n" if self.restart else "", ""
         if cmd[:3] == ("rpm", "-q", "kernel-core"):
+            if self.rpm_fails:
+                return 1, "", "error: rpmdb open failed"
             return 0, f"kernel-core-{self.kernel}  Sun 01 Nov 2026\n", ""
         if cmd[:2] == ("snap", "list"):
             return 0, SNAP_LIST, ""
@@ -96,6 +98,9 @@ class UpgradeTest(unittest.TestCase):
         for rc, text in ((2, "exit 2"), (127, "not installed"), (124, "timed out")):
             self.fake.restart = rc
             self.assertEqual(up.reboot_reason(), (None, f"dnf needs-restarting -r: {text}"))
+        self.fake.restart, self.fake.rpm_fails = 0, True       # dnf says no, but the kernel list is unreadable
+        self.assertEqual(up.reboot_reason(), (None, "rpm can't list kernel-core (exit 1)"))
+        self.fake.rpm_fails = False
         c = cfg(snaps=["microk8s"])                            # held already, so only the reboot speaks
         self.fake.restart = 127
         self.assertEqual(up.do_run(c, now=NIGHT), 0)           # no reboot: nothing says one is needed

@@ -287,3 +287,20 @@ the kit being swapped for a link while it is made.
 
 If something is left out on purpose, add it to `backup.exclude`; otherwise add it to
 `backup.paths`.
+
+A review of 9d found four gaps, all fixed:
+
+- **A failed lookup** (`findmnt`, `btrfs subvolume list`) is recorded as "couldn't check"
+  and makes `check` warn, instead of reading as "nothing left out".
+- **A listed path inside another listed path** is not reported as left out. And a path
+  with a mount or another subvolume listed below it is read live, both of them: the
+  snapshot's copy over the parent would have hidden the mount, and restic would have read
+  the empty folder it sits on. A listed path that is itself a mount point is always read
+  live.
+- **Names with spaces**, of subvolumes and of mounts, are kept whole.
+- **`hb upgrade`**: `rpm` unable to list kernels is a "can't tell", as in `hb health`.
+
+    sudo ./hb install apply        # y to code
+    sudo hb backup run             # or wait for the night's
+    sudo hb backup status          # covered: from the snapshot: ... (as before on this box)
+    sudo hb check

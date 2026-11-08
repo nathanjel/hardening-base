@@ -22,8 +22,9 @@
 # Each run notes what it covered (last-coverage): paths that don't exist, paths read
 # live rather than from the snapshot (not on the root filesystem, or no snapshot),
 # and mounts or btrfs subvolumes below the paths, which neither the snapshot nor
-# --one-file-system takes in. A missing path, or something left out that isn't in
-# backup.exclude, makes check warn.
+# --one-file-system takes in. A missing path, a lookup that failed (so it can't tell),
+# or something left out that isn't in backup.exclude makes check warn. A path with
+# another listed path below it on a different filesystem is read live, both of them.
 #
 # Config ([backup] in hb.toml): repo, password_file, require_mount, paths,
 # exclude, exclude_if_present, keep_daily, keep_weekly, keep_monthly,
@@ -81,19 +82,45 @@ take_snapshot() {
 }
 drop_snapshot() { [ -n "$SNAP" ] && [ -e "$SNAP" ] && btrfs subvolume delete "$SNAP" >/dev/null; }
 
-# boundaries PATH... — mount points and btrfs subvolumes strictly below the paths: the
-# snapshot doesn't hold them and --one-file-system doesn't cross into them.
+# Filesystems that hold nothing to back up (pseudo, in-memory, container layers, snap images).
+PSEUDO='^(proc|sysfs|devtmpfs|devpts|tmpfs|ramfs|cgroup2?|securityfs|pstore|bpf|tracefs|debugfs|mqueue|hugetlbfs|configfs|fusectl|autofs|binfmt_misc|nsfs|efivarfs|overlay|squashfs|fuse\.snapfuse|rpc_pipefs)$'
+
+# boundaries PATH... — mount points and btrfs subvolumes strictly below the paths (but not
+# themselves one of the paths): the snapshot doesn't hold them and --one-file-system doesn't
+# cross into them. A lookup that fails prints "?what: error" instead, so the report can say
+# it doesn't know rather than that nothing was left out.
 boundaries() {
-  local p m fsroot
-  fsroot="$(findmnt -no FSROOT / 2>/dev/null)"; fsroot="${fsroot%/}"
-  # pseudo and in-memory filesystems hold nothing to back up; hb's own snapshots are never wanted
-  { findmnt -rn -o TARGET,FSTYPE 2>/dev/null | awk '$2 !~ /^(proc|sysfs|devtmpfs|devpts|tmpfs|ramfs|cgroup2?|securityfs|pstore|bpf|tracefs|debugfs|mqueue|hugetlbfs|configfs|fusectl|autofs|binfmt_misc|nsfs|efivarfs|overlay|squashfs|fuse\.snapfuse|rpc_pipefs)$/ {print $1}' \
-      | sed 's/\\x20/ /g'
-    [ "$(stat -f -c %T /)" = btrfs ] && btrfs subvolume list -o / 2>/dev/null \
-      | awk -v r="$fsroot" '{p = "/" $NF; if (r != "" && index(p, r "/") == 1) p = substr(p, length(r) + 1); print p}'
-  } | grep -v -e "^$(cfg snapshot.dir)\(/\|$\)" | while IFS= read -r m; do
+  local p m t fs out fsroot snapdir found=()
+  if out="$(findmnt -rn -o TARGET,FSTYPE 2>&1)"; then
+    while read -r t fs; do
+      [ -n "$t" ] && ! [[ $fs =~ $PSEUDO ]] && found+=("$(printf '%b' "$t")")   # -r writes bytes as \xHH
+    done <<< "$out"
+  else
+    printf '?findmnt: %s\n' "${out##*$'\n'}"
+  fi
+  if [ "$(stat -f -c %T /)" = btrfs ]; then
+    fsroot="$(findmnt -no FSROOT / 2>/dev/null)"; fsroot="${fsroot%/}"
+    if out="$(btrfs subvolume list -o / 2>&1)"; then
+      while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        if [[ $t =~ ^ID\ [0-9]+\ gen\ [0-9]+\ top\ level\ [0-9]+\ path\ (.+)$ ]]; then
+          m="/${BASH_REMATCH[1]}"                    # the whole path, spaces and all
+          [ -n "$fsroot" ] && [[ $m == "$fsroot"/* ]] && m="${m#"$fsroot"}"
+          found+=("$m")
+        else
+          printf '?btrfs subvolume list: a line it can'"'"'t read: %s\n' "${t:0:80}"
+        fi
+      done <<< "$out"
+    else
+      printf '?btrfs subvolume list: %s\n' "${out##*$'\n'}"
+    fi
+  fi
+  snapdir="$(cfg snapshot.dir)"
+  for m in "${found[@]}"; do
+    { [ "$m" = "$snapdir" ] || [[ $m == "$snapdir"/* ]]; } && continue
+    for p in "$@"; do [ "$m" = "$p" ] && continue 2; done      # listed itself: backed up on its own
     for p in "$@"; do
-      [ "$m" != "$p" ] && [[ $m == "${p%/}"/* ]] && { printf '%s\n' "$m"; break; }
+      [[ $m == "${p%/}"/* ]] && { printf '%s\n' "$m"; break; }
     done
   done | sort -u
 }
@@ -105,6 +132,9 @@ excluded() {
   return 1
 }
 
+# boundary PATH — a mount point (bind mounts included), or not on the root filesystem's device
+boundary() { mountpoint -q "$1" 2>/dev/null || [ "$(stat -c %d "$1")" != "$rootdev" ]; }
+
 # backup_paths [restic flags] — restic sees the snapshot's files at their real paths:
 # in a private mount namespace, every path on the root filesystem gets the
 # snapshot's copy bind-mounted over it. Paths on other filesystems are read live.
@@ -113,18 +143,31 @@ backup_paths() {
   rootdev="$(stat -c %d /)"
   for p in "${IF_PRESENT[@]}"; do args+=(--exclude-if-present "$p"); done
   for p in "${EXCLUDE[@]}"; do args+=(--exclude "$p"); done
-  local cov=()
+  local cov=() c line
   for p in "${PATHS[@]}"; do
     [ -e "$p" ] || { log "skipping $p: it doesn't exist"; cov+=("missing $p"); continue; }
     have+=("$p")
-    if [ -n "$SNAP" ] && [ "$(stat -c %d "$p")" = "$rootdev" ] && [ -d "$SNAP$p" ]; then
+  done
+  for p in "${have[@]}"; do
+    # The snapshot's copy goes over p only when p is a plain folder of the root filesystem and no
+    # listed path below it is a mount or another subvolume: the copy would hide that, and restic
+    # would read the empty folder it was mounted on.
+    local hides=""
+    for c in "${have[@]}"; do
+      [ "$c" != "$p" ] && [[ $c == "${p%/}"/* ]] && boundary "$c" && hides="$c"
+    done
+    if [ -n "$SNAP" ] && [ -z "$hides" ] && ! boundary "$p" && [ -d "$SNAP$p" ]; then
       binds+=("$p"); cov+=("snapshot $p")
     else
       cov+=("live $p")
     fi
   done
-  while IFS= read -r p; do
-    excluded "$p" && cov+=("excluded $p") || { log "not in the backup: $p (a mount or subvolume below backup.paths)"; cov+=("left-out $p"); }
+  while IFS= read -r line; do
+    case "$line" in
+      "?"*) log "can't tell what is left out: ${line#?}"; cov+=("unknown ${line#?}") ;;
+      *) if excluded "$line"; then cov+=("excluded $line")
+         else log "not in the backup: $line (a mount or subvolume below backup.paths)"; cov+=("left-out $line"); fi ;;
+    esac
   done < <(boundaries "${have[@]}")
   [ "${COVERAGE:-}" ] && printf '%s\n' "${cov[@]}" > "$COVERAGE"
   [ ${#have[@]} -gt 0 ] || die "none of backup.paths exist"
@@ -200,6 +243,8 @@ cmd_check() {
   missing="$(grep -c '^missing ' "$STATUS/last-coverage" 2>/dev/null)"
   left="$(grep -c '^left-out ' "$STATUS/last-coverage" 2>/dev/null)"
   [ "${missing:-0}" -gt 0 ] && { echo "warn: last backup $h h ago; $missing of backup.paths don't exist (hb backup status)"; return 1; }
+  grep -q '^unknown ' "$STATUS/last-coverage" 2>/dev/null \
+    && { echo "warn: last backup $h h ago; couldn't tell what it left out (hb backup status)"; return 1; }
   [ "${left:-0}" -gt 0 ] && { echo "warn: last backup $h h ago left out $left mounts or subvolumes below backup.paths (hb backup status)"; return 1; }
   chk="$(cat "$STATUS/last-check" 2>/dev/null)"
   case "$chk" in
@@ -221,10 +266,11 @@ cmd_status() {
   if [ -s "$STATUS/last-coverage" ]; then
     echo "covered:"
     awk '{k = $1; sub(/^[^ ]+ /, ""); n[k] = n[k] (n[k] ? ", " : "") $0}
-         END {split("snapshot live missing left-out excluded", o, " ")
+         END {split("snapshot live missing unknown left-out excluded", o, " ")
+              t["unknown"] = "COULDN'"'"'T CHECK"
               t["snapshot"] = "from the snapshot"; t["live"] = "read live"; t["missing"] = "MISSING"
               t["left-out"] = "LEFT OUT (mounts, subvolumes)"; t["excluded"] = "left out, in backup.exclude"
-              for (i = 1; i <= 5; i++) if (o[i] in n) printf "            %-30s %s\n", t[o[i]] ":", n[o[i]]}' "$STATUS/last-coverage"
+              for (i = 1; i <= 6; i++) if (o[i] in n) printf "            %-30s %s\n", t[o[i]] ":", n[o[i]]}' "$STATUS/last-coverage"
   fi
   local a b
   if read -r a b 2>/dev/null < "$STATUS/last-check"; then

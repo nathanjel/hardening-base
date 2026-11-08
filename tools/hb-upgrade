@@ -161,9 +161,12 @@ def snap_refresh(cfg, st):
 
 
 def newest_kernel():
-    rc, out, _ = util.run("rpm", "-q", "kernel-core", "--last")
+    """(the newest installed kernel's version, None), or ("", why rpm couldn't tell)."""
+    rc, out, err = util.run("rpm", "-q", "kernel-core", "--last")
     first = out.splitlines()[0].split()[0] if rc == 0 and out.strip() else ""
-    return first[len("kernel-core-"):] if first.startswith("kernel-core-") else ""
+    if first.startswith("kernel-core-"):
+        return first[len("kernel-core-"):], None
+    return "", "rpm can't list kernel-core (" + {127: "not installed", 124: "timed out"}.get(rc, f"exit {rc}") + ")"
 
 
 def reboot_reason():
@@ -173,13 +176,16 @@ def reboot_reason():
         lines = [l.strip() for l in out.splitlines() if l.strip() and not l.startswith(("Updating", "Repositories"))]
         return "dnf needs-restarting: " + (next((l for l in lines if "Reboot" in l or "updated" in l),
                                                 "reboot required")), None
-    running, newest = os.uname().release, newest_kernel()
+    running, (newest, kernel_err) = os.uname().release, newest_kernel()
     if newest and newest != running:
         return f"kernel {newest} is installed, {running} runs", None
+    unknown = []
     if rc != 0:                                       # 0 is the only "no reboot needed"
-        return None, "dnf needs-restarting -r: " + {127: "not installed", 124: "timed out"}.get(
-            rc, f"exit {rc}" + (f" ({err.strip().splitlines()[-1][:120]})" if err.strip() else ""))
-    return None, None
+        unknown.append("dnf needs-restarting -r: " + {127: "not installed", 124: "timed out"}.get(
+            rc, f"exit {rc}" + (f" ({err.strip().splitlines()[-1][:120]})" if err.strip() else "")))
+    if kernel_err:
+        unknown.append(kernel_err)
+    return None, "; ".join(unknown) or None
 
 
 def reboot(st, why):
