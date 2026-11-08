@@ -91,11 +91,14 @@ class SupervoipHookTest(unittest.TestCase):
         self.assertEqual((b["sender"], b["voipNumber"], b["country"], b["recipients"]),
                          ("voipNumber", "/api/voip_numbers/3", "/api/countries/1", ["+15550100"]))
 
-    def test_accepted_but_not_sent_is_a_failure(self):
-        Api.post_answer = {"queuedMessages": []}
-        r = self.hook()
-        self.assertEqual(r.returncode, 1)
-        self.assertIn("not sent", r.stderr)
+    def test_no_confirmation_is_a_failure(self):
+        for answer, what in (({"queuedMessages": []}, "empty"), ({}, "missing"), ({"queuedMessages": None}, "missing"),
+                             ({"queuedMessages": "ok"}, "a str"), ({"queuedMessages": {"id": 1}}, "a dict"),
+                             ([{"id": 1}], "missing")):
+            Api.post_answer = answer
+            r = self.hook()
+            self.assertEqual(r.returncode, 1, (answer, r.stderr))
+            self.assertIn(f"no confirmation that it was sent (queuedMessages {what})", r.stderr)
 
     def test_an_api_error_names_the_status_never_the_text(self):
         Api.post_status, Api.post_answer = 401, {"detail": "Invalid JWT"}

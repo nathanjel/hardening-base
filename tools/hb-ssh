@@ -267,11 +267,20 @@ def wanted(codes, key_only):
     return w
 
 
+NO_ROUTE = "no route"
+
+
 def local_addr(peer):
-    """The address this box would answer peer from, or None when there's no route."""
-    rc, out, _ = util.run("ip", "-o", "route", "get", peer)
+    """(the address this box would answer peer from, None); (None, NO_ROUTE) when the box has no
+    route there at all, so such clients can't reach it; or (None, why) when it couldn't be told."""
+    rc, out, err = util.run("ip", "-o", "route", "get", peer)
     m = re.search(r"\bsrc (\S+)", out) if rc == 0 else None
-    return m.group(1) if m else None
+    if m:
+        return m.group(1), None
+    text = (err or out).strip()
+    if rc != 0 and "Network is unreachable" in text:
+        return None, NO_ROUTE
+    return None, (text.splitlines() or [f"exit {rc}"])[-1][:120]
 
 
 def sshd_view(spec=None):
@@ -322,10 +331,15 @@ def sshd_mismatches(cfg, sv):
         return [f"sshd -T: {err}"]
     lport = (plain.get("port") or ["22"])[0]
     diffs = {}                                         # (key, have, want) -> ["nathan from ..."]
+    checked, no_route = 0, []
     for where, peer, key_only in clients(sv):
-        laddr = local_addr(peer)
-        if laddr is None:
-            continue                                   # no route: such clients can't reach the box
+        laddr, why = local_addr(peer)
+        if why == NO_ROUTE:
+            no_route.append(where)                     # such clients can't reach the box
+            continue
+        if why:
+            return [f"cannot check {where}: ip route get {peer}: {why}"]
+        checked += 1
         for user in users:
             view, err = sshd_view(f"user={user},host={peer},addr={peer},laddr={laddr},lport={lport}")
             if err:
@@ -336,6 +350,9 @@ def sshd_mismatches(cfg, sv):
                 have = " ".join(view.get(key, ["(not set)"]))
                 if have != want:
                     diffs.setdefault((key, have, want), []).append(f"{user} from {where}")
+    if not checked:
+        return [f"nothing checked: no route to {', '.join(no_route) or 'any client'}, so hb can't tell "
+                "what sshd would do"]
     out = []
     for (key, have, want), who in diffs.items():
         where = sorted(set(set_in(key)) | set(set_in("match")))

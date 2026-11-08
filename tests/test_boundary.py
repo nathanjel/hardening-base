@@ -140,6 +140,9 @@ class TwoUsersTest(unittest.TestCase):
     def test_kit_notices_its_folder_being_replaced(self):
         self.inner("kit_swapped")
 
+    def test_kit_ignores_a_folder_above_being_replaced(self):
+        self.inner("kit_ancestor")
+
 
 # --- inside the namespace --------------------------------------------------------------------
 
@@ -400,9 +403,9 @@ def case_kit():
                                user=ME, group=GID, extra_groups=[], cwd="/")
     time.sleep(0.2)
     rc = bg.do_kit(cfg, to)
-    refused = int(planter.communicate(timeout=40)[0].strip())
+    planter.communicate(timeout=40)
     assert rc == 0, rc
-    assert refused > 0, "the folder was open to the user while the kit was being made"
+    assert not os.path.lexists(f"{to}/planted"), "the user got a link into the kit's folder before it was theirs"
     assert_untouched(target)
     st = os.stat(to)
     assert st.st_uid == ME and stat.S_IMODE(st.st_mode) == 0o700, st
@@ -413,27 +416,58 @@ def case_kit():
         assert mode is None or stat.S_IMODE(st.st_mode) == mode, (name, oct(st.st_mode))
 
 
+def after_mkdir(name, script):
+    """Run script as the user right after root creates a folder called name (by path or by descriptor)."""
+    real = os.mkdir
+
+    def mkdir(path, *a, **kw):
+        real(path, *a, **kw)
+        if os.path.basename(path) == name:
+            as_user(script)
+    os.mkdir = mkdir
+    return lambda: setattr(os, "mkdir", real)
+
+
 def case_kit_swapped():
     bg, cfg = kit_tool()
     user_dir(f"{TMP}/nh")
     elsewhere = f"{TMP}/elsewhere"
     os.mkdir(elsewhere)
-    real = os.makedirs
     for name, swap in (("link", "mv {to} {to}.orig; ln -s %s {to}" % elsewhere),
                        ("own", "mv {to} {to}.orig; mkdir {to}")):
         to = f"{TMP}/nh/{name}"
-
-        def swapping(path, *a, target=to, script=swap, **kw):
-            real(path, *a, **kw)
-            if path == target:
-                as_user(script.format(to=target))
-
-        os.makedirs = swapping
+        undo = after_mkdir(name, swap.format(to=to))
         assert bg.do_kit(cfg, to) == 2
-        os.makedirs = real
+        undo()
         assert os.listdir(elsewhere) == [], "kit files landed in the swapped-in folder"
         if name == "own":
             assert os.listdir(to) == [], "kit files landed in the user's replacement folder"
+
+
+def case_kit_ancestor():
+    """A folder of the user's above the kit is swapped for a link to a folder of root's, right after the
+    kit's folder is made; and a link already in the path. Root's folders keep their owner and contents."""
+    bg, cfg = kit_tool()
+    user_dir(f"{TMP}/nh")
+    rootdir = f"{TMP}/rootdir"                               # what the link points at: root's, with a kit inside
+    os.makedirs(f"{rootdir}/b/kit")
+    root_file(f"{rootdir}/b/kit/root-file")
+    as_user(f"mkdir -p {TMP}/nh/a/b")
+    undo = after_mkdir("kit", f"mv {TMP}/nh/a {TMP}/nh/a.old; ln -s {rootdir} {TMP}/nh/a")
+    rc = bg.do_kit(cfg, f"{TMP}/nh/a/b/kit")
+    undo()
+    assert_untouched(f"{rootdir}/b/kit/root-file")
+    for d in (rootdir, f"{rootdir}/b", f"{rootdir}/b/kit"):
+        assert os.lstat(d).st_uid == 0, f"{d} was given away"
+    assert sorted(os.listdir(f"{rootdir}/b/kit")) == ["root-file"], os.listdir(f"{rootdir}/b/kit")
+    assert rc == 0, rc                                       # the kit went where the path pointed when it was opened
+    assert os.lstat(f"{TMP}/nh/a.old/b/kit").st_uid == ME
+    assert sorted(os.listdir(f"{TMP}/nh/a.old/b/kit")) == ["kit.html", "kit.txt", "rescue.key", "rescue.key.pub"]
+
+    # a link already in the path: refused before anything is written
+    rc = bg.do_kit(cfg, f"{TMP}/nh/a/b/kit2")               # nh/a is now the link to rootdir
+    assert rc == 2, rc
+    assert not os.path.lexists(f"{rootdir}/b/kit2"), "the kit followed a link of the user's"
 
 
 def inner(case, me, gid):

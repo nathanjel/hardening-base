@@ -20,7 +20,8 @@ reports on (e.g. one that runs through Kubernetes):
 Exits 0 once supervoip has queued the message. Errors go to stderr as one line;
 the text itself is never printed or logged. Uses the API as supervoip's schema
 (/api/docs.json, SmsMessage) has it: recipients is a list, the body is "text",
-country is required, and a 2xx answer with no queuedMessages was not sent.
+country is required, and only an answer that lists the message in queuedMessages
+counts as sent.
 """
 import argparse
 import json
@@ -133,10 +134,13 @@ def main(argv):
     except RuntimeError as e:
         print(f"sms-supervoip: {e}", file=sys.stderr)
         return 1
+    # supervoip confirms a send only by listing it in queuedMessages; anything else (missing, null,
+    # empty, another type) is no confirmation, so hb notify keeps the SMS and tries again
     queued = answer.get("queuedMessages") if isinstance(answer, dict) else None
-    if isinstance(queued, list) and not queued:
-        print("sms-supervoip: accepted but not sent (no queuedMessages): check the number and the sender",
-              file=sys.stderr)
+    if not (isinstance(queued, list) and queued):
+        what = "empty" if isinstance(queued, list) else "missing" if queued is None else f"a {type(queued).__name__}"
+        print(f"sms-supervoip: no confirmation that it was sent (queuedMessages {what}): "
+              "check the number and the sender", file=sys.stderr)
         return 1
     return 0
 

@@ -166,7 +166,10 @@ def check_k8s(cfg):
         pods = None
     if pods is None:
         return FAIL, "cannot list pods"
-    bad, evicted, fine = pod_states(pods)
+    parents = {}
+    if any(p.get("status", {}).get("reason") == "Evicted" for p in pods):
+        parents = replicaset_parents()
+    bad, evicted, fine = pod_states(pods, parents)
     left = (f"; {evicted} evicted pods left over (kubectl delete pod -A --field-selector=status.phase=Failed)"
             if evicted else "")
     if bad:
@@ -174,30 +177,66 @@ def check_k8s(cfg):
     return (WARN if evicted else OK), f"node Ready, {fine} pods fine" + left
 
 
-def pod_states(pods):
-    """([pods that are down, as "ns/name why have/want"], evicted pods, pods fine).
+def replicaset_parents():
+    """{ReplicaSet uid: its Deployment's uid}, so pods from before and after a rollout count as one workload."""
+    rc, out = run(*KUBECTL, "get", "replicasets", "-A", "-o", "json")
+    try:
+        items = json.loads(out)["items"] if rc == 0 else []
+    except (ValueError, KeyError):
+        items = []
+    parents = {}
+    for rs in items:
+        meta = rs.get("metadata", {})
+        refs = meta.get("ownerReferences") or []
+        ref = next((r for r in refs if r.get("controller")), None)
+        if ref and meta.get("uid"):
+            parents[meta["uid"]] = ref.get("uid")
+    return parents
 
-    A pod the kubelet evicted (disk or memory pressure) stays as a Failed record
-    after its controller has started a replacement; the replacement shows here on
-    its own, so the record itself is only worth a warning."""
-    bad, evicted, fine = [], 0, 0
+
+def workload(p, parents):
+    """The uid of what runs this pod (its controller, or the Deployment above that), or None."""
+    refs = p.get("metadata", {}).get("ownerReferences") or []
+    ref = next((r for r in refs if r.get("controller")), None)
+    return parents.get(ref.get("uid"), ref.get("uid")) if ref else None
+
+
+def pod_states(pods, parents=None):
+    """([pods that are down, as "ns/name why have/want"], evicted pods left over, pods fine).
+
+    A pod the kubelet evicted (disk or memory pressure) stays as a Failed record. Once
+    its workload runs again (a pod of the same controller, or of the same Deployment
+    after a rollout, is up or has completed), the record is only worth a warning; an
+    evicted pod nothing has replaced is a pod that is down."""
+    parents = parents or {}
+    bad, evicted, fine, up = [], [], 0, set()
     for p in pods:
         st, meta = p.get("status", {}), p.get("metadata", {})
         phase = st.get("phase")
         if phase == "Succeeded":
+            up.add(workload(p, parents))
             continue
         if phase == "Failed" and st.get("reason") == "Evicted":
-            evicted += 1
+            evicted.append(p)
             continue
         cs = st.get("containerStatuses") or []
         ready = sum(1 for c in cs if c.get("ready"))
         want = len(cs) or len(p.get("spec", {}).get("containers", []))
         if phase == "Running" and cs and ready == want:
             fine += 1
+            up.add(workload(p, parents))
             continue
         why = next((c["state"]["waiting"].get("reason") for c in cs if "waiting" in c.get("state", {})), None)
         bad.append(f"{meta.get('namespace')}/{meta.get('name')} {why or st.get('reason') or phase} {ready}/{want}")
-    return bad, evicted, fine
+    left = 0
+    for p in evicted:
+        meta, w = p.get("metadata", {}), workload(p, parents)
+        if w is not None and w in up:
+            left += 1
+        else:
+            bad.append(f"{meta.get('namespace')}/{meta.get('name')} Evicted, "
+                       + ("nothing has replaced it" if w else "and no controller to replace it"))
+    return bad, left, fine
 
 
 def http_status(url):

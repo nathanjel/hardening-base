@@ -243,3 +243,21 @@ Empty `notify.sms_fallback` and `k8s.keep_restarting` in `hb.toml`, then
 `sudo ./hb install apply`, and remove the drop-ins:
 `sudo sh -c 'rm /etc/systemd/system/snap.microk8s.daemon-*.service.d/10-hb-keep-restarting.conf'`,
 `sudo systemctl daemon-reload`.
+
+## A second review of 9a to 9c
+
+| Piece | Tool | What changes |
+|---|---|---|
+| Break-glass kit | `hb breakglass kit` | the whole kit is made in root's own folder first. Only then is the destination's parent opened from `/` one name at a time, refusing links, and the kit's folder created in it, checked to be this run's (root's, empty) and filled. Only that folder and the files written into it are handed over, each through its own descriptor; a failed run hands over nothing. A `--to` whose path goes through a link is refused |
+| sshd's own view | `hb ssh` | a client the box has no route to (no IPv6, say) is skipped as before, but a probe that fails for any other reason fails the check, and so does a check that reached no client at all |
+| SMS fallback | `hooks/sms-supervoip` | only an answer that lists the message in `queuedMessages` counts as sent; a missing, empty or malformed one is a failure, so `hb notify` keeps the SMS and tries again |
+| Evicted pods | `hb health` | an evicted pod is a warning only once its workload runs again (a pod of the same controller, or the same Deployment after a rollout, is up or done); otherwise it fails like any pod that is down |
+
+    sudo ./hb install apply        # y to code
+    sudo hb notify test --fallback # sent by notify.sms_fallback: the real API confirms the queue
+    sudo hb ssh check              # ok, as before
+    sudo hb check
+
+Don't make a kit just to test it: a new kit voids the one you have.
+`tests/test_boundary.py` covers the kit with two real uids, including a folder above
+the kit being swapped for a link while it is made.

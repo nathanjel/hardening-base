@@ -193,11 +193,12 @@ class SshdTest(unittest.TestCase):
                     "Subsystem sftp /usr/libexec/openssh/sftp-server\n")
         saved = {n: getattr(ssh, n) for n in ("SSHD", "SSHD_CONFIG", "DROPIN", "local_addr")}
         self.addCleanup(lambda: [setattr(ssh, n, v) for n, v in saved.items()])
+        self.real_local_addr = saved["local_addr"]
         ssh.SSHD = [SSHD, "-f", f"{d}/main", "-h", f"{d}/hostkey"]
         ssh.SSHD_CONFIG, ssh.DROPIN = f"{d}/main", f"{d}/conf.d/10-hb-ssh.conf"
         # the box answers the internet on 198.51.100.7 / 2001:db8:1::7 and the tunnel on 10.77.0.1
-        ssh.local_addr = lambda peer: ("10.77.0.1" if peer.startswith("10.77.") else
-                                       "2001:db8:1::7" if ":" in peer else "198.51.100.7")
+        self.routes = {"10.77.": ("10.77.0.1", None), ":": ("2001:db8:1::7", None), "": ("198.51.100.7", None)}
+        ssh.local_addr = lambda peer: next(v for k, v in self.routes.items() if k in peer)
 
     def write(self, name, text):
         with open(f"{self.d}/conf.d/{name}", "w") as f:
@@ -260,6 +261,39 @@ class SshdTest(unittest.TestCase):
         bad = self.mismatches(files={"60-later.conf": "AllowGroups wheel\n"})
         self.assertEqual(len(bad), 1, bad)
         self.assertIn("allowgroups is 'hb-ssh wheel'", bad[0])
+
+    BROKEN = {"60-later.conf": f"Match User {ME}\n    AuthorizedKeysCommand /usr/bin/true\n"
+                                "    AuthorizedKeysCommandUser nobody\n"}
+
+    def test_no_route_for_one_family_is_fine(self):
+        self.routes[":"] = (None, ssh.NO_ROUTE)                          # no IPv6 at all
+        self.assertEqual(self.mismatches(), [])
+        bad = self.mismatches(files=self.BROKEN)
+        self.assertEqual(len(bad), 1, bad)
+        self.assertNotIn("IPv6", bad[0])
+
+    def test_nothing_checked_is_a_failure_not_a_pass(self):
+        self.routes = {"": (None, ssh.NO_ROUTE)}                        # no route anywhere, a wrong setting
+        bad = self.mismatches(files=self.BROKEN)
+        self.assertEqual(len(bad), 1, bad)
+        self.assertTrue(bad[0].startswith("nothing checked: no route to the internet (IPv4), the internet (IPv6), "
+                                          "10.77.0.0/24"), bad)
+
+    def test_a_failed_probe_is_a_failure(self):
+        self.routes = {"": (None, "ip: command not found")}
+        bad = self.mismatches()
+        self.assertEqual(bad, ["cannot check the internet (IPv4): ip route get 192.0.2.1: ip: command not found"])
+
+    def test_local_addr_tells_no_route_from_failure(self):
+        old = ssh.util.run
+        self.addCleanup(setattr, ssh.util, "run", old)
+        for answer, want in (((0, "192.0.2.1 via 51.0.0.1 dev eth0 src 51.0.0.2 uid 0\n", ""), ("51.0.0.2", None)),
+                             ((2, "", "RTNETLINK answers: Network is unreachable\n"), (None, ssh.NO_ROUTE)),
+                             ((127, "", ""), (None, "exit 127")),
+                             ((2, "", "RTNETLINK answers: Permission denied\n"),
+                              (None, "RTNETLINK answers: Permission denied"))):
+            ssh.util.run = lambda *cmd, **kw: answer
+            self.assertEqual(self.real_local_addr("192.0.2.1"), want)
 
     def test_sshd_errors_are_reported(self):
         bad = self.mismatches(files={"60-later.conf": "NoSuchOption yes\n"})
