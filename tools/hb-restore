@@ -40,6 +40,7 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+import hbkit.pyversion  # noqa: E402,F401  (first: re-runs this tool on Python 3.11+ when needed)
 from hbkit import config, restic, util  # noqa: E402
 
 DRILL_DIR = "/var/tmp"

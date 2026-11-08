@@ -2,6 +2,7 @@
 import fcntl
 import json
 import os
+import re
 import subprocess
 import tempfile
 
@@ -19,6 +20,32 @@ def run(*cmd, timeout=30, input=None, **kw):
         return 127, "", f"{cmd[0]}: not found"
     except subprocess.TimeoutExpired:
         return 124, "", f"{cmd[0]}: timed out after {timeout}s"
+
+
+# The kernel's own packages: kernel-core (and the kernel meta package) on Fedora; kernel,
+# kernel6.12, kernel6.18 on Amazon Linux 2023, which has no kernel-core. Never -headers,
+# -tools, -devel or -modules-extra. `rpm -qa --qf KERNEL_QF 'kernel*'` lists candidates.
+KERNEL_RPM = re.compile(r"kernel(-core|[0-9]+[.][0-9]+)?")
+KERNEL_QF = "%{INSTALLTIME} %{NAME} %{VERSION}-%{RELEASE}.%{ARCH}\n"
+
+
+def kernel_rows(out):
+    """[(install time, version)] of the kernel packages in rpm's KERNEL_QF output, oldest first."""
+    rows = []
+    for line in out.splitlines():
+        p = line.split()
+        if len(p) == 3 and p[0].isdigit() and KERNEL_RPM.fullmatch(p[1]):
+            rows.append((int(p[0]), p[2]))
+    return sorted(rows)
+
+
+def boot_kernel_version(out):
+    """The kernel the next boot starts, from `grubby --default-kernel` (/boot/vmlinuz-VERSION),
+    or None. The newest installed kernel isn't necessarily that one (AL2023 keeps kernel and
+    kernel6.12 side by side, and the default is chosen with grubby). Without root, grubby
+    can print just "/boot" and still exit 0, so anything but a whole path counts as no answer."""
+    m = re.fullmatch(r"/boot/vmlinuz-([0-9][^/\s]*)", out.strip())
+    return m.group(1) if m else None
 
 
 def state_dir(name):

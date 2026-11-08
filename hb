@@ -24,6 +24,9 @@ case "${1:-help}" in
     for t in $(tools); do
       out="$("$HB_ROOT/tools/hb-$t" check 2>&1)"; rc=$?
       out="${out##*$'\n'}"   # a check's verdict is its last line
+      # exit 1 is a warning only with a verdict that says so: Python exits 1 on an uncaught
+      # exception and bash on an unbound variable, and a check that broke is a failure
+      if [ "$rc" -eq 1 ]; then case "$out" in warn*|pending*) ;; *) rc=2 out="fail: the check broke: $out" ;; esac; fi
       printf '%-10s %s\n' "$t" "$out"
       [ "$rc" -gt "$worst" ] && worst=$rc
       case "$rc" in 0) ok=$((ok + 1)) ;; 1) warn=$((warn + 1)) ;; *) fail=$((fail + 1)) ;; esac

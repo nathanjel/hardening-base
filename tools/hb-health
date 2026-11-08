@@ -23,7 +23,8 @@ import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
-from hbkit import config  # noqa: E402
+import hbkit.pyversion  # noqa: E402,F401  (first: re-runs this tool on Python 3.11+ when needed)
+from hbkit import config, util  # noqa: E402
 
 OK, WARN, FAIL, SKIP = 0, 1, 2, -1
 WORDS = {OK: "ok", WARN: "warn", FAIL: "FAIL", SKIP: "skip"}
@@ -43,19 +44,25 @@ def run(*cmd, timeout=30):
 
 def check_reboot(cfg):
     running = os.uname().release
-    rc, out = run("rpm", "-q", "--qf", "%{INSTALLTIME} %{VERSION}-%{RELEASE}.%{ARCH}\n", "kernel-core")
-    rows = sorted((int(t), v) for t, v in (ln.split() for ln in out.splitlines() if ln.strip())) if rc == 0 else []
-    installed, newest = rows[-1] if rows else (0, running)
+    # the kernel the next boot starts, not the newest installed: they differ when another kernel
+    # line is installed beside the default (AL2023: kernel and kernel6.12)
+    gr, gout = run("grubby", "--default-kernel")
+    boot = util.boot_kernel_version(gout) if gr == 0 else None
     nr, _ = run("dnf", "needs-restarting", "-r", timeout=60)
-    if newest != running:
+    if boot and boot != running:
+        rc, out = run("rpm", "-qa", "--qf", util.KERNEL_QF, "kernel*")
+        installed = max((t for t, v in util.kernel_rows(out) if v == boot), default=None) if rc == 0 else None
+        if installed is None:
+            return WARN, f"running kernel {running}, the next boot starts {boot}"
         days = (time.time() - installed) / 86400
-        detail = f"running kernel {running}, {newest} installed {days:.0f} days ago"
+        detail = f"running kernel {running}, {boot} installed {days:.0f} days ago"
         return (FAIL if days >= cfg["reboot_fail_days"] else WARN), detail
     if nr == 1:
         return WARN, "updated system libraries need a reboot"
     # 0 is the only answer that means "no reboot needed"; anything else is not knowing
     unknown = [f"dnf needs-restarting -r: {exit_text(nr)}"] if nr != 0 else []
-    unknown += [f"rpm can't list kernel-core ({exit_text(rc)})"] if not rows else []
+    if not boot:
+        unknown.append("grubby --default-kernel: " + (exit_text(gr) if gr else "no kernel in its answer (needs root)"))
     if unknown:
         return WARN, f"kernel {running}; can't tell whether a reboot is needed: " + "; ".join(unknown)
     return OK, f"kernel {running}"

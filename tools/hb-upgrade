@@ -40,6 +40,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+import hbkit.pyversion  # noqa: E402,F401  (first: re-runs this tool on Python 3.11+ when needed)
 from hbkit import config, util  # noqa: E402
 
 WAIT_WARN_DAYS = 7
@@ -160,13 +161,16 @@ def snap_refresh(cfg, st):
         util.notify("warn", "upgrade.snap", f"snap refresh failed: {st['snaps']['out']}")
 
 
-def newest_kernel():
-    """(the newest installed kernel's version, None), or ("", why rpm couldn't tell)."""
-    rc, out, err = util.run("rpm", "-q", "kernel-core", "--last")
-    first = out.splitlines()[0].split()[0] if rc == 0 and out.strip() else ""
-    if first.startswith("kernel-core-"):
-        return first[len("kernel-core-"):], None
-    return "", "rpm can't list kernel-core (" + {127: "not installed", 124: "timed out"}.get(rc, f"exit {rc}") + ")"
+def boot_kernel():
+    """(the kernel the next boot starts, None), or ("", why that can't be told). A reboot only
+    helps when this differs from the running kernel: the newest installed one may not be the
+    default (rebooting for it would boot the same kernel again, night after night)."""
+    rc, out, err = util.run("grubby", "--default-kernel")
+    version = util.boot_kernel_version(out) if rc == 0 else None
+    if version:
+        return version, None
+    why = {127: "not installed", 124: "timed out"}.get(rc, f"exit {rc}") if rc else "no kernel in its answer"
+    return "", f"grubby --default-kernel: {why}"
 
 
 def reboot_reason():
@@ -176,9 +180,9 @@ def reboot_reason():
         lines = [l.strip() for l in out.splitlines() if l.strip() and not l.startswith(("Updating", "Repositories"))]
         return "dnf needs-restarting: " + (next((l for l in lines if "Reboot" in l or "updated" in l),
                                                 "reboot required")), None
-    running, (newest, kernel_err) = os.uname().release, newest_kernel()
-    if newest and newest != running:
-        return f"kernel {newest} is installed, {running} runs", None
+    running, (boot, kernel_err) = os.uname().release, boot_kernel()
+    if boot and boot != running:
+        return f"kernel {boot} is set to boot, {running} runs", None
     unknown = []
     if rc != 0:                                       # 0 is the only "no reboot needed"
         unknown.append("dnf needs-restarting -r: " + {127: "not installed", 124: "timed out"}.get(

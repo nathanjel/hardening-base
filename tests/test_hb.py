@@ -28,6 +28,24 @@ class CheckSummaryTest(unittest.TestCase):
         self.assertEqual(lines[0], "alpha      ok: not managed")       # the verdict is a check's last line
         self.assertEqual(lines[-1], "3 ok, 1 warn, 1 fail; not managed here: alpha, delta")
 
+    def test_a_check_that_crashed_is_a_failure_not_a_warning(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        os.makedirs(f"{d}/tools")
+        shutil.copy(os.path.join(REPO, "hb"), f"{d}/hb")
+        for name, line, rc in (("alpha", "warn: something", 1), ("beta", "pending: a group change", 1),
+                               ("gamma", "ModuleNotFoundError: No module named 'tomllib'", 1),
+                               ("delta", "line 9: x: unbound variable", 1)):
+            with open(f"{d}/tools/hb-{name}", "w") as f:
+                f.write(f"#!/bin/sh\necho \"{line}\"\nexit {rc}\n")
+            os.chmod(f"{d}/tools/hb-{name}", 0o755)
+        r = subprocess.run([f"{d}/hb", "check"], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 2)
+        lines = r.stdout.splitlines()
+        self.assertIn("gamma      fail: the check broke: ModuleNotFoundError: No module named 'tomllib'", lines)
+        self.assertIn("delta      fail: the check broke: line 9: x: unbound variable", lines)
+        self.assertEqual(lines[-1], "0 ok, 2 warn, 2 fail")
+
 
 if __name__ == "__main__":
     unittest.main()

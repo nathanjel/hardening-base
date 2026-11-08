@@ -139,19 +139,25 @@ class K8sCheckTest(unittest.TestCase):
         old = health.run
         self.addCleanup(setattr, health, "run", old)
         health.run = lambda *cmd, timeout=30: (0, "node1 Ready x y z\n") if "nodes" in cmd else (0, "not json")
+        old_exists = health.os.path.exists                  # as if microk8s were installed, wherever this runs
+        self.addCleanup(setattr, health.os.path, "exists", old_exists)
+        health.os.path.exists = lambda p: True if p == health.KUBECTL[0] else old_exists(p)
         self.assertEqual(health.check_k8s({})[0], health.FAIL)
 
 
 
 class RebootCheckTest(unittest.TestCase):
-    def check(self, nr, rpm_rc=0, kernel=None):
+    def check(self, nr, rpm=None, rpm_rc=0, boot=None, grubby=None):
+        """nr: dnf needs-restarting's exit; rpm: the kernel listing; boot: what grubby says the next boot starts."""
         running = os.uname().release
         old = health.run
         self.addCleanup(setattr, health, "run", old)
 
         def run(*cmd, timeout=30):
             if cmd[0] == "rpm":
-                return rpm_rc, f"1700000000 {kernel or running}\n" if rpm_rc == 0 else ""
+                return rpm_rc, (rpm if rpm is not None else f"1700000000 kernel-core {boot or running}\n") if rpm_rc == 0 else ""
+            if cmd[0] == "grubby":
+                return grubby if grubby else (0, f"/boot/vmlinuz-{boot or running}\n")
             return nr, ""
         health.run = run
         return health.check_reboot({"reboot_fail_days": 7})
@@ -159,16 +165,42 @@ class RebootCheckTest(unittest.TestCase):
     def test_answers(self):
         self.assertEqual(self.check(0)[0], health.OK)
         self.assertEqual(self.check(1), (health.WARN, "updated system libraries need a reboot"))
-        self.assertEqual(self.check(0, kernel="9.9.9-1.fc44.x86_64")[0], health.FAIL)   # waited long enough
+        self.assertEqual(self.check(0, boot="9.9.9-1.fc44.x86_64")[0], health.FAIL)   # waited long enough
 
     def test_no_answer_is_not_ok(self):
         for nr, text in ((2, "exit 2"), (127, "not installed"), (124, "timed out")):
             level, line = self.check(nr)
             self.assertEqual(level, health.WARN, nr)
             self.assertIn(f"can't tell whether a reboot is needed: dnf needs-restarting -r: {text}", line)
-        level, line = self.check(0, rpm_rc=1)
-        self.assertEqual(level, health.WARN)
-        self.assertIn("rpm can't list kernel-core (exit 1)", line)
+        for grubby, text in (((127, ""), "not installed"), ((0, "/boot\n"), "no kernel in its answer (needs root)")):
+            level, line = self.check(0, grubby=grubby)       # "/boot" with exit 0: grubby run without root
+            self.assertEqual(level, health.WARN)
+            self.assertIn(f"grubby --default-kernel: {text}", line)
+        level, line = self.check(0, rpm_rc=1, boot="9.9.9-1.fc44.x86_64")   # since when: rpm can't say
+        self.assertEqual((level, line), (health.WARN, f"running kernel {os.uname().release}, the next boot starts 9.9.9-1.fc44.x86_64"))
+
+    def test_amazon_linux_kernel_packages(self):
+        # AL2023 has no kernel-core: the kernel is `kernel` (6.1) or kernel6.12 / kernel6.18
+        out = ("1753178820 kernel 6.1.176-221.367.amzn2023.aarch64\n"
+               "1761434640 kernel 6.1.189-236.399.amzn2023.aarch64\n"
+               "1762620618 kernel-headers 6.1.189-236.400.amzn2023.aarch64\n"
+               "1762620617 kernel-livepatch-repo-s3 2023.12.20261102-0.amzn2023.noarch\n"
+               "1761900000 kernel6.12-modules-extra 6.12.40-1.amzn2023.aarch64\n"
+               "1761885660 kernel 6.1.189-236.400.amzn2023.aarch64\n")
+        self.assertEqual(health.util.kernel_rows(out),
+                         [(1753178820, "6.1.176-221.367.amzn2023.aarch64"),
+                          (1761434640, "6.1.189-236.399.amzn2023.aarch64"),
+                          (1761885660, "6.1.189-236.400.amzn2023.aarch64")])
+        level, line = self.check(0, rpm=out, boot="6.1.189-236.400.amzn2023.aarch64")
+        self.assertEqual(level, health.FAIL)                 # installed in 2025: far past reboot_fail_days
+        self.assertIn("6.1.189-236.400.amzn2023.aarch64 installed", line)
+
+    def test_a_kernel_installed_beside_the_boot_default_is_not_a_reboot(self):
+        # kernel6.12 installed after the running kernel, while grubby still boots the running one
+        running = os.uname().release
+        out = f"1761000000 kernel {running}\n1762000000 kernel6.12 6.12.40-1.amzn2023.aarch64\n"
+        self.assertEqual(self.check(0, rpm=out), (health.OK, f"kernel {running}"))
+
 
 if __name__ == "__main__":
     unittest.main()

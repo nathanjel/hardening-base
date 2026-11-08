@@ -208,5 +208,27 @@ class StatusTest(unittest.TestCase):
         self.assertEqual(status.strip_word("ok"), "")
 
 
+class CollectTest(unittest.TestCase):
+    def test_a_check_that_crashed_is_a_failure_not_a_warning(self):
+        answers = {
+            "health": (0, "ok    disk        / 30% used\n", ""),
+            "alpha": (1, "warn: something\n", ""),
+            "beta": (1, "pending: a group change\n", ""),
+            "gamma": (1, "reading the state\n",                                  # a Python crash: exit 1,
+                      "Traceback (most recent call last):\nKeyError: 'dnf'\n"),  # the traceback on stderr
+            "delta": (1, "", "line 9: x: unbound variable\n"),
+        }
+        old_run, old_tools = status.util.run, status.tools
+        self.addCleanup(setattr, status.util, "run", old_run)
+        self.addCleanup(setattr, status, "tools", old_tools)
+        status.util.run = lambda *cmd, timeout=30, **kw: answers[cmd[1]]
+        status.tools = lambda: ["alpha", "beta", "gamma", "delta"]
+        got = status.collect()
+        self.assertEqual(got["alpha"], ("warn", "something"))
+        self.assertEqual(got["beta"], ("warn", "a group change"))
+        self.assertEqual(got["gamma"], ("fail", "the check broke: KeyError: 'dnf'"))
+        self.assertEqual(got["delta"], ("fail", "the check broke: line 9: x: unbound variable"))
+
+
 if __name__ == "__main__":
     unittest.main()

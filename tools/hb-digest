@@ -21,6 +21,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+import hbkit.pyversion  # noqa: E402,F401  (first: re-runs this tool on Python 3.11+ when needed)
 from hbkit import config, util  # noqa: E402
 
 KEEP = 30
@@ -64,7 +65,7 @@ def upgrade_line(now):
         return f"no upgrade since {datetime.datetime.fromtimestamp(d['at']):%d %b}", ["the nightly upgrade didn't run"]
     n = len(d.get("changed", []))
     parts = [f"upgrade: {n} package{'s' if n != 1 else ''}" + (" (FAILED)" if d.get("rc") else "")]
-    kernels = [c for c in d.get("changed", []) if c.startswith("kernel-core.")]
+    kernels = [c for c in d.get("changed", []) if util.KERNEL_RPM.fullmatch(c.rsplit(".", 1)[0])]   # name.arch
     if kernels:
         parts.append("new kernel")
     r = st.get("reboot", {})

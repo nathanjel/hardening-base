@@ -88,7 +88,7 @@ class ItemsTest(unittest.TestCase):
         self.fake.answers["rpm -q"] = (1, "git-2.50\npackage restic is not installed\nwireguard-tools-1.0\n", "")
         self.assertEqual(rebuild.chk_packages(self.ctx), (1, "will install 1 of 3 packages: restic"))
         self.assertIsNone(rebuild.fix_packages(self.ctx))
-        self.assertEqual(self.fake.ran("dnf"), [("dnf", "install", "-y", "--skip-unavailable", "restic")])
+        self.assertEqual(self.fake.ran("dnf"), [("dnf", "install", "-y", "--setopt=strict=False", "restic")])
 
     def test_no_package_list_is_broken(self):
         self.assertEqual(rebuild.chk_packages(self.ctx)[0], 2)

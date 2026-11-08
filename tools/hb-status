@@ -20,6 +20,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+import hbkit.pyversion  # noqa: E402,F401  (first: re-runs this tool on Python 3.11+ when needed)
 from hbkit import util  # noqa: E402
 
 BANNER = os.environ.get("HB_BANNER", "/run/motd.d/hb")
@@ -60,6 +61,10 @@ def collect():
         rc, out, err = util.run(util.HB, t, "check", timeout=300)
         lines = (out.strip() or err.strip()).splitlines()
         last = lines[-1] if lines else f"exit {rc}"
+        if rc == 1 and not last.startswith(("warn", "pending")):
+            # exit 1 is a warning only with a verdict that says so: Python exits 1 on an uncaught
+            # exception (its traceback is on stderr), bash on an unbound variable. That check broke.
+            rc, last = 2, "the check broke: " + (err.strip().splitlines() or [last])[-1]
         level = "ok" if rc == 0 else "warn" if rc == 1 else "fail"
         results[t] = (level, strip_word(last))
     return results

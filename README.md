@@ -4,7 +4,7 @@ An admin toolkit for one Linux server you work on remotely: many small tools
 behind one `hb` command, bash and stdlib Python only, no third-party libraries
 (one vendored data file: the EFF wordlist for passphrases, CC BY 3.0).
 It targets Fedora/RHEL-family hosts (dnf, firewalld, btrfs), with an optional
-microk8s plug-in. Nothing about a particular host lives in the repo: that goes
+microk8s plug-in, and runs on Amazon Linux 2023 too ([docs/AL2023.md](docs/AL2023.md)). Nothing about a particular host lives in the repo: that goes
 in `hb.toml` and `local/`, both git-ignored.
 
 The goal is a box that is hardened, backed up and maintained by code you can
@@ -53,7 +53,7 @@ timers run) and the config to `/etc/hb/hb.toml`.
 | `hb-disk` | what's eating the disk: the biggest folders, what grew since last week, big folders nobody has touched in a month; reports only |
 | `hb-inventory` | the state dump a rebuild needs (packages, snaps, accounts, units, every Kubernetes object you made, ...), written before each backup, and what changed since the one before: new packages, accounts, listening ports, SSH keys, sudoers, firewall rules, Kubernetes objects (in the morning digest) |
 | `hb-rebuild` | sets up a fresh box from the newest snapshot: files, packages, snaps, accounts, data, microk8s add-ons, Kubernetes objects, units; only ever adds. See [docs/RUNBOOK-rebuild.md](docs/RUNBOOK-rebuild.md) |
-| `phase0/inventory.sh` | the read-only survey hb started from |
+| `phase0/inventory.sh` | the read-only survey hb starts from on a new box (Fedora or AL2023, bare metal or EC2, any kubeconfig) |
 
 ## Conventions
 
@@ -67,10 +67,11 @@ timers run) and the config to `/etc/hb/hb.toml`.
   in a terminal or the web shell, load, builds, a tmux pane running more than a shell, hb's own jobs,
   `hb upgrade hold`. Each prints why and exits 1 when busy; `hb upgrade` and `hb k8s` wait for all of them.
   Pod restarts consult them, and reboots will too.
-- Python tools run as `python3 -IB`: isolated mode, no bytecode written.
+- Python tools run as `python3 -IB`: isolated mode, no bytecode written. They need Python 3.11 or newer;
+  on an older `/usr/bin/python3` they re-run themselves on the newest `/usr/bin/python3.N` (`lib/hbkit/pyversion.py`).
 - Defaults never change anything; only what `hb.toml` lists gets touched.
 - `hooks/` holds what other programs call (mdadm, smartd); `units/` the systemd units.
 
-Tests: `python3 -B -m unittest discover -s tests`
+Tests: `python3 -B -m unittest discover -s tests`; on Amazon Linux 2023's userland: `tests/al2023.sh` (docker or podman)
 
 MIT licensed, see [LICENSE](LICENSE).
