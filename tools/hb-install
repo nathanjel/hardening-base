@@ -11,7 +11,9 @@
 #   code    /opt/hb holds the checkout's files (git-tracked and new, never ignored
 #           ones such as hb.toml or local/)
 #   link    /usr/local/bin/hb points at /opt/hb/hb
-#   config  /etc/hb/hb.toml is root's and matches the checkout's hb.toml, if any
+#   config  /etc/hb/hb.toml is root's and matches the checkout's hb.toml, if any; and
+#           everything in /etc/hb (secrets, tokens, TOTP keys) is root's, unreadable by
+#           anyone else: apply tightens what isn't
 #   units   units/* are installed in /etc/systemd/system. A unit that leaves
 #           units/ is removed only if it carries units/' first line ("# Managed
 #           by hb install"); units other tools write (hb-webshell.service) stay.
@@ -94,11 +96,16 @@ chk_config() {
     echo "no $etc, and no hb.toml in the checkout to copy"; return 2
   fi
   if [ "$(stat -c %u:%a "$etc")" != 0:600 ]; then echo "$etc will be made root's, mode 600"; return 1; fi
+  local loose
+  loose="$(loose_in_etc)"
+  if [ -n "$loose" ]; then echo "only root may read what is in $ETC; will tighten: $loose"; return 1; fi
   if [ -n "$src" ] && ! cmp -s "$src" "$etc"; then
     echo "$src differs from $etc (diff them; apply copies the checkout's)"; return 1
   fi
   echo "$etc"
 }
+# loose_in_etc — what in /etc/hb is someone else's, or open to group or others (links aside)
+loose_in_etc() { find "$ETC" ! -type l \( ! -uid 0 -o -perm /077 \) -printf '%p ' 2>/dev/null | sed 's/ $//'; }
 fix_config() {
   local etc="$ETC/hb.toml" src=""
   [ -n "$SRC" ] && [ -f "$SRC/hb.toml" ] && src="$SRC/hb.toml"
@@ -107,7 +114,8 @@ fix_config() {
     keep_copy "$etc"
     install -m 600 "$src" "$etc" || return 1
   fi
-  chown root:root "$etc" && chmod 600 "$etc"
+  chown root:root "$etc" && chmod 600 "$etc" || return 1
+  chown -R root:root "$ETC" && chmod -R go-rwx "$ETC"   # only root ever writes here, so nothing to follow
 }
 
 # --- units ----------------------------------------------------------------------

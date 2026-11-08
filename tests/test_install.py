@@ -84,5 +84,34 @@ class UnitsTest(unittest.TestCase):
                 self.assertTrue(f.readline().startswith(MARK), f"{os.path.basename(path)}: first line must be {MARK!r}")
 
 
+def userns_ok():
+    return subprocess.run(["unshare", "-r", "true"], capture_output=True).returncode == 0
+
+
+@unittest.skipUnless(userns_ok(), "needs unprivileged user namespaces (unshare -r)")
+class EtcTest(unittest.TestCase):
+    """Everything in /etc/hb is root's alone: a token placed by hand with mode 644 gets tightened."""
+
+    def test_loose_files_are_found_and_tightened(self):
+        d = tempfile.mkdtemp()
+        etc, src = os.path.join(d, "etc-hb"), os.path.join(d, "checkout")
+        write(os.path.join(src, "hb.toml"), "[install]\ntimers = []\n")
+        write(os.path.join(etc, "hb.toml"), "[install]\ntimers = []\n")
+        write(os.path.join(etc, "secrets", "supervoip-token"), "t0ken\n")
+        os.chmod(etc, 0o700)
+        os.chmod(os.path.join(etc, "hb.toml"), 0o600)
+        os.chmod(os.path.join(etc, "secrets"), 0o755)
+        os.chmod(os.path.join(etc, "secrets", "supervoip-token"), 0o644)     # as `sudo tee` leaves it
+        script = (f'source "$1"; ETC="$2"; SRC="$3"; chk_config; echo "rc=$?"; fix_config; '
+                  f'chk_config; echo "rc=$?"; stat -c "%a %n" "$2/secrets" "$2/secrets/supervoip-token"')
+        p = subprocess.run(["unshare", "-r", "bash", "-c", script, "_", harness(), etc, src],
+                           env=dict(os.environ, HB_CONFIG=os.path.join(etc, "hb.toml")), capture_output=True, text=True)
+        lines = p.stdout.splitlines()
+        self.assertEqual(lines[0], f"only root may read what is in {etc}; will tighten: "
+                                   f"{etc}/secrets {etc}/secrets/supervoip-token", p.stderr)
+        self.assertEqual(lines[1:4], ["rc=1", etc + "/hb.toml", "rc=0"])
+        self.assertEqual(lines[4:], [f"700 {etc}/secrets", f"600 {etc}/secrets/supervoip-token"])
+
+
 if __name__ == "__main__":
     unittest.main()

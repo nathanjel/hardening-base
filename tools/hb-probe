@@ -174,7 +174,7 @@ def scan(args):
 def box_command():
     """The scan command for this server, from hb.toml."""
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
-    import hbkit.pyversion  # noqa: F401  (re-runs on Python 3.11+ when needed)
+    import hbkit.start  # noqa: F401  (re-runs on Python 3.11+ when needed)
     from hbkit import config
     probe = config.load()["probe"]
     hosts = " ".join(dict.fromkeys([probe["host"] or "HOST"] + public_addresses()))

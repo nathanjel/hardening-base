@@ -68,7 +68,7 @@ timers run) and the config to `/etc/hb/hb.toml`.
   `hb upgrade hold`. Each prints why and exits 1 when busy; `hb upgrade` and `hb k8s` wait for all of them.
   Pod restarts consult them, and reboots will too.
 - Python tools run as `python3 -IB`: isolated mode, no bytecode written. They need Python 3.11 or newer;
-  on an older `/usr/bin/python3` they re-run themselves on the newest `/usr/bin/python3.N` (`lib/hbkit/pyversion.py`).
+  on an older `/usr/bin/python3` they re-run themselves on the newest `/usr/bin/python3.N` (`lib/hbkit/start.py`).
 - Defaults never change anything; only what `hb.toml` lists gets touched.
 - `hooks/` holds what other programs call (mdadm, smartd); `units/` the systemd units.
 

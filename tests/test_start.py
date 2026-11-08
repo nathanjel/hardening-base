@@ -1,4 +1,4 @@
-"""hbkit.pyversion: on a Python older than 3.11 a tool re-runs itself on the newest /usr/bin/python3.N."""
+"""hbkit.start: a tool re-runs itself on Python 3.11+ when it has to, and ends quietly when its output pipe closes."""
 import os
 import subprocess
 import sys
@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from tools import REPO  # noqa: E402
 
 sys.path.insert(0, os.path.join(REPO, "lib"))
-from hbkit import pyversion  # noqa: E402
+from hbkit import start  # noqa: E402
 
 
 class NewestTest(unittest.TestCase):
@@ -22,7 +22,7 @@ class NewestTest(unittest.TestCase):
                 path = os.path.join(d, name)
                 open(path, "w").close()
                 os.chmod(path, mode)
-            self.assertEqual(pyversion.newest(os.path.join(d, "python3.*")), os.path.join(d, "python3.13"))
+            self.assertEqual(start.newest(os.path.join(d, "python3.*")), os.path.join(d, "python3.13"))
 
     def test_none_when_only_old_ones(self):
         with tempfile.TemporaryDirectory() as d:
@@ -30,10 +30,10 @@ class NewestTest(unittest.TestCase):
                 path = os.path.join(d, name)
                 open(path, "w").close()
                 os.chmod(path, 0o755)
-            self.assertIsNone(pyversion.newest(os.path.join(d, "python3.*")))
+            self.assertIsNone(start.newest(os.path.join(d, "python3.*")))
 
 
-@unittest.skipUnless(pyversion.newest(), "no /usr/bin/python3.N >= 3.11 here")
+@unittest.skipUnless(start.newest(), "no /usr/bin/python3.N >= 3.11 here")
 class ReRunTest(unittest.TestCase):
     def test_an_old_interpreter_hands_over_with_the_same_flags_and_arguments(self):
         with tempfile.TemporaryDirectory() as d:
@@ -45,15 +45,40 @@ class ReRunTest(unittest.TestCase):
                         os.environ["HB_TEST_RERUN"] = "1"
                         sys.version_info = (3, 9, 25, "final", 0)     # what AL2023's /usr/bin/python3 says
                     sys.path.insert(0, {os.path.join(REPO, "lib")!r})
-                    import hbkit.pyversion
+                    import hbkit.start
                     print(sys.executable, sys.flags.isolated, sys.flags.dont_write_bytecode, sys.argv[1:])
                     """))
             r = subprocess.run([sys.executable, "-I", "-B", script, "a b", "--c"], capture_output=True, text=True,
                                timeout=30)
             self.assertEqual(r.returncode, 0, r.stderr)
             exe, isolated, nobytecode, args = r.stdout.split(" ", 3)
-            self.assertEqual(exe, pyversion.newest())
+            self.assertEqual(exe, start.newest())
             self.assertEqual((isolated, nobytecode, args.strip()), ("1", "1", "['a b', '--c']"))
+
+
+class ClosedPipeTest(unittest.TestCase):
+    def tool(self, body):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d))
+        path = os.path.join(d, "tool")
+        with open(path, "w") as f:
+            f.write(f"import sys\nsys.path.insert(0, {os.path.join(REPO, 'lib')!r})\nimport hbkit.start\n" + body)
+        return path
+
+    def test_a_reader_that_goes_away_ends_the_tool_quietly(self):
+        # hb health status | head -3
+        script = self.tool("for i in range(100000):\n    print('line', i, flush=True)\n")
+        p = subprocess.Popen([sys.executable, "-I", "-B", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        p.stdout.readline()
+        p.stdout.close()
+        _, err = p.communicate(timeout=30)
+        self.assertEqual((p.returncode, err), (141, b""))
+
+    def test_another_broken_pipe_still_shows(self):
+        script = self.tool("raise BrokenPipeError('the API hung up')\n")
+        p = subprocess.run([sys.executable, "-I", "-B", script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("BrokenPipeError: the API hung up", p.stderr)
 
 
 if __name__ == "__main__":
