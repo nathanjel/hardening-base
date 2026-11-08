@@ -32,7 +32,7 @@ class Server:
     def __init__(self):
         self.dir = tempfile.mkdtemp()
         self.secret = otp.new_secret()
-        ws.STATE_DIR, ws.AUTH = self.dir, os.path.join(self.dir, "auth.json")
+        ws.STATE_DIR, ws.AUTH, ws.WINDOW = self.dir, os.path.join(self.dir, "auth.json"), os.path.join(self.dir, "public")
         with open(ws.AUTH, "w") as f:
             json.dump({"password": otp.scrypt_hash(PASSWORD), "secret": self.secret}, f)
         s = socket.socket()
@@ -318,6 +318,12 @@ class AdminTest(unittest.TestCase):
     def exec_args(self, unit):
         line = [l for l in unit.splitlines() if l.startswith("ExecStart=")][0]
         return line.split()[2:]                       # after the program and "serve"
+
+    def test_the_window_file_is_outside_the_daemons_folder(self):
+        with open(os.path.join(REPO, "lib", "hbkit", "webshell.py")) as f:
+            self.assertIn(f'WINDOW = "{self.tool.WINDOW}"', f.read())       # both sides mean the same file
+        self.assertFalse(self.tool.WINDOW.startswith(self.tool.STATE_DIR + "/"))
+        self.assertEqual(os.path.dirname(self.tool.WINDOW), "/run")          # root's, and a reboot clears it
 
     def test_unit(self):
         unit = self.tool.unit_wanted(self.s)

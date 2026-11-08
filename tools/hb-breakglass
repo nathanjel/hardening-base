@@ -44,7 +44,6 @@ import os
 import pwd
 import re
 import secrets
-import shutil
 import socket
 import subprocess
 import sys
@@ -379,9 +378,21 @@ def kit_preflight(cfg):
     return why
 
 
-def chown_to(path, owner):
+def kit_put(dfd, name, data, mode=0o600):
+    """A new file in the kit's folder: it can't already exist, or be a link."""
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=dfd)
+    with os.fdopen(fd, "wb") as f:
+        os.fchmod(f.fileno(), mode)
+        f.write(data)
+
+
+def hand_over(dfd, owner):
+    """Give the kit to the person who asked for it, its folder last. Until this runs the folder is
+    root's alone, so nobody can add anything to it, and nothing here follows a link."""
     pw = pwd.getpwnam(owner)
-    os.chown(path, pw.pw_uid, pw.pw_gid)
+    for name in os.listdir(dfd):
+        os.chown(name, pw.pw_uid, pw.pw_gid, dir_fd=dfd, follow_symlinks=False)
+    os.fchown(dfd, pw.pw_uid, pw.pw_gid)
 
 
 def do_kit(cfg, to):
@@ -432,14 +443,19 @@ def do_kit(cfg, to):
             if err:
                 print(f"note: couldn't remove the previous kit's backup key {old_id[:8]}: {err}")
 
-    os.makedirs(to, mode=0o700)
-    if owner:
-        chown_to(to, owner)
+    dfd = None
     try:
+        # Everything below goes through this descriptor, so it lands in this folder even if
+        # the path to it (often in the owner's home) is changed meanwhile.
+        os.makedirs(to, mode=0o700)
+        dfd = os.open(to, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        if os.fstat(dfd).st_uid != os.geteuid():
+            raise RuntimeError(f"{to} was replaced while the kit was being made")
         with tempfile.TemporaryDirectory(dir=util.state_dir("breakglass")) as tmp:
             pub = make_ssh_key(os.path.join(tmp, "rescue.key"), k["phrase"], f"{user} kit {k['made']}")
             for n in ("rescue.key", "rescue.key.pub"):
-                shutil.move(os.path.join(tmp, n), os.path.join(to, n))
+                with open(os.path.join(tmp, n), "rb") as f:
+                    kit_put(dfd, n, f.read(), os.fstat(f.fileno()).st_mode & 0o777)
         util.write_atomic(os.path.join(KEYDIR, user),
                           f"# Managed by hb-breakglass: the kit made {k['made']}.\n{pub}\n", mode=0o644)
         rc, _, err = util.run("chpasswd", input=f"{user}:{k['password']}\n")
@@ -449,15 +465,16 @@ def do_kit(cfg, to):
         k["codes"] = out.split()
         if rc != 0 or len(k["codes"]) != 10:
             raise RuntimeError(f"hb totp codes: {(err or out).strip()[:120]}")
-        util.write_atomic(os.path.join(to, "kit.txt"), kit_txt(k), mode=0o600)
-        util.write_atomic(os.path.join(to, "kit.html"), kit_html(k), mode=0o600)
+        kit_put(dfd, "kit.txt", kit_txt(k).encode())
+        kit_put(dfd, "kit.html", kit_html(k).encode())
     except (RuntimeError, OSError) as e:
         print(f"{e}\nthe kit is incomplete; run hb breakglass kit again (to a new --to)")
         return 2
     finally:
-        if owner and os.path.isdir(to):
-            for n in os.listdir(to):
-                chown_to(os.path.join(to, n), owner)
+        if dfd is not None:
+            if owner:
+                hand_over(dfd, owner)
+            os.close(dfd)
     st.update(kit_made=k["made"], kit_made_ts=time.time(), kit_dir=to)
     save_state(st)
     util.notify("info", "breakglass.kit", f"new break-glass kit made for {user}")

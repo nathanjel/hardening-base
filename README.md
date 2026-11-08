@@ -20,7 +20,8 @@ upgrades and cleanup jobs. They arrive in phases.
 Phases 1 to 8 are written and applied on the first box (runbooks:
 [docs/PHASE1.md](docs/PHASE1.md), [docs/PHASE2.md](docs/PHASE2.md),
 [docs/PHASE3.md](docs/PHASE3.md), [docs/PHASE4.md](docs/PHASE4.md),
-[docs/PHASE5.md](docs/PHASE5.md), [docs/PHASE6.md](docs/PHASE6.md), [docs/PHASE7.md](docs/PHASE7.md), [docs/PHASE8.md](docs/PHASE8.md)). Start from `hb.toml.example`, which lists every
+[docs/PHASE5.md](docs/PHASE5.md), [docs/PHASE6.md](docs/PHASE6.md), [docs/PHASE7.md](docs/PHASE7.md), [docs/PHASE8.md](docs/PHASE8.md)). Phase 9
+([docs/PHASE9.md](docs/PHASE9.md)) hardens them after an outside review. Start from `hb.toml.example`, which lists every
 key, as `hb.toml` in the checkout. `sudo ./hb install apply` then copies the code
 to `/opt/hb` (root's, so nothing running as your user can change what root's
 timers run) and the config to `/etc/hb/hb.toml`.

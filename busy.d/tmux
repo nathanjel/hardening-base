@@ -1,6 +1,8 @@
 #!/usr/bin/python3 -IB
 """Busy while any tmux pane, of any user, runs something other than a shell: a long agent
-run, an editor, a running job. Every tmux server under /tmp/tmux-<uid>/ is asked."""
+run, an editor, a running job. Every tmux server under /tmp/tmux-<uid>/ is asked, by a client
+running as the owner of its socket: a tmux client takes orders from its server, so root's must
+never talk to a user's, and it gets a bare environment because a client sends its own to the server."""
 import glob
 import os
 import stat
@@ -8,12 +10,15 @@ import subprocess
 import sys
 
 SHELLS = {"bash", "zsh", "sh", "dash", "fish", "ksh", "tcsh", "csh"}
+ENV = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": "/"}
 for sock in sorted(glob.glob(os.path.join(os.environ.get("HB_TMUX_DIR", "/tmp"), "tmux-*", "*"))):
     try:
-        if not stat.S_ISSOCK(os.stat(sock).st_mode):
+        st = os.lstat(sock)
+        if not stat.S_ISSOCK(st.st_mode):
             continue
+        owner = dict(user=st.st_uid, group=st.st_gid, extra_groups=[]) if os.geteuid() == 0 and st.st_uid != 0 else {}
         p = subprocess.run(["tmux", "-S", sock, "list-panes", "-a", "-F", "#{session_name} #{pane_current_command}"],
-                           capture_output=True, text=True, timeout=10)
+                           capture_output=True, text=True, errors="replace", timeout=10, cwd="/", env=ENV, **owner)
     except (OSError, subprocess.TimeoutExpired):
         continue
     for line in p.stdout.splitlines():

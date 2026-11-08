@@ -97,8 +97,39 @@ class ProjectsTest(unittest.TestCase):
         a.fn()
         self.assertFalse(os.path.exists(os.path.join(repo, "build")))
         self.assertTrue(os.path.exists(os.path.join(repo, ".venv")))
-        found = clean.build_output(repo, cfg(self.root, venv_idle_days=30), 40)
+        found = clean.build_output(repo, os.getuid(), cfg(self.root, venv_idle_days=30), 40)
         self.assertEqual(found, [os.path.join(repo, ".venv")])
+
+    def test_read_only_build_folder_still_goes(self):
+        repo = os.path.join(self.root, "ro")
+        make_repo(repo, ["build/"], {"a": "1", "build/mod/x": "y"})
+        age_tree(repo)
+        os.chmod(os.path.join(repo, "build", "mod"), 0o555)      # how Go leaves its module cache
+        self.plan()[0]["ro"].fn()
+        self.assertFalse(os.path.exists(os.path.join(repo, "build")))
+
+    def test_swapped_after_the_plan_is_left_alone(self):
+        for name, files in (("del", {"a": "1", "build/x": "y"}),
+                            ("mk", {"a": "1", "build/x": "y", "Makefile": "clean:\n\trm -rf build\n"})):
+            repo = os.path.join(self.root, name)
+            make_repo(repo, ["build/"], files)
+            age_tree(repo)
+            action = self.plan()[0][name]
+            elsewhere = tempfile.mkdtemp()
+            write(os.path.join(elsewhere, "build", "keep"))
+            os.rename(repo, repo + ".moved")
+            os.symlink(elsewhere, repo)
+            with self.assertRaisesRegex(RuntimeError, "changed since the plan"):
+                action.fn()
+            self.assertTrue(os.path.exists(os.path.join(elsewhere, "build", "keep")))
+            self.assertTrue(os.path.exists(os.path.join(repo + ".moved", "build", "x")))
+
+    def test_repo_owner(self):
+        self.assertEqual(clean.repo_owner(self.root), os.getuid())
+        link = os.path.join(self.root, "link")
+        os.symlink(self.root, link)
+        self.assertIsNone(clean.repo_owner(link))
+        self.assertIsNone(clean.repo_owner(os.path.join(self.root, "missing")))
 
     def test_repo_without_build_output_needs_no_action(self):
         repo = os.path.join(self.root, "plain")
@@ -125,12 +156,15 @@ class CachesTest(unittest.TestCase):
         age_tree(os.path.join(home, ".npm"))
         os.symlink("/etc", os.path.join(home, ".cache", "link"))
 
+        real = clean.pwd
+
         class FakePwd:
+            getpwuid = staticmethod(real.getpwuid)
+
             @staticmethod
             def getpwnam(name):
-                return type("pw", (), {"pw_dir": home})
+                return type("pw", (), {"pw_dir": home, "pw_uid": os.getuid()})
 
-        real = clean.pwd
         clean.pwd = FakePwd
         self.addCleanup(setattr, clean, "pwd", real)
         actions, _ = clean.plan_caches(cfg("/nonexistent", users=["someone"]), time.time())
@@ -154,8 +188,18 @@ class HelpersTest(unittest.TestCase):
     def test_remove_refuses_paths_outside_parent(self):
         parent, other = tempfile.mkdtemp(), tempfile.mkdtemp()
         write(os.path.join(other, "f"))
-        clean.remove([other, os.path.join(parent, "..", os.path.basename(other))], parent)()
+        for path in (other, os.path.join(parent, "..", os.path.basename(other))):
+            with self.assertRaisesRegex(RuntimeError, "isn't inside"):
+                clean.remove([path], parent, os.getuid())()
         self.assertTrue(os.path.exists(os.path.join(other, "f")))
+
+    def test_commands_run_as_the_uid_the_plan_saw(self):
+        me = os.getuid()
+        self.assertNotIn("user", clean.as_user(me))              # not root: nothing to change
+        real = clean.os.geteuid
+        self.addCleanup(setattr, clean.os, "geteuid", real)
+        clean.os.geteuid = lambda: 0
+        self.assertEqual(clean.as_user(me)["user"], me)          # root: always that user, whatever a path says now
 
 
 def fake_registry(root, repos):

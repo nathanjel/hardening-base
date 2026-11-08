@@ -7,7 +7,7 @@ this runbook in `local/`.
 
 | Piece | Tool | What changes on the system |
 |---|---|---|
-| Getting files back | `hb restore get` | a new folder in `/var/tmp/hb-restore/` (over the live files only with `--to /` and a yes) |
+| Getting files back | `hb restore get` | a new folder `/var/tmp/hb-restore-<now>-<random>` (over the live files only with `--to /` and a yes) |
 | The drill | `hb-restore.timer` (15 January, April, July, October, 02:30) | nothing lasting: a temporary folder in `/var/tmp`, removed afterwards; the result in `/var/lib/hb/restore/` |
 | State dump | `hb inventory` (run by `hb backup`) | `/var/lib/hb/state`, now with accounts, add-ons and every Kubernetes object you made |
 | Rebuild | `hb rebuild` | on the running box: only `/var/lib/hb/rebuild/stage`; on a fresh box, everything it's missing |
@@ -47,7 +47,7 @@ data folders.
 
     sudo hb restore list                          # snapshots
     sudo hb restore ls /etc/hb                    # what the newest one holds there
-    sudo hb restore get /etc/hb/hb.toml           # into /var/tmp/hb-restore/<now>/etc/hb/hb.toml
+    sudo hb restore get /etc/hb/hb.toml           # into /var/tmp/hb-restore-<now>-<random>/etc/hb/hb.toml
     sudo hb restore get /etc/hb --from 1a2b3c4d   # an older snapshot, by its ID
 
 The restored files sit at their full paths under the folder it prints.

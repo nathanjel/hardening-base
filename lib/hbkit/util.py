@@ -3,6 +3,7 @@ import fcntl
 import json
 import os
 import subprocess
+import tempfile
 
 HB_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 HB = os.path.join(HB_ROOT, "hb")
@@ -36,13 +37,20 @@ def read_json(path, default):
 
 
 def write_atomic(path, text, mode=0o600):
-    """Replace path with text in one step, so readers never see half a file."""
-    tmp = f"{path}.tmp{os.getpid()}"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-    with os.fdopen(fd, "w") as f:
-        f.write(text)
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    """Replace path with text in one step, so readers never see half a file. The temporary file
+    is new and randomly named, and a link at path is replaced, not written through."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=f".{os.path.basename(path)}.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            os.fchmod(f.fileno(), mode)
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def write_json(path, data, mode=0o600):

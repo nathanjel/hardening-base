@@ -47,7 +47,7 @@ class DrillTest(unittest.TestCase):
                        capture_output=True)
         self.addCleanup(setattr, restore.restic, "COMMAND", restore.restic.COMMAND)
         restore.restic.COMMAND = ["restic"]
-        for name, value in (("DRILL_DIR", self.d), ("GET_DIR", os.path.join(self.d, "got"))):
+        for name, value in (("DRILL_DIR", self.d), ("GET_DIR", self.d)):
             self.addCleanup(setattr, restore, name, getattr(restore, name))
             setattr(restore, name, value)
         notes = []
@@ -118,6 +118,20 @@ class DrillTest(unittest.TestCase):
         with open(to + os.path.join(self.tree, "home", "f07.txt"), "rb") as f:
             self.assertEqual(f.read(), b"file 7\n" * 8)
         self.assertFalse(os.path.exists(to + os.path.join(self.tree, "home", "f08.txt")))
+
+    def test_get_by_default_makes_a_new_private_folder(self):
+        path = os.path.join(self.tree, "home", "f07.txt")
+        made = []
+        for _ in range(2):
+            before = set(os.listdir(self.d))
+            self.assertEqual(restore.do_get([path], "latest", None, "box"), 0)
+            made += sorted(set(os.listdir(self.d)) - before)
+        self.assertEqual(len(set(made)), 2)                    # never a name someone could take first
+        for name in made:
+            self.assertTrue(name.startswith("hb-restore-"), name)
+            folder = os.path.join(self.d, name)
+            self.assertEqual(os.stat(folder).st_mode & 0o777, 0o700)
+            self.assertTrue(os.path.exists(folder + path))
 
     def test_get_over_live_files_needs_a_yes(self):
         path = os.path.join(self.tree, "home", "f09.txt")

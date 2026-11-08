@@ -47,6 +47,7 @@ from hbkit import otp, util
 WEB = os.path.join(util.HB_ROOT, "web")
 AUTH = os.environ.get("HB_WEBSHELL_AUTH") or os.path.join(os.environ.get("CREDENTIALS_DIRECTORY", "/nonexistent"), "auth")
 STATE_DIR = os.environ.get("HB_WEBSHELL_STATE", "/var/lib/hb-webshell")
+WINDOW = "/run/hb-webshell-public"      # the public window's end: root's file, this daemon only reads it
 
 MAX_HEAD = 8192              # request line plus headers
 MAX_HEADERS = 64
@@ -108,7 +109,7 @@ def locked():
 
 
 def public_until():
-    data = util.read_json(state_path("public"), {})
+    data = util.read_json(WINDOW, {})
     try:
         return float(data.get("until", 0))
     except (AttributeError, TypeError, ValueError):

@@ -25,10 +25,10 @@ Items:
 Over WireGuard: http://<wg address>:<port>, plain HTTP inside the tunnel. Public:
 `hb webshell open` applies a Service, an EndpointSlice pointing at the WireGuard
 address, a Certificate and an Ingress for webshell.host (needs a DNS record),
-writes the window's end where the daemon reads it, and starts a timer that runs
-`hb webshell close`. The daemon itself refuses the ingress once the window has
-passed, timer or not. Restarting the daemon leaves the tmux session "web"
-running (KillMode=process).
+writes the window's end to /run/hb-webshell-public (root's; the daemon only reads
+it, and a reboot clears it), and starts a timer that runs `hb webshell close`. The
+daemon itself refuses the ingress once the window has passed, timer or not.
+Restarting the daemon leaves the tmux session "web" running (KillMode=process).
 
 Config ([webshell] in hb.toml): user, port, host, ingress_from, ingress_class,
 namespace, issuer, middlewares, max_hours. The tunnel comes from [wg].
@@ -50,7 +50,8 @@ from hbkit import util  # noqa: E402
 
 AUTH = "/etc/hb/webshell.json"
 UNIT = "/etc/systemd/system/hb-webshell.service"
-STATE_DIR = "/var/lib/hb-webshell"          # the daemon's (StateDirectory); root writes "public", removes "lock"
+STATE_DIR = "/var/lib/hb-webshell"          # the daemon's (StateDirectory); root only reads it and removes "lock"
+WINDOW = "/run/hb-webshell-public"          # the public window: root's, the daemon only reads it
 NAME = "hb-webshell"                        # the unit, and the Kubernetes objects
 TIMER = "hb-webshell-close"
 KUBECTL = ("/snap/bin/microk8s", "kubectl")
@@ -305,7 +306,7 @@ def manifests(s):
 
 def window():
     """(until, host) of the public window, or (0, "") when closed."""
-    data = util.read_json(os.path.join(STATE_DIR, "public"), {})
+    data = util.read_json(WINDOW, {})
     try:
         return float(data.get("until", 0)), str(data.get("host", ""))
     except (AttributeError, TypeError, ValueError):
@@ -355,8 +356,7 @@ def do_open(s, arg):
             print(f"kubectl apply {obj['kind']} failed: {err.strip()}")
             return 2
     until = time.time() + secs
-    util.write_json(os.path.join(STATE_DIR, "public"), {"until": until, "host": s["host"],
-                                                       "opened": int(time.time())}, mode=0o644)
+    util.write_json(WINDOW, {"until": until, "host": s["host"], "opened": int(time.time())}, mode=0o644)
     stop_timer()
     rc, _, err = util.run("systemd-run", f"--unit={TIMER}", f"--on-active={secs}", "--timer-property=AccuracySec=10s",
                           "--description=hb webshell: close the public window", util.HB, "webshell", "close", "--timer")
@@ -382,7 +382,7 @@ def do_open(s, arg):
 def do_close(s, by_timer):
     rc, _, err = kubectl("delete", "ingress", NAME, "-n", s["ns"], "--ignore-not-found")
     try:
-        os.remove(os.path.join(STATE_DIR, "public"))
+        os.remove(WINDOW)
     except FileNotFoundError:
         pass
     if not by_timer:

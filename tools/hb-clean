@@ -14,14 +14,20 @@ idle projects, stale caches, Docker leftovers.
 Targets:
   projects  git repos under clean.project_roots untouched for idle_days: run the
             repo's executable .hb-clean if it has one, else `make clean` if the
-            Makefile has that target (both as the repo's owner), else delete its
-            git-ignored build folders (clean.build_dirs; .venv after venv_idle_days).
-            Only git-ignored folders count, never tracked files, .env* or data/.
+            Makefile has that target, else delete its git-ignored build folders
+            (clean.build_dirs; .venv after venv_idle_days). Only git-ignored
+            folders count, never tracked files, .env* or data/.
   caches    entries in ~/.cache (and ~/.npm/_cacache) untouched for cache_idle_days,
             for each of clean.users
   docker    stopped containers older than docker_container_days, unused images
             older than docker_image_days, build cache above docker_build_cache.
             Volumes are listed, never removed. Only with clean.docker = true.
+
+Everything in a project or a cache runs with its owner's rights, not root's, as the
+owner the plan saw: if a folder is swapped for something else after the plan, it is
+left alone, and nothing here could reach beyond that owner's files anyway. A repo
+owned by root is skipped. A folder holding another user's subfolder (a container's
+build output, say) is kept and named in the notes: remove it by hand.
 
 The local image registry (clean.registry_dir) is measured, never cleaned: its
 size goes in the report, and the check warns once it passes clean.registry_warn.
@@ -64,9 +70,11 @@ def human(n):
     return f"{n:.1f} TB"
 
 
-def walk_stats(path):
-    """(bytes on disk, newest mtime) of everything under path, symlinks not followed."""
-    total, newest, stack = 0, 0, [path]
+def walk_stats(path, uid=None):
+    """(bytes on disk, newest mtime, first folder not owned by uid) of everything under path,
+    symlinks not followed. Only folders count as foreign: a folder's owner can delete any file
+    in it, but not empty a subfolder of someone else's."""
+    total, newest, foreign, stack = 0, 0, None, [path]
     while stack:
         p = stack.pop()
         try:
@@ -76,38 +84,67 @@ def walk_stats(path):
         total += st.st_blocks * 512
         newest = max(newest, st.st_mtime)
         if stat.S_ISDIR(st.st_mode):
+            if foreign is None and uid is not None and st.st_uid != uid:
+                foreign = p
             try:
                 with os.scandir(p) as it:
                     stack.extend(e.path for e in it)
             except OSError:
                 pass
-    return total, newest
+    return total, newest, foreign
 
 
 def inside(path, parent):
     return os.path.realpath(path).startswith(os.path.realpath(parent) + os.sep) and not os.path.islink(path)
 
 
-def remove(paths, parent):
-    def fn():
-        for p in paths:
-            if inside(p, parent):
-                shutil.rmtree(p) if os.path.isdir(p) else os.unlink(p)
-        return "removed"
-    return fn
-
-
-def as_owner(path):
-    """subprocess options that run a command as path's owner, in their home."""
-    st = os.stat(path)
-    pw = pwd.getpwuid(st.st_uid)
+def as_user(uid):
+    """subprocess options that run a command as uid, in their home. Callers pass the uid the plan
+    saw, never one read again from a path that may have been swapped since."""
+    pw = pwd.getpwuid(uid)
     env = {"HOME": pw.pw_dir, "USER": pw.pw_name, "LOGNAME": pw.pw_name,
            "PATH": f"{pw.pw_dir}/.local/bin:{pw.pw_dir}/.cargo/bin:/usr/local/bin:/usr/bin",
            "GIT_OPTIONAL_LOCKS": "0"}
     opts = {"env": env, "errors": "surrogateescape"}
-    if os.geteuid() == 0 and st.st_uid != 0:
+    if os.geteuid() == 0:
         opts.update(user=pw.pw_uid, group=pw.pw_gid, extra_groups=os.getgrouplist(pw.pw_name, pw.pw_gid))
     return opts
+
+
+def unchanged(path, uid):
+    """path is still a real folder of uid's, as it was in the plan."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == uid
+
+
+def delete_as(uid, path):
+    """rm -rf path with uid's rights: None, or the error. A folder its owner made read-only (Go's
+    module cache, pnpm) gets its write permission back for a second try."""
+    opts = dict(as_user(uid), timeout=3600, cwd="/", stdin=subprocess.DEVNULL)
+    rm = ("rm", "-rf", "--one-file-system", "--", path)
+    rc, _, err = util.run(*rm, **opts)
+    if rc:
+        util.run("chmod", "-R", "u+rwx", "--", path, **opts)
+        rc, _, err = util.run(*rm, **opts)
+    return None if rc == 0 else (err.strip().splitlines() or [f"exit {rc}"])[-1][:200]
+
+
+def remove(paths, parent, uid):
+    """Delete paths with uid's rights, never root's."""
+    def fn():
+        if not unchanged(parent, uid):
+            raise RuntimeError(f"{parent} changed since the plan; left alone")
+        for p in paths:
+            if not inside(p, parent):
+                raise RuntimeError(f"{p} isn't inside {parent} any more; left alone")
+            err = delete_as(uid, p)
+            if err:
+                raise RuntimeError(f"rm {p}: {err}")
+        return "removed"
+    return fn
 
 
 # --- projects ----------------------------------------------------------------------
@@ -126,13 +163,23 @@ def find_repos(roots, skip):
             dirs[:] = [d for d in dirs if depth < 4 and not d.startswith(".") and d not in skip]
 
 
-def git_lines(repo, *args):
-    rc, out, _ = util.run("git", "-C", repo, *args, "-z", timeout=300, **as_owner(repo))
+def repo_owner(repo):
+    """The uid everything in repo runs as, or None: not a real folder, root's, or no known user's."""
+    try:
+        st = os.lstat(repo)
+        pwd.getpwuid(st.st_uid)
+    except (OSError, KeyError):
+        return None
+    return st.st_uid if stat.S_ISDIR(st.st_mode) and st.st_uid != 0 else None
+
+
+def git_lines(repo, uid, *args):
+    rc, out, _ = util.run("git", "-C", repo, *args, "-z", timeout=300, **as_user(uid))
     return [p for p in out.split("\0") if p] if rc == 0 else None
 
 
-def last_activity(repo):
-    files = git_lines(repo, "ls-files", "-co", "--exclude-standard")
+def last_activity(repo, uid):
+    files = git_lines(repo, uid, "ls-files", "-co", "--exclude-standard")
     if files is None:
         return None
     newest = 0
@@ -144,10 +191,10 @@ def last_activity(repo):
     return newest
 
 
-def build_output(repo, cfg, idle_days):
+def build_output(repo, uid, cfg, idle_days):
     """Git-ignored folders in repo that clean.build_dirs (or .venv) names."""
     found = []
-    for rel in git_lines(repo, "ls-files", "-o", "-i", "--exclude-standard", "--directory") or []:
+    for rel in git_lines(repo, uid, "ls-files", "-o", "-i", "--exclude-standard", "--directory") or []:
         rel = rel.rstrip("/")
         parts = rel.split("/")
         full = os.path.join(repo, rel)
@@ -162,20 +209,21 @@ def build_output(repo, cfg, idle_days):
     return found
 
 
-def has_make_clean(repo):
+def has_make_clean(repo, uid):
+    """Read by the owner, with a time limit: the Makefile could be anything, a pipe for one."""
     for name in ("GNUmakefile", "makefile", "Makefile"):
-        try:
-            with open(os.path.join(repo, name), errors="replace") as f:
-                if re.search(r"^clean\s*:", f.read(), re.M):
-                    return True
-        except OSError:
-            continue
+        rc, _, _ = util.run("grep", "-qE", r"^clean[[:space:]]*:", "--", os.path.join(repo, name), timeout=30,
+                            stdin=subprocess.DEVNULL, **as_user(uid))
+        if rc == 0:
+            return True
     return False
 
 
-def run_in(repo, *cmd):
+def run_in(repo, uid, *cmd):
     def fn():
-        rc, out, err = util.run(*cmd, cwd=repo, timeout=900, stdin=subprocess.DEVNULL, **as_owner(repo))
+        if not unchanged(repo, uid):
+            raise RuntimeError(f"{repo} changed since the plan; left alone")
+        rc, out, err = util.run(*cmd, cwd=repo, timeout=900, stdin=subprocess.DEVNULL, **as_user(uid))
         if rc != 0:
             raise RuntimeError(f"{' '.join(cmd)} exited {rc}: {(err.strip().splitlines() or [''])[-1][:200]}")
         return f"ran {' '.join(cmd)}"
@@ -186,24 +234,34 @@ def plan_projects(cfg, now):
     actions, notes = [], []
     skip = set(cfg["build_dirs"]) | {"node_modules", ".venv"}
     for repo in find_repos(cfg["project_roots"], skip):
-        last = last_activity(repo)
+        uid = repo_owner(repo)
+        if uid is None:
+            notes.append(f"{repo}: owned by root or by no known user, skipped")
+            continue
+        last = last_activity(repo, uid)
         if last is None:
             notes.append(f"{repo}: git can't read it, skipped")
             continue
         idle = (now - last) / DAY
         if idle < cfg["idle_days"]:
             continue
-        dirs = build_output(repo, cfg, idle)
+        dirs, size = [], 0
+        for d in build_output(repo, uid, cfg, idle):
+            used, _, foreign = walk_stats(d, uid)
+            if foreign:
+                notes.append(f"kept {d}: {foreign} is another user's, and hb clean works with the owner's rights")
+            else:
+                dirs.append(d)
+                size += used
         if not dirs:
             continue
-        size = sum(walk_stats(d)[0] for d in dirs)
         names = sorted({os.path.basename(d) for d in dirs})
         if os.access(os.path.join(repo, ".hb-clean"), os.X_OK):
-            how, fn = "run .hb-clean", run_in(repo, os.path.join(repo, ".hb-clean"))
-        elif has_make_clean(repo):
-            how, fn = "make clean", run_in(repo, "make", "clean")
+            how, fn = "run .hb-clean", run_in(repo, uid, os.path.join(repo, ".hb-clean"))
+        elif has_make_clean(repo, uid):
+            how, fn = "make clean", run_in(repo, uid, "make", "clean")
         else:
-            how, fn = f"delete {', '.join(names)}", remove(dirs, repo)
+            how, fn = f"delete {', '.join(names)}", remove(dirs, repo, uid)
         actions.append(Action("projects", f"{repo}: {how} (idle {idle:.0f} days, {len(dirs)} build folders)", size, fn))
     return actions, notes
 
@@ -214,9 +272,13 @@ def plan_caches(cfg, now):
     actions, notes = [], []
     for user in cfg["users"]:
         try:
-            home = pwd.getpwnam(user).pw_dir
+            pw = pwd.getpwnam(user)
         except KeyError:
             notes.append(f"no user {user}")
+            continue
+        home, uid = pw.pw_dir, pw.pw_uid
+        if not unchanged(home, uid):
+            notes.append(f"{home} isn't {user}'s own folder, skipped")
             continue
         base = os.path.join(home, ".cache")
         entries = []
@@ -228,10 +290,13 @@ def plan_caches(cfg, now):
         if os.path.isdir(npm) and not os.path.islink(npm):
             entries.append(npm)
         for path in sorted(entries):
-            size, newest = walk_stats(path)
+            size, newest, foreign = walk_stats(path, uid)
             idle = (now - newest) / DAY
             if idle >= cfg["cache_idle_days"] and size > 0:
-                actions.append(Action("caches", f"{path} (untouched {idle:.0f} days)", size, remove([path], home)))
+                if foreign:
+                    notes.append(f"kept {path}: {foreign} is another user's, and hb clean works with the owner's rights")
+                else:
+                    actions.append(Action("caches", f"{path} (untouched {idle:.0f} days)", size, remove([path], home, uid)))
             elif size >= 10**9:
                 notes.append(f"kept {path}: {human(size)}, used {idle:.0f} days ago")
     return actions, notes

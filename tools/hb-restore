@@ -4,9 +4,9 @@
   hb restore list                         the backup's snapshots, newest last
   hb restore ls [SNAP] PATH               what a snapshot holds under PATH (default: the newest)
   hb restore get PATH... [--from SNAP] [--to DIR]
-                                          restore PATHs into DIR, by default a new folder in
-                                          /var/tmp/hb-restore; over the live files only with
-                                          --to / and after you confirm
+                                          restore PATHs into DIR, by default a new folder
+                                          /var/tmp/hb-restore-<now>-<random>, root's; over the
+                                          live files only with --to / and after you confirm
   hb restore drill                        restore a random sample of the newest snapshot and
                                           compare it with the live files (hb-restore.timer,
                                           quarterly)
@@ -43,7 +43,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.
 from hbkit import config, restic, util  # noqa: E402
 
 DRILL_DIR = "/var/tmp"
-GET_DIR = "/var/tmp/hb-restore"
+GET_DIR = "/var/tmp"
 GRACE_DAYS = 7
 MUST_HAVE_FILES = 3                         # files restored from each must_have folder
 MAX_TOTAL = 5 * 10**9                       # the sample's biggest files go until it fits
@@ -242,9 +242,10 @@ def do_get(paths, snap, to, host):
         if not util.ask("restore over the live files?"):
             print("nothing restored")
             return 1
-    else:
-        to = to or os.path.join(GET_DIR, time.strftime("%Y%m%d-%H%M%S"))
+    elif to:
         os.makedirs(to, mode=0o700, exist_ok=True)
+    else:       # a shared folder: a new, randomly named folder of root's, never a name someone can take first
+        to = tempfile.mkdtemp(prefix=f"hb-restore-{time.strftime('%Y%m%d-%H%M%S')}-", dir=GET_DIR)
     args = ["restore", snap, *(restic.host_args(host) if snap == "latest" else []), "--target", to]
     args += ["--overwrite", "if-changed"] if in_place else []
     for p in paths:
