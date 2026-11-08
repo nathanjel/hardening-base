@@ -112,6 +112,44 @@ class EtcTest(unittest.TestCase):
         self.assertEqual(lines[1:4], ["rc=1", etc + "/hb.toml", "rc=0"])
         self.assertEqual(lines[4:], [f"700 {etc}/secrets", f"600 {etc}/secrets/supervoip-token"])
 
+    def test_a_link_is_broken_until_the_file_itself_is_there(self):
+        # a link in /etc/hb can lead to a world-readable or user-owned secret elsewhere
+        d = tempfile.mkdtemp()
+        etc, outside = os.path.join(d, "etc-hb"), os.path.join(d, "home", "token")
+        write(os.path.join(etc, "hb.toml"), "[install]\ntimers = []\n")
+        write(outside, "t0ken\n")
+        os.chmod(etc, 0o700)
+        os.chmod(os.path.join(etc, "hb.toml"), 0o600)
+        os.chmod(outside, 0o644)
+        os.makedirs(os.path.join(etc, "secrets"), mode=0o700)
+        os.symlink(outside, os.path.join(etc, "secrets", "supervoip-token"))
+        script = 'source "$1"; ETC="$2"; SRC=""; chk_config; echo "rc=$?"; fix_config; chk_config >/dev/null; echo "rc=$?"'
+        p = subprocess.run(["unshare", "-r", "bash", "-c", script, "_", harness(), etc],
+                           env=dict(os.environ, HB_CONFIG=os.path.join(etc, "hb.toml")), capture_output=True, text=True)
+        self.assertEqual(p.stdout.splitlines(), [
+            f"links in {etc} lead where this can't vouch for: {etc}/secrets/supervoip-token (put the file itself there)",
+            "rc=2", "rc=2"], p.stderr)
+        self.assertEqual(oct(os.stat(outside).st_mode & 0o777), "0o644")      # the target isn't touched
+
+    def test_hb_toml_or_the_folder_as_a_link_is_never_followed(self):
+        for what in ("hb.toml", "folder"):
+            d = tempfile.mkdtemp()
+            etc, outside = os.path.join(d, "etc-hb"), os.path.join(d, "home", "hb.toml")
+            write(outside, "[install]\ntimers = []\n")
+            os.chmod(outside, 0o644)
+            if what == "hb.toml":
+                os.makedirs(etc, mode=0o700)
+                os.symlink(outside, os.path.join(etc, "hb.toml"))
+            else:
+                os.symlink(os.path.dirname(outside), etc)
+            script = 'source "$1"; ETC="$2"; SRC=""; chk_config; echo "rc=$?"; fix_config; echo "fix=$?"'
+            p = subprocess.run(["unshare", "-r", "bash", "-c", script, "_", harness(), etc],
+                               env=dict(os.environ, HB_CONFIG=outside), capture_output=True, text=True)
+            lines = p.stdout.splitlines()
+            self.assertTrue(lines[0].startswith(f"links in {etc} lead where this can't vouch for: "), (what, lines))
+            self.assertEqual(lines[1:], ["rc=2", "fix=1"], what)
+            self.assertEqual(oct(os.stat(outside).st_mode & 0o777), "0o644", what)     # never chmod'ed through it
+
 
 if __name__ == "__main__":
     unittest.main()

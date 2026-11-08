@@ -60,19 +60,49 @@ class ClosedPipeTest(unittest.TestCase):
     def tool(self, body):
         d = tempfile.mkdtemp()
         self.addCleanup(lambda: __import__("shutil").rmtree(d))
+        self.dir = d
         path = os.path.join(d, "tool")
         with open(path, "w") as f:
             f.write(f"import sys\nsys.path.insert(0, {os.path.join(REPO, 'lib')!r})\nimport hbkit.start\n" + body)
         return path
 
-    def test_a_reader_that_goes_away_ends_the_tool_quietly(self):
-        # hb health status | head -3
-        script = self.tool("for i in range(100000):\n    print('line', i, flush=True)\n")
-        p = subprocess.Popen([sys.executable, "-I", "-B", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        p.stdout.readline()
+    def run_closing(self, body, lines=1):
+        """Start the tool, read LINES lines, close the reading end, then let the tool go on (EOF on stdin)."""
+        p = subprocess.Popen([sys.executable, "-I", "-B", self.tool(body)], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        for _ in range(lines):
+            p.stdout.readline()
         p.stdout.close()
-        _, err = p.communicate(timeout=30)
-        self.assertEqual((p.returncode, err), (141, b""))
+        p.stdin.close()
+        err = p.stderr.read().decode()
+        p.stderr.close()
+        p.wait(timeout=30)
+        return p.returncode, err
+
+    def test_a_reader_that_goes_away_ends_the_tool_quietly(self):
+        # hb health status | head -3, which prints and flushes line by line
+        rc, err = self.run_closing("sys.stdin.read()\nfor i in range(100000):\n    print('line', i, flush=True)\n", 0)
+        self.assertEqual((rc, err), (141, ""))
+
+    def test_output_still_buffered_at_exit_ends_quietly_too(self):
+        # the last flush happens while Python shuts down: without help, "Exception ignored" and exit 120
+        rc, err = self.run_closing("print('x' * 100)\nsys.stdin.read()\n", 0)
+        self.assertEqual((rc, err), (141, ""))
+
+    def test_the_tool_unwinds_on_the_way_out(self):
+        body = ("sys.stdin.read()\ntry:\n    while True:\n        print('x', flush=True)\n"
+                "finally:\n    open(sys.argv[0] + '.cleaned', 'w').close()\n")
+        rc, err = self.run_closing(body, 0)
+        self.assertEqual((rc, err), (141, ""))
+        self.assertTrue(os.path.exists(os.path.join(self.dir, "tool.cleaned")))
+
+    def test_another_broken_pipe_after_the_reader_left_still_shows(self):
+        # stdout is closed, but this error has nothing to do with it: its traceback and exit 1 stay
+        body = "print('one', flush=True)\nprint('pending')\nsys.stdin.read()\nraise BrokenPipeError('the API hung up')\n"
+        rc, err = self.run_closing(body, 1)
+        self.assertEqual(rc, 1)
+        self.assertIn("BrokenPipeError: the API hung up", err)
+        self.assertNotIn("Exception ignored", err)
 
     def test_another_broken_pipe_still_shows(self):
         script = self.tool("raise BrokenPipeError('the API hung up')\n")

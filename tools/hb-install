@@ -13,7 +13,8 @@
 #   link    /usr/local/bin/hb points at /opt/hb/hb
 #   config  /etc/hb/hb.toml is root's and matches the checkout's hb.toml, if any; and
 #           everything in /etc/hb (secrets, tokens, TOTP keys) is root's, unreadable by
-#           anyone else: apply tightens what isn't
+#           anyone else: apply tightens what isn't. A link there is broken until replaced
+#           by the file itself: where it leads, this can't vouch for
 #   units   units/* are installed in /etc/systemd/system. A unit that leaves
 #           units/ is removed only if it carries units/' first line ("# Managed
 #           by hb install"); units other tools write (hb-webshell.service) stay.
@@ -88,15 +89,19 @@ chk_link() {
 fix_link() { ln -sfn "$PREFIX/hb" /usr/local/bin/hb; }
 
 # --- config ---------------------------------------------------------------------
+# links_in_etc — links in /etc/hb, /etc/hb itself included. Where they lead, this can't vouch
+# for, and chown/chmod/install would follow them, so they come before anything else.
+links_in_etc() { { [ -e "$ETC" ] || [ -L "$ETC" ]; } || return 0; find "$ETC" -type l -printf '%p ' 2>/dev/null | sed 's/ $//'; }
 chk_config() {
-  local etc="$ETC/hb.toml" src=""
+  local etc="$ETC/hb.toml" src="" links loose
   [ -n "$SRC" ] && [ -f "$SRC/hb.toml" ] && src="$SRC/hb.toml"
+  links="$(links_in_etc)"
+  if [ -n "$links" ]; then echo "links in $ETC lead where this can't vouch for: $links (put the file itself there)"; return 2; fi
   if [ ! -f "$etc" ]; then
     [ -n "$src" ] && { echo "will copy $src → $etc"; return 1; }
     echo "no $etc, and no hb.toml in the checkout to copy"; return 2
   fi
   if [ "$(stat -c %u:%a "$etc")" != 0:600 ]; then echo "$etc will be made root's, mode 600"; return 1; fi
-  local loose
   loose="$(loose_in_etc)"
   if [ -n "$loose" ]; then echo "only root may read what is in $ETC; will tighten: $loose"; return 1; fi
   if [ -n "$src" ] && ! cmp -s "$src" "$etc"; then
@@ -109,6 +114,7 @@ loose_in_etc() { find "$ETC" ! -type l \( ! -uid 0 -o -perm /077 \) -printf '%p 
 fix_config() {
   local etc="$ETC/hb.toml" src=""
   [ -n "$SRC" ] && [ -f "$SRC/hb.toml" ] && src="$SRC/hb.toml"
+  [ -z "$(links_in_etc)" ] || { echo "links in $ETC: not touching anything there" >&2; return 1; }
   install -d -m 700 "$ETC"
   if [ -n "$src" ] && ! cmp -s "$src" "$etc" 2>/dev/null; then
     keep_copy "$etc"

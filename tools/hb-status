@@ -47,6 +47,10 @@ def strip_word(line):
     return "" if line in ("ok", "warn", "fail") else line
 
 
+def minutes(n):
+    return f"{n:.0f} minute" + ("" if round(n) == 1 else "s")
+
+
 def collect():
     """{key: (level, detail)} from hb-health's lines and every other tool's check."""
     results = {}
@@ -142,9 +146,9 @@ def check():
         return 1
     age = (time.time() - cache["ts"]) / 60
     if age > STALE_MINUTES:
-        print(f"warn: last refresh {age:.0f} minutes ago; is hb-status.timer running?")
+        print(f"warn: last refresh {minutes(age)} ago; is hb-status.timer running?")
         return 1
-    print(f"ok: refreshed {age:.0f} minutes ago")
+    print(f"ok: refreshed {minutes(age)} ago")
     return 0
 
 
