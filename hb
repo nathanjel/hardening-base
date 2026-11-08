@@ -20,13 +20,19 @@ case "${1:-help}" in
     echo "tools: $(tools | tr '\n' ' ')"
     ;;
   check)
-    worst=0
+    worst=0 ok=0 warn=0 fail=0 idle=()
     for t in $(tools); do
       out="$("$HB_ROOT/tools/hb-$t" check 2>&1)"; rc=$?
       out="${out##*$'\n'}"   # a check's verdict is its last line
       printf '%-10s %s\n' "$t" "$out"
       [ "$rc" -gt "$worst" ] && worst=$rc
+      case "$rc" in 0) ok=$((ok + 1)) ;; 1) warn=$((warn + 1)) ;; *) fail=$((fail + 1)) ;; esac
+      # an "ok" that only means the tool has nothing to do here: green, but nothing is being checked
+      case "$out" in *"not managed"*|*"not configured"*|*"not installed"*) idle+=("$t") ;; esac
     done
+    printf '\n%d ok, %d warn, %d fail' "$ok" "$warn" "$fail"
+    [ ${#idle[@]} -gt 0 ] && printf '; not managed here: %s' "$(IFS=,; echo "${idle[*]}" | sed 's/,/, /g')"
+    printf '\n'
     [ "$worst" -gt 2 ] && worst=2
     exit "$worst"
     ;;

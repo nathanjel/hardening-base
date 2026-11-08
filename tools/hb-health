@@ -46,14 +46,23 @@ def check_reboot(cfg):
     rc, out = run("rpm", "-q", "--qf", "%{INSTALLTIME} %{VERSION}-%{RELEASE}.%{ARCH}\n", "kernel-core")
     rows = sorted((int(t), v) for t, v in (ln.split() for ln in out.splitlines() if ln.strip())) if rc == 0 else []
     installed, newest = rows[-1] if rows else (0, running)
-    rc, _ = run("dnf", "needs-restarting", "-r", timeout=60)
+    nr, _ = run("dnf", "needs-restarting", "-r", timeout=60)
     if newest != running:
         days = (time.time() - installed) / 86400
         detail = f"running kernel {running}, {newest} installed {days:.0f} days ago"
         return (FAIL if days >= cfg["reboot_fail_days"] else WARN), detail
-    if rc == 1:
+    if nr == 1:
         return WARN, "updated system libraries need a reboot"
+    # 0 is the only answer that means "no reboot needed"; anything else is not knowing
+    unknown = [f"dnf needs-restarting -r: {exit_text(nr)}"] if nr != 0 else []
+    unknown += [f"rpm can't list kernel-core ({exit_text(rc)})"] if not rows else []
+    if unknown:
+        return WARN, f"kernel {running}; can't tell whether a reboot is needed: " + "; ".join(unknown)
     return OK, f"kernel {running}"
+
+
+def exit_text(rc):
+    return {127: "not installed", 124: "timed out"}.get(rc, f"exit {rc}")
 
 
 def check_raid(cfg):

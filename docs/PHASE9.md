@@ -7,7 +7,7 @@ An outside review of hb, cross-checked against the code, led to three parts:
 | 9a | Root and users: root stops acting with its own rights on things a user can change | this runbook |
 | 9b | SSH: rollback that covers group membership, the effective sshd settings checked | this runbook |
 | 9c | After an outage: an SMS route that doesn't depend on Kubernetes, alerts that admit they failed, microk8s that keeps retrying, evicted pods as a warning, honest cleanup figures | this runbook |
-| 9d | Honest reporting: backup coverage, a reboot check that can say "unknown", unmanaged tools listed | to follow |
+| 9d | Honest reporting: backup coverage, a reboot check that can say "unknown", unmanaged tools listed | this runbook |
 
 Keep a filled-in copy of this runbook in `local/`.
 
@@ -268,3 +268,22 @@ A third and a fourth review found three more, also fixed:
 Don't make a kit just to test it: a new kit voids the one you have.
 `tests/test_boundary.py` covers the kit with two real uids, including a folder above
 the kit being swapped for a link while it is made.
+
+## 9d: reports that say what they don't know
+
+| Piece | Tool | What changes |
+|---|---|---|
+| Backup coverage | `hb backup` | each run writes `last-coverage`: paths read from the snapshot, paths read live (another filesystem, or no snapshot), paths that don't exist, and mounts or btrfs subvolumes below the paths, which neither the snapshot nor `--one-file-system` takes in. `check` warns on a missing path, and on anything left out that `backup.exclude` doesn't name; `status` lists it all |
+| Reboot | `hb health`, `hb upgrade` | only `dnf needs-restarting -r` exiting 0 means "no reboot needed". Any other answer (not installed, timed out, an error), or `rpm` unable to list kernels, is a warning that says it can't tell; the night doesn't reboot on it |
+| `hb check` | `hb` | after the lines, a count (`N ok, N warn, N fail`) and the tools whose "ok" only means they have nothing to do here (`not managed`, `not configured`, `not installed`) |
+
+**Risk.** None: reporting only. The first coverage note comes with the next backup.
+
+    sudo ./hb install apply        # y to code
+    sudo hb check                  # the last line: the count
+    sudo hb backup run             # or wait for the night's
+    sudo hb backup status          # covered: from the snapshot ..., read live ..., ...
+    sudo hb backup check
+
+If something is left out on purpose, add it to `backup.exclude`; otherwise add it to
+`backup.paths`.

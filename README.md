@@ -13,7 +13,7 @@ small browser shell, a break-glass kit, encrypted restic backups, idle-aware
 upgrades and cleanup jobs. They arrive in phases.
 
     hb <tool> <verb>     e.g. sudo ./hb k8s plan
-    hb check             one line per tool
+    hb check             one line per tool, then a count that names the tools with nothing to check here
 
 ## Status
 
@@ -47,7 +47,7 @@ timers run) and the config to `/etc/hb/hb.toml`.
 | `hb-status` | runs every check every 15 minutes, writes the login banner, passes changes to hb-notify |
 | `hb-notify` | events for the banner; failures also as SMS through any command you name (rate-limited), with a second route for when the first is down (`hooks/sms-supervoip`) |
 | `hb-alerts` | mdadm and smartd report through hb-notify, no mail server needed |
-| `hb-backup` | restic from a read-only btrfs snapshot, plus a state dump for rebuilding |
+| `hb-backup` | restic from a read-only btrfs snapshot, plus a state dump for rebuilding; each run notes what it covered (missing paths, live reads, mounts and subvolumes left out) |
 | `hb-restore` | files back from the backup (into a folder, or over the live ones after a yes), and a quarterly drill that restores a random sample and compares it byte for byte with the live files |
 | `hb-clean` | build output in idle projects, stale caches, Docker leftovers; dry-run first. Measures the image registry, never cleans it |
 | `hb-disk` | what's eating the disk: the biggest folders, what grew since last week, big folders nobody has touched in a month; reports only |

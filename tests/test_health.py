@@ -142,5 +142,33 @@ class K8sCheckTest(unittest.TestCase):
         self.assertEqual(health.check_k8s({})[0], health.FAIL)
 
 
+
+class RebootCheckTest(unittest.TestCase):
+    def check(self, nr, rpm_rc=0, kernel=None):
+        running = os.uname().release
+        old = health.run
+        self.addCleanup(setattr, health, "run", old)
+
+        def run(*cmd, timeout=30):
+            if cmd[0] == "rpm":
+                return rpm_rc, f"1700000000 {kernel or running}\n" if rpm_rc == 0 else ""
+            return nr, ""
+        health.run = run
+        return health.check_reboot({"reboot_fail_days": 7})
+
+    def test_answers(self):
+        self.assertEqual(self.check(0)[0], health.OK)
+        self.assertEqual(self.check(1), (health.WARN, "updated system libraries need a reboot"))
+        self.assertEqual(self.check(0, kernel="9.9.9-1.fc44.x86_64")[0], health.FAIL)   # waited long enough
+
+    def test_no_answer_is_not_ok(self):
+        for nr, text in ((2, "exit 2"), (127, "not installed"), (124, "timed out")):
+            level, line = self.check(nr)
+            self.assertEqual(level, health.WARN, nr)
+            self.assertIn(f"can't tell whether a reboot is needed: dnf needs-restarting -r: {text}", line)
+        level, line = self.check(0, rpm_rc=1)
+        self.assertEqual(level, health.WARN)
+        self.assertIn("rpm can't list kernel-core (exit 1)", line)
+
 if __name__ == "__main__":
     unittest.main()

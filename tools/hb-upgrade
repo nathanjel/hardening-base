@@ -167,15 +167,19 @@ def newest_kernel():
 
 
 def reboot_reason():
-    """Why a reboot is needed, or None."""
-    rc, out, _ = util.run("dnf", "needs-restarting", "-r", timeout=300)
+    """(why a reboot is needed, or None; why that can't be told, or None)."""
+    rc, out, err = util.run("dnf", "needs-restarting", "-r", timeout=300)
     if rc == 1:
         lines = [l.strip() for l in out.splitlines() if l.strip() and not l.startswith(("Updating", "Repositories"))]
-        return "dnf needs-restarting: " + (next((l for l in lines if "Reboot" in l or "updated" in l), "reboot required"))
+        return "dnf needs-restarting: " + (next((l for l in lines if "Reboot" in l or "updated" in l),
+                                                "reboot required")), None
     running, newest = os.uname().release, newest_kernel()
     if newest and newest != running:
-        return f"kernel {newest} is installed, {running} runs"
-    return None
+        return f"kernel {newest} is installed, {running} runs", None
+    if rc != 0:                                       # 0 is the only "no reboot needed"
+        return None, "dnf needs-restarting -r: " + {127: "not installed", 124: "timed out"}.get(
+            rc, f"exit {rc}" + (f" ({err.strip().splitlines()[-1][:120]})" if err.strip() else ""))
+    return None, None
 
 
 def reboot(st, why):
@@ -217,13 +221,17 @@ def do_run(cfg, manual=False, now=None):
         else:
             snap_refresh(cfg, st)
         save_state(st)
-    why = reboot_reason()
+    why, unknown = reboot_reason()
     r = st.setdefault("reboot", {})
+    if unknown:
+        r["unknown"] = unknown
+    else:
+        r.pop("unknown", None)
     if not why:
         r.pop("needed_since", None)
         r.pop("busy", None)
         save_state(st)
-        log("no reboot needed")
+        log(f"can't tell whether a reboot is needed: {unknown}" if unknown else "no reboot needed")
         return 0 if st["dnf"]["rc"] == 0 else 2
     r.setdefault("needed_since", int(time.time()))
     r["why"] = why
@@ -275,6 +283,8 @@ def verdict(cfg):
     if not d or time.time() - d["at"] > 2 * 86400:
         return 1, "warn: no upgrade in 2 days: is hb-upgrade.timer running?"
     r = st.get("reboot", {})
+    if r.get("unknown") and not r.get("needed_since"):
+        return 1, f"warn: {summary(st)}; can't tell whether a reboot is needed: {r['unknown']}"
     if r.get("needed_since"):
         days = (time.time() - r["needed_since"]) / 86400
         wait = f"reboot waiting {days:.0f} days" if days >= 1 else "reboot waiting"

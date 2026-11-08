@@ -82,13 +82,31 @@ class UpgradeTest(unittest.TestCase):
         self.assertEqual(up.chk_snaps(cfg(snaps=["lxd"]))[0], 2)
 
     def test_reboot_reason(self):
-        self.assertIn("Reboot is required", up.reboot_reason())
+        why, unknown = up.reboot_reason()
+        self.assertIn("Reboot is required", why)
+        self.assertIsNone(unknown)
         self.fake.restart = 0
-        self.assertIsNone(up.reboot_reason())
+        self.assertEqual(up.reboot_reason(), (None, None))
         self.fake.kernel = "9.9.9-1.fc44.x86_64"               # a newer kernel than the one running
-        self.assertIn("9.9.9", up.reboot_reason())
+        self.assertIn("9.9.9", up.reboot_reason()[0])
         self.fake.restart = 2                                  # dnf itself failed: the kernel comparison decides
-        self.assertIn("9.9.9", up.reboot_reason())
+        self.assertIn("9.9.9", up.reboot_reason()[0])
+
+    def test_a_reboot_check_that_cant_answer_says_so(self):
+        for rc, text in ((2, "exit 2"), (127, "not installed"), (124, "timed out")):
+            self.fake.restart = rc
+            self.assertEqual(up.reboot_reason(), (None, f"dnf needs-restarting -r: {text}"))
+        c = cfg(snaps=["microk8s"])                            # held already, so only the reboot speaks
+        self.fake.restart = 127
+        self.assertEqual(up.do_run(c, now=NIGHT), 0)           # no reboot: nothing says one is needed
+        self.assertFalse(self.fake.did("systemctl", "reboot"))
+        rc, line = up.verdict(c)
+        self.assertEqual(rc, 1)
+        self.assertIn("can't tell whether a reboot is needed: dnf needs-restarting -r: not installed", line)
+        self.fake.restart = 0                                  # the next night it answers: ok again
+        up.save_state({**up.load_state(), "night": "earlier"})
+        up.do_run(c, now=NIGHT)
+        self.assertEqual(up.verdict(c)[0], 0)
 
     def test_window(self):
         self.assertTrue(up.in_window(cfg(), datetime.datetime(2026, 11, 2, 4, 30)))
