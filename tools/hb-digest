@@ -81,6 +81,10 @@ def upgrade_line(now):
                          "Free the box (or run sudo hb upgrade now) so it can happen.")
     if d.get("rc"):
         notes.append(f"dnf upgrade failed: {d.get('error', '')}")
+    if st.get("unfinished"):
+        notes.append(f"A dnf upgrade stopped halfway: {st['unfinished'].get('why', '')}")
+    for unit, p in (st.get("after_pending") or {}).items():
+        notes.append(f"After the upgrade, {unit} still needs you: {p.get('why', '')} (sudo hb upgrade now tries again)")
     return ", ".join(parts), notes
 
 

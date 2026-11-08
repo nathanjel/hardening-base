@@ -187,6 +187,19 @@ enabled = false
 window_end = "07:00"
 snaps = []                    # snaps whose auto-refresh is held and done here instead, e.g. ["microk8s", "snapd", "core22"];
                               # with enabled = false only the hold: they refresh when you refresh them
+refresh_snaps = true          # false: the snaps are only held, never refreshed here (you refresh them)
+release = ""                  # "": the distribution's choice. "latest": the newest release, resolved each night and
+                              # passed as --releasever, never another major version (Amazon Linux 2023 stays on its
+                              # release otherwise); or one release, e.g. "2023.12.20261102"
+security_only = false         # true: security advisories only (dnf upgrade --security)
+repos = []                    # only these repositories, e.g. ["amazonlinux"]; []: every enabled one
+reboot = "idle"               # "never": hb never reboots; the check and the digest say one is waiting
+# after = [                   # one rule per unit; when one of packages changed (no packages: every night) and it ran before:
+#   { packages = ["openssh-server", "openssl-libs"], test = ["/usr/sbin/sshd", "-t"], unit = "sshd" },
+#   { unit = "my-firewall", action = "reload-or-restart" },
+# ]                           # its test, then systemctl restart (or action). A failing test leaves the unit alone:
+#                             # the step stays pending (tried on every run, or: hb upgrade forget UNIT), the check
+#                             # fails, and nothing refreshes or reboots until it is done
 snapshot_days = 3             # how long the pre-upgrade snapshots stay; 0: none (on a busy disk,
                               # where they'd hold days of deleted files: the backup is the way back)
 force_after_days = 0          # 0: never reboot while busy; N: reboot anyway once it has waited N days

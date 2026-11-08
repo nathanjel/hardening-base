@@ -1,5 +1,6 @@
 """Phase 6: hb-upgrade's night (commands faked), the busy.d checks on fake inputs, the digest and its banner line."""
 import contextlib
+import copy
 import datetime
 import io
 import json
@@ -28,11 +29,9 @@ snapd     2.77.1    28254  latest/stable  canonical**  snapd
 
 
 def cfg(**over):
-    c = {"upgrade": {"enabled": True, "window_end": "07:00", "snaps": ["microk8s", "snapd"], "snapshot_days": 3,
-                     "force_after_days": 0},
-         "snapshot": {"dir": tempfile.mkdtemp(), "keep_days": 14}, "digest": {"reminders": []}}
-    c["upgrade"].update(over)
-    return c
+    u = copy.deepcopy(up.config.DEFAULTS["upgrade"])
+    u.update({"enabled": True, "snaps": ["microk8s", "snapd"], "snapshot_days": 3}, **over)
+    return {"upgrade": u, "snapshot": {"dir": tempfile.mkdtemp(), "keep_days": 14}, "digest": {"reminders": []}}
 
 
 class Fake:
@@ -42,9 +41,24 @@ class Fake:
         self.calls, self.restart = [], 1        # dnf needs-restarting -r: 1 = reboot needed
         self.dnf_rc, self.kernel, self.grubby_fails, self.grubby_out = 0, os.uname().release, False, None
         self.rpm = ["bash.x86_64 5.2-1", "kernel-core.x86_64 7.2.13-200"]
+        self.rpm_after = ["bash.x86_64 5.2-2", "kernel-core.x86_64 7.2.14-200"]
+        self.release, self.newest, self.repoquery_rc = "2023.12.20261102", "2023.12.20261116", 0
+        self.active, self.tests, self.kw, self.check_rc = set(), {}, [], 0
 
     def __call__(self, *cmd, **kw):
         self.calls.append(cmd)
+        self.kw.append((cmd, kw))
+        if cmd[:2] == ("rpm", "-q") and cmd[-1] == "system-release":
+            return 0, self.release + "\n", ""
+        if cmd[:2] == ("dnf", "repoquery"):                     # dnf 4 prints its own newline after --qf
+            return self.repoquery_rc, f"{self.newest}\n\n" if self.repoquery_rc == 0 else "", \
+                "Error: Failed to download metadata" if self.repoquery_rc else ""
+        if cmd == ("dnf", "check"):
+            return self.check_rc, "glibc-2.34-1.x86_64 is a duplicate with glibc-2.34-2.x86_64\n" if self.check_rc else "", ""
+        if cmd[:3] == ("systemctl", "is-active", "--quiet"):
+            return (0 if cmd[3] in self.active else 3), "", ""
+        if cmd and cmd[0] in self.tests:                         # an upgrade.after test, e.g. sshd -t
+            return self.tests[cmd[0]], "", "error in /etc/ssh/sshd_config line 9" if self.tests[cmd[0]] else ""
         if cmd == ("grubby", "--default-kernel"):           # the kernel the next boot starts
             if self.grubby_out is not None:
                 return 0, self.grubby_out, ""
@@ -55,7 +69,7 @@ class Fake:
             return 0, "\n".join(self.rpm) + "\n", ""
         if cmd[:3] == ("dnf", "upgrade", "--refresh"):
             if self.dnf_rc == 0:
-                self.rpm = ["bash.x86_64 5.2-2", "kernel-core.x86_64 7.2.14-200"]
+                self.rpm = self.rpm_after
             return self.dnf_rc, "", "Error: cannot download repomd.xml" if self.dnf_rc else ""
         if cmd[:2] == ("dnf", "needs-restarting"):
             return self.restart, "Reboot is required to fully utilize these updates.\n" if self.restart else "", ""
@@ -231,6 +245,231 @@ class UpgradeTest(unittest.TestCase):
 def can_fake_root():
     return shutil.which("unshare") is not None and subprocess.run(
         ["unshare", "-r", "true"], capture_output=True).returncode == 0
+
+
+class AmazonLinuxUpgradeTest(unittest.TestCase):
+    """Stage 4 on Amazon Linux 2023: a resolved release, security only, one repository, the after rules,
+    and reboots left to a person."""
+
+    setUp = UpgradeTest.setUp
+
+    AL = dict(release="latest", security_only=True, repos=["amazonlinux"], reboot="never", snaps=["microk8s"],
+              refresh_snaps=False, snapshot_days=0)
+
+    def upgrade_call(self):
+        return next(((c, kw) for c, kw in self.fake.kw if c[:2] == ("dnf", "upgrade")), (None, None))
+
+    def test_the_newest_release_is_resolved_then_named(self):
+        self.fake.restart = 0
+        self.assertEqual(up.do_run(cfg(**self.AL), now=NIGHT), 0)
+        cmd, kw = self.upgrade_call()
+        self.assertEqual(cmd, ("dnf", "upgrade", "--refresh", "-y", "--disablerepo=*", "--enablerepo=amazonlinux",
+                               "--setopt=amazonlinux.skip_if_unavailable=False", "--releasever=2023.12.20261116",
+                               "--security"))
+        self.assertIsNone(kw["timeout"])                      # an RPM transaction is never killed halfway
+        q = next(c for c in self.fake.calls if c[:2] == ("dnf", "repoquery"))
+        self.assertIn("--releasever=latest", q)
+        self.assertIn("--enablerepo=amazonlinux", q)
+        st = up.load_state()
+        self.assertEqual(st["dnf"]["release"], "2023.12.20261116")
+        self.assertIn("dnf 2023.12.20261116: 2 packages", up.summary(st))
+        self.assertFalse(self.fake.did("snap", "refresh", "microk8s"))   # held only: never refreshed here
+
+    def test_another_major_version_or_no_answer_means_no_upgrade(self):
+        for newest, rc, text in (("2025.0.20270301", 0, "is another major version than 2023.12.20261102"),
+                                 ("", 1, "can't tell the newest release (Error: Failed to download metadata)")):
+            self.fake.newest, self.fake.repoquery_rc, self.fake.calls, self.fake.kw = newest, rc, [], []
+            up.save_state({})
+            self.assertEqual(up.do_run(cfg(**self.AL), now=NIGHT), 2)
+            self.assertEqual(self.upgrade_call(), (None, None))
+            vrc, line = up.verdict(cfg(**self.AL))
+            self.assertEqual(vrc, 2)
+            self.assertIn(text, line)
+
+    def test_a_pinned_release_is_used_as_it_is(self):
+        self.fake.restart = 0
+        up.do_run(cfg(**dict(self.AL, release="2023.12.20261102")), now=NIGHT)
+        self.assertIn("--releasever=2023.12.20261102", self.upgrade_call()[0])
+        self.assertFalse(self.fake.did("dnf", "repoquery"))
+
+    def test_after_rules_restart_only_what_changed_and_ran(self):
+        rules = [{"packages": ["openssh-server", "openssl-libs"], "test": ["/usr/sbin/sshd", "-t"], "unit": "sshd"},
+                 {"unit": "microk8s-management-firewall", "action": "reload-or-restart"},   # every night
+                 {"packages": ["fail2ban-server"], "test": ["/usr/bin/fail2ban-client", "-t"], "unit": "fail2ban"},
+                 {"packages": ["amazon-ssm-agent"], "unit": "amazon-ssm-agent"}]
+        self.fake.rpm = ["openssh-server.aarch64 9.9p1-15", "amazon-ssm-agent.aarch64 3.3.5600.0-1",
+                         "fail2ban-server.noarch 1.1.0-1"]
+        self.fake.rpm_after = ["openssh-server.aarch64 9.9p1-16", "amazon-ssm-agent.aarch64 3.3.5700.0-1",
+                               "fail2ban-server.noarch 1.1.0-1"]
+        self.fake.active = {"sshd", "microk8s-management-firewall", "fail2ban"}   # the SSM agent wasn't running
+        self.fake.restart = 0
+        self.assertEqual(up.do_run(cfg(**dict(self.AL, after=rules)), now=NIGHT), 0)
+        ran = [c for c in self.fake.calls if c[0] in ("/usr/sbin/sshd", "/usr/bin/fail2ban-client")
+               or c[:2] in (("systemctl", "restart"), ("systemctl", "reload-or-restart"))]
+        self.assertEqual(ran, [("/usr/sbin/sshd", "-t"), ("systemctl", "restart", "sshd"),
+                               ("systemctl", "reload-or-restart", "microk8s-management-firewall")])
+        self.assertEqual(up.load_state()["dnf"]["after"], ["restart sshd", "reload-or-restart microk8s-management-firewall"])
+        self.assertEqual(up.verdict(cfg(**dict(self.AL, after=rules)))[0], 0)
+
+    def test_a_failing_test_leaves_the_unit_as_it_is_and_fails_the_night(self):
+        rules = [{"packages": ["openssh-server"], "test": ["/usr/sbin/sshd", "-t"], "unit": "sshd"}]
+        self.fake.rpm, self.fake.rpm_after = ["openssh-server.aarch64 9.9p1-15"], ["openssh-server.aarch64 9.9p1-16"]
+        self.fake.active, self.fake.tests, self.fake.restart = {"sshd"}, {"/usr/sbin/sshd": 255}, 0
+        self.assertEqual(up.do_run(cfg(**dict(self.AL, after=rules)), now=NIGHT), 2)
+        self.assertFalse(self.fake.did("systemctl", "restart", "sshd"))
+        rc, line = up.verdict(cfg(**dict(self.AL, after=rules)))
+        self.assertEqual(rc, 2)
+        self.assertIn("sshd: /usr/sbin/sshd -t failed (error in /etc/ssh/sshd_config line 9), not restarted", line)
+
+    def test_reboot_never_waits_for_a_person(self):
+        self.fake.restart = 1                                  # needs-restarting: a reboot is needed
+        self.assertEqual(up.do_run(cfg(**self.AL), now=NIGHT), 0)
+        self.assertFalse(self.fake.did("systemctl", "reboot"))
+        rc, line = up.verdict(cfg(**self.AL))
+        self.assertEqual(rc, 0)
+        self.assertIn("reboot waiting, for you (upgrade.reboot = never)", line)
+        st = up.load_state()
+        st["reboot"]["needed_since"] -= 8 * 86400
+        up.save_state(st)
+        self.assertEqual(up.verdict(cfg(**self.AL))[0], 1)    # a week later: the check warns
+
+    SSHD = [{"packages": ["openssh-server"], "test": ["/usr/sbin/sshd", "-t"], "unit": "sshd"}]
+
+    def broken_sshd(self):
+        self.fake.rpm, self.fake.rpm_after = ["openssh-server.aarch64 9.9p1-15"], ["openssh-server.aarch64 9.9p1-16"]
+        self.fake.active, self.fake.tests = {"sshd"}, {"/usr/sbin/sshd": 255}
+
+    def test_no_reboot_while_a_validation_failed(self):
+        # an idle-reboot box: sshd's new config fails sshd -t, and a reboot is needed. Rebooting would
+        # start the broken sshd; the running one must stay, and the night must say it failed.
+        self.broken_sshd()
+        self.fake.restart = 1
+        c = cfg(**dict(self.AL, reboot="idle", after=self.SSHD))
+        self.assertEqual(up.do_run(c, now=NIGHT), 2)
+        self.assertFalse(self.fake.did("systemctl", "reboot"))
+        self.assertFalse(self.fake.did("systemctl", "restart", "sshd"))
+
+    def test_no_reboot_or_refresh_after_a_failed_transaction(self):
+        self.fake.dnf_rc, self.fake.restart = 1, 1
+        self.assertEqual(up.do_run(cfg(), now=NIGHT), 2)
+        self.assertFalse(self.fake.did("systemctl", "reboot"))
+        self.assertFalse(self.fake.did("snap", "refresh", "microk8s"))
+
+    def test_a_failed_after_step_stays_until_it_works(self):
+        self.broken_sshd()
+        self.fake.restart = 0
+        c = cfg(**dict(self.AL, after=self.SSHD))
+        self.assertEqual(up.do_run(c, now=NIGHT), 2)
+        self.assertIn("sshd", up.load_state()["after_pending"])
+        self.assertEqual(up.do_run(c, now=NIGHT), 2)             # 30 minutes later: tried again, still broken
+        self.assertFalse(self.fake.did("systemctl", "restart", "sshd"))
+        st = up.load_state()                                      # the next night: openssh doesn't change again
+        st["night"] = "earlier"
+        up.save_state(st)
+        self.fake.rpm = self.fake.rpm_after
+        self.fake.tests = {"/usr/sbin/sshd": 0}                   # someone fixed the config
+        self.assertEqual(up.do_run(c, now=NIGHT), 0)
+        self.assertTrue(self.fake.did("systemctl", "restart", "sshd"))
+        self.assertNotIn("after_pending", up.load_state())
+        self.assertEqual(up.verdict(c)[0], 0)
+
+    def test_forget_a_step_taken_care_of(self):
+        self.broken_sshd()
+        self.fake.restart = 0
+        c = cfg(**dict(self.AL, after=self.SSHD))
+        up.do_run(c, now=NIGHT)
+        self.assertEqual(up.verdict(c)[0], 2)
+        self.assertEqual(up.do_forget("fail2ban"), 1)
+        self.assertEqual(up.do_forget("sshd"), 0)
+        self.assertEqual(up.verdict(c)[0], 0)
+
+    def test_a_pinned_release_of_another_major_is_refused(self):
+        c = cfg(**dict(self.AL, release="2025.0.20270301"))
+        self.assertEqual(up.do_run(c, now=NIGHT), 2)
+        self.assertEqual(self.upgrade_call(), (None, None))
+        self.assertIn("pinned release 2025.0.20270301 is another major version than 2023.12.20261102", up.verdict(c)[1])
+
+    def test_a_transaction_that_never_finished_shows(self):
+        up.save_state({"dnf_started": int(time.time()) - 4 * 3600})
+        rc, line = up.verdict(cfg(**self.AL))
+        self.assertEqual(rc, 1)
+        self.assertIn("hasn't finished: still running, or stopped halfway", line)
+
+    def interrupted(self, test_rc=0):
+        """openssh-server got installed, then the run died before its after steps were saved."""
+        self.fake.rpm = self.fake.rpm_after = ["openssh-server.aarch64 9.9p1-16"]   # already the new one
+        self.fake.active, self.fake.tests, self.fake.restart = {"sshd"}, {"/usr/sbin/sshd": test_rc}, 0
+        up.save_state({"night": "earlier", "dnf_started": {
+            "at": int(time.time()) - 6 * 3600, "before": {"openssh-server.aarch64": ["9.9p1-15"]},
+            "was_active": {"sshd": True}}})
+        return cfg(**dict(self.AL, after=self.SSHD))
+
+    def test_an_interrupted_transaction_still_gets_its_after_steps(self):
+        c = self.interrupted()
+        self.assertEqual(up.do_run(c, now=NIGHT), 0)
+        self.assertTrue(self.fake.did("/usr/sbin/sshd", "-t"))
+        self.assertTrue(self.fake.did("systemctl", "restart", "sshd"))
+        self.assertTrue(self.fake.did("dnf", "check"))
+        st = up.load_state()
+        self.assertNotIn("dnf_started", st)
+        self.assertNotIn("unfinished", st)
+        self.assertEqual(up.verdict(c)[0], 0)
+
+    def test_an_interrupted_transaction_whose_test_fails_stays_pending(self):
+        c = self.interrupted(test_rc=255)
+        self.assertEqual(up.do_run(c, now=NIGHT), 2)
+        self.assertFalse(self.fake.did("systemctl", "restart", "sshd"))
+        self.assertIn("sshd", up.load_state()["after_pending"])
+
+    def test_a_broken_package_database_stays_failed_until_clean(self):
+        c = self.interrupted()
+        self.fake.check_rc, self.fake.restart = 1, 1           # dnf check finds a duplicate; a reboot is due
+        c["upgrade"]["reboot"] = "idle"
+        self.assertEqual(up.do_run(c, now=NIGHT), 2)
+        self.assertFalse(self.fake.did("systemctl", "reboot"))
+        rc, line = up.verdict(c)
+        self.assertEqual(rc, 2)
+        self.assertIn("stopped halfway; dnf check: glibc-2.34-1.x86_64 is a duplicate", line)
+        self.fake.check_rc, self.fake.restart = 0, 0           # someone cleaned it up
+        self.assertEqual(up.do_run(c, now=NIGHT), 0)
+        self.assertEqual(up.verdict(c)[0], 0)
+
+    def test_forget_dnf(self):
+        c = self.interrupted()
+        self.fake.check_rc = 1
+        up.do_run(c, now=NIGHT)
+        self.assertEqual(up.do_forget("dnf"), 0)
+        self.assertEqual(up.do_forget("dnf"), 1)
+        self.assertNotIn("unfinished", up.load_state())
+
+    def test_the_unit_has_no_deadline_either(self):
+        with open(os.path.join(REPO, "units", "hb-upgrade.service")) as f:
+            self.assertIn("TimeoutStartSec=infinity\n", f.read())
+
+    def test_settings_that_cant_be_used(self):
+        for over, text in ((dict(release="2023.x"), "upgrade.release"),
+                           (dict(reboot="sometimes"), "upgrade.reboot"),
+                           (dict(repos=["amazon linux"]), "upgrade.repos"),
+                           (dict(after=[{"unit": "sshd", "test": ["sshd", "-t"]}]), "test starts with a full path"),
+                           (dict(after=[{"unit": "sshd", "when": ["x"]}]), "a table of"),
+                           (dict(after=[{"unit": "sshd", "action": "stop"}]), "action is one of"),
+                           (dict(refresh_snaps="false"), "upgrade.refresh_snaps: true or false"),
+                           (dict(security_only=1), "upgrade.security_only: true or false"),
+                           (dict(enabled="false"), "upgrade.enabled: true or false"),
+                           (dict(repos="amazonlinux"), "upgrade.repos: a list"),
+                           (dict(after={"unit": "sshd"}), "upgrade.after: a list"),
+                           (dict(snaps="microk8s"), "upgrade.snaps: a list"),
+                           (dict(snapshot_days="0"), "upgrade.snapshot_days: a whole number"),
+                           (dict(window_end="7am"), "upgrade.window_end"),
+                           (dict(after=[{"unit": "sshd", "test": ["/usr/sbin/sshd", "-t"], "packages": ["openssh-server"]},
+                                        {"unit": "sshd"}]), "more than one rule for sshd")):
+            c = cfg(**dict(self.AL, **over))
+            rc, line = up.verdict(c)
+            self.assertEqual(rc, 2, over)
+            self.assertIn(text, line)
+            self.fake.calls = []
+            self.assertEqual(up.do_run(c, now=NIGHT), 2)
+            self.assertFalse(self.fake.did("dnf"), over)
 
 
 @unittest.skipUnless(can_fake_root(), "needs unprivileged user namespaces (unshare -r)")

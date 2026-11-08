@@ -9,6 +9,8 @@
                               minutes until upgrade.window_end)
   hb upgrade now              the same at once, outside the window; asks before a reboot
   hb upgrade hold [8h|off]    no reboots or snap refreshes for a while (busy.d/hold)
+  hb upgrade forget UNIT      an upgrade.after step that failed and you took care of yourself
+                              (forget dnf: a transaction that stopped halfway, which you checked)
 
 Items:
   snaps     auto-refresh held for upgrade.snaps, so microk8s doesn't refresh (and
@@ -19,10 +21,28 @@ Each night, once:
      upgrade.snapshot_days. A snapshot keeps everything deleted or rewritten
      after it, so on a busy disk set 0: no snapshot, old ones go, and the
      night's backup is the way back
-  2. dnf upgrade --refresh -y (Fedora, Docker, any repo you added)
-  3. snap refresh of upgrade.snaps, only when the box is idle
-  4. a reboot when dnf needs-restarting -r asks for one (or a newer kernel is
-     installed), only when the box is idle
+  2. dnf upgrade --refresh -y (Fedora, Docker, any repo you added), with no time
+     limit: an RPM transaction must never be killed halfway (the check warns after 3
+     hours instead). A failed transaction means no snap refresh or reboot. One that
+     never finished (a crash, a power cut) is found by the next run: the after steps
+     of what it changed run, from the state kept when it started, then dnf check; a
+     database with problems keeps the check failing until it is clean. Narrowed by:
+       upgrade.release        "" (the distribution's own choice), "latest": the newest
+                              release, resolved first and passed as --releasever, never
+                              another major version (Amazon Linux 2023 stays on the release
+                              it has unless told), or one release such as "2023.12.20261102"
+       upgrade.security_only  only security advisories (--security)
+       upgrade.repos          only these repositories, e.g. ["amazonlinux"]; [] = all
+  3. upgrade.after: for each rule, when one of its packages changed (no packages:
+     every night) and its unit was running before: its test, then systemctl
+     restart (or its action). One rule per unit. A failing test leaves the unit as it is; the step
+     stays pending, tried again on every later run (and by hb upgrade now) until it
+     works, and until then the check fails and nothing refreshes or reboots
+  4. snap refresh of upgrade.snaps, only when the box is idle (upgrade.refresh_snaps
+     false: never, they are only held)
+  5. a reboot when dnf needs-restarting -r asks for one (or another kernel is set to
+     boot), only when the box is idle. upgrade.reboot = "never": no reboot, it waits
+     for you, and the check and the digest say so
 Idle means every busy.d check passes (no recent typing in a terminal or the
 web shell, no calls, low load, no builds, no tmux pane running anything but a
 shell, no backup, no hold). Busy: the next run tries again, until
@@ -30,8 +50,9 @@ upgrade.window_end, then the next night. A reboot waiting 7 days shows in
 hb check and the digest; with upgrade.force_after_days set it then happens even
 when busy. Fedora release upgrades stay manual.
 
-Config ([upgrade] in hb.toml): enabled, window_end, snaps, snapshot_days,
-force_after_days. The busy checks read [busy]. With enabled false and snaps
+Config ([upgrade] in hb.toml): enabled, window_end, snaps, refresh_snaps,
+snapshot_days, force_after_days, release, security_only, repos, after, reboot.
+The busy checks read [busy]. With enabled false and snaps
 listed, only the hold is managed: no nightly run, and the snaps refresh when you
 refresh them (sudo snap refresh microk8s), at a moment you choose.
 """
@@ -46,6 +67,7 @@ import hbkit.start  # noqa: E402,F401  (first: Python 3.11+, and a quiet end whe
 from hbkit import config, util  # noqa: E402
 
 WAIT_WARN_DAYS = 7
+RUN_WARN = 3 * 3600                 # a dnf transaction this long (or never finished) shows in the check
 HOLD_MAX = 7 * 86400
 
 
@@ -88,10 +110,11 @@ def chk_snaps(cfg):
     if missing:
         return 2, f"upgrade.snaps names {', '.join(missing)}, not installed"
     loose = [s for s in want if not have[s]]
-    when = "they refresh in the upgrade window" if cfg["upgrade"]["enabled"] else "you refresh them when you choose"
+    here = cfg["upgrade"]["enabled"] and cfg["upgrade"]["refresh_snaps"]
+    when = "they refresh in the upgrade window" if here else "you refresh them when you choose"
     if loose:
         return 1, f"will hold auto-refresh for {', '.join(loose)} ({when} instead)"
-    return 0, f"{', '.join(want)} held; " + ("refreshed in the upgrade window" if cfg["upgrade"]["enabled"]
+    return 0, f"{', '.join(want)} held; " + ("refreshed in the upgrade window" if here
                                             else "nothing refreshes them until you do (sudo snap refresh NAME)")
 
 
@@ -101,6 +124,202 @@ def fix_snaps(cfg):
 
 
 ITEMS = (("snaps", chk_snaps, fix_snaps),)
+
+
+# --- settings ---------------------------------------------------------------------------------
+
+RELEASE = re.compile(r"[0-9]{4}\.[0-9]+\.[0-9]{8}")      # Amazon Linux 2023: 2023.12.20261102
+REPO = re.compile(r"[A-Za-z0-9_.:-]+")
+UNIT = re.compile(r"[A-Za-z0-9@_.:-]+")
+RULE_KEYS = {"packages", "test", "unit", "action"}
+ACTIONS = ("restart", "reload-or-restart", "try-restart")
+
+
+def settings_problem(cfg):
+    """What in [upgrade] can't be used as written, or None."""
+    u = cfg["upgrade"]
+    for key in ("enabled", "refresh_snaps", "security_only"):
+        if not isinstance(u[key], bool):
+            return f"upgrade.{key}: true or false, not {u[key]!r}"
+    for key in ("snaps", "repos", "after"):
+        if not isinstance(u[key], list):
+            return f"upgrade.{key}: a list, not {u[key]!r}"
+    for key in ("snapshot_days", "force_after_days"):
+        if isinstance(u[key], bool) or not isinstance(u[key], int) or u[key] < 0:
+            return f"upgrade.{key}: a whole number, 0 or more, not {u[key]!r}"
+    for key in ("release", "reboot", "window_end"):
+        if not isinstance(u[key], str):
+            return f"upgrade.{key}: a string, not {u[key]!r}"
+    if not re.fullmatch(r"([01]?[0-9]|2[0-3]):[0-5][0-9]", u["window_end"]):
+        return f"upgrade.window_end {u['window_end']!r}: HH:MM"
+    bad = [s for s in u["snaps"] if not isinstance(s, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", s)]
+    if bad:
+        return f"upgrade.snaps: {bad[0]!r} is not a snap name"
+    if u["release"] not in ("", "latest") and not RELEASE.fullmatch(u["release"]):
+        return f"upgrade.release {u['release']!r}: \"\", \"latest\" or a release such as 2023.12.20261102"
+    if u["reboot"] not in ("idle", "never"):
+        return f"upgrade.reboot {u['reboot']!r}: \"idle\" or \"never\""
+    bad = [r for r in u["repos"] if not isinstance(r, str) or not REPO.fullmatch(r)]
+    if bad:
+        return f"upgrade.repos: {bad[0]!r} is not a repository id"
+    for i, rule in enumerate(u["after"]):
+        where = f"upgrade.after[{i}]"
+        if not isinstance(rule, dict) or set(rule) - RULE_KEYS:
+            return f"{where}: a table of {', '.join(sorted(RULE_KEYS))}"
+        if not isinstance(rule.get("unit"), str) or not UNIT.fullmatch(rule["unit"]):
+            return f"{where}: unit names the systemd unit to restart"
+        if rule.get("action", "restart") not in ACTIONS:
+            return f"{where}: action is one of {', '.join(ACTIONS)}"
+        for key in ("packages", "test"):
+            if key in rule and (not isinstance(rule[key], list) or not all(isinstance(x, str) and x for x in rule[key])):
+                return f"{where}: {key} is a list of words"
+        if rule.get("test") and not rule["test"][0].startswith("/"):
+            return f"{where}: test starts with a full path"
+    units = [rule["unit"] for rule in u["after"]]
+    twice = sorted({x for x in units if units.count(x) > 1})
+    if twice:
+        return f"upgrade.after: more than one rule for {', '.join(twice)}: one per unit (its test can be a script)"
+    return None
+
+
+def repo_args(cfg):
+    repos = cfg["upgrade"]["repos"]
+    if not repos:
+        return []
+    return ["--disablerepo=*"] + [f"--enablerepo={r}" for r in repos] + \
+           [f"--setopt={r}.skip_if_unavailable=False" for r in repos]
+
+
+def resolve_release(cfg):
+    """(the --releasever to pass, "" for none; or None, why it can't be used)."""
+    want = cfg["upgrade"]["release"]
+    if not want:
+        return "", None
+    rc, out, _ = util.run("rpm", "-q", "--qf", "%{VERSION}\n", "system-release")
+    have = out.strip() if rc == 0 and RELEASE.fullmatch(out.strip()) else ""
+    if want != "latest":                               # a pinned release: never another major version either
+        if not have:
+            return None, f"release {want} pinned, but the installed one is unknown: not moving"
+        if want.split(".")[0] != have.split(".")[0]:
+            return None, f"pinned release {want} is another major version than {have}: not moving"
+        return want, None
+    rc, out, err = util.run("dnf", "repoquery", "-q", "--refresh", "--releasever=latest", *repo_args(cfg),
+                            "--latest-limit=1", "--qf", "%{version}\n", "system-release", timeout=600)
+    found = {line.strip() for line in out.splitlines() if RELEASE.fullmatch(line.strip())}
+    if rc or len(found) != 1:
+        why = (err.strip().splitlines() or [f"exit {rc}"])[-1][:160] if rc else f"{len(found)} answers"
+        return None, f"can't tell the newest release ({why})"
+    newest = found.pop()
+    if not have:
+        return None, f"newest release {newest}, but the installed one is unknown: not moving"
+    if newest.split(".")[0] != have.split(".")[0]:
+        return None, f"newest release {newest} is another major version than {have}: not moving"
+    return newest, None
+
+
+def nightly_command(cfg, release=None):
+    """The dnf upgrade the night runs; release None: as configured ("latest" is resolved at run time)."""
+    rel = cfg["upgrade"]["release"] if release is None else release
+    cmd = ["dnf", "upgrade", "--refresh", "-y", *repo_args(cfg)]
+    cmd += [f"--releasever={rel}"] if rel else []
+    return cmd + (["--security"] if cfg["upgrade"]["security_only"] else [])
+
+
+def unit_active(unit):
+    return util.run("systemctl", "is-active", "--quiet", unit)[0] == 0
+
+
+def run_rule(rule):
+    """Its test, then its action: (what was done, None) or (None, why not)."""
+    unit = rule["unit"]
+    if rule.get("test"):
+        rc, out, err = util.run(*rule["test"], timeout=120)
+        if rc:
+            last = ((err or out).strip().splitlines() or [f"exit {rc}"])[-1][:120]
+            return None, f"{' '.join(rule['test'])} failed ({last}), not restarted"
+    action = rule.get("action", "restart")
+    rc, _, err = util.run("systemctl", action, unit, timeout=300)
+    if rc:
+        return None, f"systemctl {action} failed ({err.strip()[:120]})"
+    return f"{action} {unit}", None
+
+
+def after_steps(cfg, st, changed, was_active):
+    """Run upgrade.after for what changed. What failed goes to st["after_pending"]: tried again on
+    every later run until it works (or hb upgrade forget UNIT), and until then the check fails and
+    nothing reboots or refreshes. Returns what was done."""
+    names = {c.rsplit(".", 1)[0] for c in changed}
+    done, pending = [], st.setdefault("after_pending", {})
+    for rule in cfg["upgrade"]["after"]:
+        unit, wants = rule["unit"], set(rule.get("packages", []))
+        if wants and not names & wants:
+            continue
+        if not was_active.get(unit):
+            continue                                   # not running before: not ours to start
+        what, why = run_rule(rule)
+        if what:
+            done.append(what)
+            pending.pop(unit, None)
+        else:
+            pending[unit] = {"since": pending.get(unit, {}).get("since", int(time.time())), "why": why}
+    if not pending:
+        st.pop("after_pending")
+    return done
+
+
+def recover(cfg, st):
+    """The last dnf transaction never finished (killed, a crash, a power cut): the after steps of what
+    changed since it started, from the state kept when it started; then `dnf check`. A database it
+    reports problems in stays "unfinished": the check fails and nothing reboots until it is clean."""
+    s = st.pop("dnf_started")
+    started = s.get("at", 0) if isinstance(s, dict) else 0
+    when = f"{datetime.datetime.fromtimestamp(started):%d %b %H:%M}" if started else "at an unknown time"
+    if isinstance(s, dict) and isinstance(s.get("before"), dict):
+        changed = changes({k: set(v) for k, v in s["before"].items()}, packages())
+        done = after_steps(cfg, st, changed, s.get("was_active") or {})
+        log(f"the dnf upgrade started {when} never finished: {len(changed)} packages changed since"
+            + (f"; after: {', '.join(done)}" if done else ""))
+    else:
+        log(f"the dnf upgrade started {when} never finished, and what it started from wasn't kept")
+    st["unfinished"] = {"started": started, "why": ""}
+    check_unfinished(st)
+    if st.get("unfinished"):
+        util.notify("warn", "upgrade.unfinished", f"a dnf upgrade stopped halfway ({when}): {st['unfinished']['why']}")
+
+
+def check_unfinished(st):
+    """dnf check on a database a transaction stopped halfway in: clean, and the matter is closed."""
+    rc, out, err = util.run("dnf", "check", timeout=600)
+    if rc == 0:
+        log("dnf check: no problems")
+        st.pop("unfinished", None)
+        return
+    last = ((out or err).strip().splitlines() or [f"exit {rc}"])[-1][:160]
+    st["unfinished"]["why"] = f"dnf check: {last} (see dnf history; sudo hb upgrade now checks again)"
+
+
+def retry_pending(cfg, st):
+    """After rules that failed on an earlier run: try them again, now."""
+    pending = st.get("after_pending") or {}
+    rules = {r["unit"]: r for r in cfg["upgrade"]["after"]}
+    for unit in list(pending):
+        rule = rules.get(unit)
+        if not rule:
+            log(f"after: {unit} has no upgrade.after rule any more; forgotten")
+            pending.pop(unit)
+            continue
+        if not unit_active(unit):
+            pending[unit]["why"] = "not running now: start it, or sudo hb upgrade forget " + unit
+            continue
+        what, why = run_rule(rule)
+        if what:
+            log(f"after (pending since {datetime.datetime.fromtimestamp(pending[unit]['since']):%d %b %H:%M}): {what}")
+            pending.pop(unit)
+        else:
+            pending[unit]["why"] = why
+            log(f"after: {unit}: still {why}")
+    if not pending:
+        st.pop("after_pending", None)
 
 
 # --- the night's steps ----------------------------------------------------------------------
@@ -144,15 +363,36 @@ def snapshot(cfg):
             log(f"removed old snapshot {name}" if rc == 0 else f"couldn't remove {name}: {err.strip()}")
 
 
-def dnf_upgrade(st):
+def dnf_upgrade(cfg, st):
+    release, why = resolve_release(cfg)
+    if release is None:
+        st["dnf"] = {"at": int(time.time()), "rc": 2, "changed": [], "error": why}
+        log(f"dnf upgrade not run: {why}")
+        util.notify("warn", "upgrade.dnf", f"dnf upgrade not run: {why}")
+        return
+    cmd = nightly_command(cfg, release)
+    was_active = {rule["unit"]: unit_active(rule["unit"]) for rule in cfg["upgrade"]["after"]}
     before = packages()
-    rc, out, err = util.run("dnf", "upgrade", "--refresh", "-y", timeout=3600)
+    # Until it ends: a run that finds this left over knows the transaction stopped halfway, and what
+    # was installed and running before it, so the after steps of what it changed still happen.
+    st["dnf_started"] = {"at": int(time.time()), "before": {k: sorted(v) for k, v in before.items()},
+                         "was_active": was_active}
+    save_state(st)
+    rc, out, err = util.run(*cmd, timeout=None)        # never kill an RPM transaction halfway
+    st.pop("dnf_started", None)
     changed = changes(before, packages())
+    done = after_steps(cfg, st, changed, was_active)
     error = "" if rc == 0 else ((err or out).strip().splitlines() or [f"exit {rc}"])[-1][:200]
-    st["dnf"] = {"at": int(time.time()), "rc": rc, "changed": changed, "error": error}
-    log(f"dnf upgrade: exit {rc}, {len(changed)} packages changed" + (f": {error}" if error else ""))
+    st["dnf"] = {"at": int(time.time()), "rc": rc, "changed": changed, "error": error, "release": release,
+                 "after": done}
+    pending = st.get("after_pending", {})
+    log(f"dnf upgrade{f' (release {release})' if release else ''}: exit {rc}, {len(changed)} packages changed"
+        + (f"; after: {', '.join(done)}" if done else "") + (f": {error}" if error else "")
+        + "".join(f"; {u}: {p['why']}" for u, p in pending.items()))
     if rc:
         util.notify("warn", "upgrade.dnf", f"dnf upgrade failed: {error}")   # the failing check sends the SMS
+    for unit, p in pending.items():
+        util.notify("warn", f"upgrade.after.{unit}", f"after the upgrade, {unit}: {p['why']}")
 
 
 def snap_refresh(cfg, st):
@@ -217,18 +457,34 @@ def in_window(cfg, now=None):
 def do_run(cfg, manual=False, now=None):
     """One pass of the night's work. Every step is done at most once per night; reruns pick up
     what is left (a busy snap refresh or reboot)."""
+    problem = settings_problem(cfg)
+    if problem:
+        log(f"not run: {problem}")
+        return 2
     if not manual and not in_window(cfg, now):
         log(f"outside the window (before {cfg['upgrade']['window_end']}): nothing to do")
         return 0
     st, night = load_state(), datetime.date.today().isoformat()
-    if st.get("night") != night:
-        st = {"night": night, "reboot": st.get("reboot", {})}
+    if st.get("night") != night:                       # a new night; what is still open comes along
+        st = {"night": night, **{k: st[k] for k in ("reboot", "after_pending", "dnf_started", "unfinished") if k in st}}
+    if st.get("dnf_started"):                          # the last transaction never ended
+        recover(cfg, st)
+        save_state(st)
+    elif st.get("unfinished"):
+        check_unfinished(st)
+        save_state(st)
+    if st.get("after_pending"):
+        retry_pending(cfg, st)
+        save_state(st)
     if "dnf" not in st:
         snapshot(cfg)
-        dnf_upgrade(st)
+        dnf_upgrade(cfg, st)
         save_state(st)
+    failed = night_failed(st)
+    if failed:
+        log(f"no snap refresh or reboot tonight: {failed}")
     busy = util.busy()
-    if cfg["upgrade"]["snaps"] and "snaps" not in st:
+    if cfg["upgrade"]["snaps"] and cfg["upgrade"]["refresh_snaps"] and "snaps" not in st and not failed:
         if busy and not (manual and util.ask(f"busy ({busy[0]}); refresh snaps anyway?")):
             st["snaps_busy"] = busy[0]
             log(f"snap refresh waits: {busy[0]}")
@@ -246,18 +502,30 @@ def do_run(cfg, manual=False, now=None):
         r.pop("busy", None)
         save_state(st)
         log(f"can't tell whether a reboot is needed: {unknown}" if unknown else "no reboot needed")
-        return 0 if st["dnf"]["rc"] == 0 else 2
+        return 2 if failed else 0
     r.setdefault("needed_since", int(time.time()))
     r["why"] = why
+    if failed and not manual:
+        r.pop("busy", None)
+        save_state(st)
+        log(f"a reboot is needed ({why}), but not while the upgrade needs attention")
+        return 2
+    if cfg["upgrade"]["reboot"] == "never" and not manual:
+        r.pop("busy", None)
+        save_state(st)
+        log(f"a reboot is needed ({why}); upgrade.reboot = never: it waits for you")
+        return 0
     waited = (time.time() - r["needed_since"]) / 86400
     busy = util.busy()
     force = cfg["upgrade"]["force_after_days"]
     if manual:
+        if failed:
+            log(f"first: {failed}")
         log(f"a reboot is needed: {why}" + (f"; busy: {'; '.join(busy)}" if busy else ""))
         if util.ask("reboot now?"):
-            return reboot(st, why)
+            return reboot(st, why) or (2 if failed else 0)
         save_state(st)
-        return 1
+        return 2 if failed else 1
     if busy and not (force and waited >= force):
         r["busy"] = busy[0]
         save_state(st)
@@ -268,6 +536,40 @@ def do_run(cfg, manual=False, now=None):
     return reboot(st, why)
 
 
+def night_failed(st):
+    """Why tonight mustn't go on to a snap refresh or a reboot, or "" (the transaction failed, or an
+    after rule is still pending)."""
+    d = st.get("dnf", {})
+    parts = [f"dnf upgrade failed: {d.get('error', '')}"] if d.get("rc") else []
+    if st.get("unfinished"):
+        parts.append(f"a dnf upgrade stopped halfway: {st['unfinished'].get('why', '')}")
+    parts += [f"{u}: {p['why']}" for u, p in (st.get("after_pending") or {}).items()]
+    return "; ".join(parts)
+
+
+def do_forget(unit):
+    """hb upgrade forget UNIT: an after step you took care of yourself (dnf: a transaction that stopped
+    halfway, which you checked)."""
+    st = load_state()
+    if unit == "dnf":
+        if not st.pop("unfinished", None):
+            print("no unfinished dnf upgrade on record")
+            return 1
+        save_state(st)
+        print("forgotten: the unfinished dnf upgrade (you checked it)")
+        return 0
+    pending = st.get("after_pending") or {}
+    if unit not in pending:
+        print(f"nothing pending for {unit}" + (f" (pending: {', '.join(pending)})" if pending else ""))
+        return 1
+    pending.pop(unit)
+    if not pending:
+        st.pop("after_pending")
+    save_state(st)
+    print(f"forgotten: {unit}'s after step (you took care of it)")
+    return 0
+
+
 # --- verdicts ---------------------------------------------------------------------------------
 
 def summary(st):
@@ -275,7 +577,10 @@ def summary(st):
     if not d:
         return "no upgrade yet"
     when = datetime.datetime.fromtimestamp(d["at"])
-    text = f"{when:%d %b %H:%M} dnf: {len(d.get('changed', []))} packages" + (" (failed)" if d.get("rc") else "")
+    text = f"{when:%d %b %H:%M} dnf" + (f" {d['release']}" if d.get("release") else "") + \
+        f": {len(d.get('changed', []))} packages" + (" (failed)" if d.get("rc") else "")
+    if d.get("after"):
+        text += f" ({', '.join(d['after'])})"
     s = st.get("snaps")
     if s:
         text += f"; snaps: {s.get('out') or 'refreshed'}"
@@ -285,12 +590,29 @@ def summary(st):
 
 
 def verdict(cfg):
+    problem = settings_problem(cfg)
+    if problem:
+        return 2, f"fail: {problem}"
     if not cfg["upgrade"]["enabled"] and not cfg["upgrade"]["snaps"]:
         return 0, "ok: not managed"
     rc, line = chk_snaps(cfg)
     if rc or not cfg["upgrade"]["enabled"]:       # only the hold is managed: nothing else to say
         return rc, f"{['ok', 'warn', 'fail'][rc]}: snaps: {line}"
     st = load_state()
+    pending = st.get("after_pending") or {}
+    if pending:
+        return 2, "fail: after the upgrade, " + "; ".join(
+            f"{u}: {p['why']} (since {datetime.datetime.fromtimestamp(p['since']):%d %b %H:%M})" for u, p in pending.items()) + \
+            "; sudo hb upgrade now tries again"
+    unfinished = st.get("unfinished")
+    if unfinished:
+        when = datetime.datetime.fromtimestamp(unfinished.get("started") or 0)
+        return 2, f"fail: the dnf upgrade started {when:%d %b %H:%M} stopped halfway; {unfinished.get('why', '')}"
+    started = st.get("dnf_started")
+    started = started.get("at") if isinstance(started, dict) else started
+    if started and time.time() - started > RUN_WARN:
+        return 1, (f"warn: the dnf upgrade started {datetime.datetime.fromtimestamp(started):%d %b %H:%M} hasn't finished: "
+                   "still running, or stopped halfway (dnf history)")
     d = st.get("dnf")
     if d and d.get("rc"):
         return 2, f"fail: dnf upgrade failed {datetime.datetime.fromtimestamp(d['at']):%d %b}: {d.get('error', '')}"
@@ -303,6 +625,8 @@ def verdict(cfg):
         days = (time.time() - r["needed_since"]) / 86400
         wait = f"reboot waiting {days:.0f} days" if days >= 1 else "reboot waiting"
         busy = f" (busy: {r['busy']})" if r.get("busy") else ""
+        if cfg["upgrade"]["reboot"] == "never":
+            wait += ", for you (upgrade.reboot = never)"
         if days >= WAIT_WARN_DAYS:
             return 1, f"warn: {wait}{busy}: {r.get('why', '')}"
         return 0, f"ok: {summary(st)}; {wait}{busy}"
@@ -319,11 +643,17 @@ def do_status(cfg):
     print(line)
     if not cfg["upgrade"]["enabled"]:
         return max(worst, rc)
+    shown = "<the newest release, resolved first>" if cfg["upgrade"]["release"] == "latest" else None
+    print("nightly: " + " ".join(nightly_command(cfg, shown)) + (f"; after: {len(cfg['upgrade']['after'])} rule{'s' if len(cfg['upgrade']['after']) != 1 else ''}"
+                                                           if cfg["upgrade"]["after"] else ""))
     st = load_state()
     r = st.get("reboot", {})
     if r.get("rebooted_at"):
         print(f"last reboot by hb: {datetime.datetime.fromtimestamp(r['rebooted_at']):%d %b %H:%M}, "
               f"from {r.get('from_kernel', '?')} ({r.get('why', '')})")
+    if cfg["upgrade"]["reboot"] == "never":
+        print("reboots: never by hb (upgrade.reboot = never)")
+        return max(worst, rc)
     busy = util.busy()
     print("busy now: " + ("; ".join(busy) if busy else "no (a reboot could happen)"))
     return max(worst, rc)
@@ -381,12 +711,19 @@ def main(argv):
         print("error: run with sudo", file=sys.stderr)
         return 2
     cfg = config.load()
+    if verb == "forget" and len(argv) == 3:
+        with util.Lock(os.path.join(util.state_dir("upgrade"), "lock")):
+            return do_forget(argv[2])
     if verb == "check":
         rc, line = verdict(cfg)
         print(line)
         return rc
     if verb == "hold":
         return do_hold(argv[2] if len(argv) > 2 else "")
+    problem = settings_problem(cfg)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return 2
     if not cfg["upgrade"]["enabled"] and (verb in ("run", "now") or not cfg["upgrade"]["snaps"]):
         print("not managed (upgrade.enabled is false)" + ("; only the snap hold is" if cfg["upgrade"]["snaps"] else ""))
         return 0

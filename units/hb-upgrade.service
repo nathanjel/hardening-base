@@ -9,4 +9,6 @@ Type=oneshot
 Environment=HOME=/root
 ExecStart=/opt/hb/hb upgrade run
 Nice=10
-TimeoutStartSec=2h
+# No deadline: killing dnf halfway through an RPM transaction is worse than a long night.
+# hb upgrade check warns when a transaction runs (or stopped) for more than 3 hours.
+TimeoutStartSec=infinity
