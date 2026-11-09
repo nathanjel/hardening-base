@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # tests/al2023.sh — hb on Amazon Linux 2023's userland, in the official container image:
 # its Python 3.9 next to python3.13, dnf 4, rpm. Runs `hb check` as root with no hb.toml
-# (defaults manage nothing), then the test suite as a normal user under python3.13.
+# (defaults manage nothing), installs restic as hb install does and backs a file up with it
+# (needs GitHub; skipped when out of reach), then the test suite as a normal user under python3.13.
 # No systemd, sshd or kernel in a container: those parts only the real box tests.
 #
 #   tests/al2023.sh            docker (or podman), from the checkout
@@ -29,6 +30,27 @@ git ls-files -co --exclude-standard -z | tar --null -T - -cz |
   cat /tmp/check
   if grep -q "the check broke" /tmp/check || ! tail -1 /tmp/check | grep -qE "^[0-9]+ ok, [0-9]+ warn, [0-9]+ fail"; then
     echo "FAILED: a check broke, or hb check did not finish"; bad=1
+  fi
+  echo "== restic, as hb install puts it there (the release from GitHub, SHA-256 checked), and a backup with it"
+  case "$(uname -m)" in   # restic 0.19.1, from its SHA256SUMS (signature checked on 9 Nov 2026)
+    x86_64) sha=f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c ;;
+    aarch64) sha=a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465 ;;
+  esac
+  if ! curl -fsSI -o /dev/null --max-time 20 https://github.com; then
+    echo "skipped: GitHub is out of reach"
+  else
+    printf "[backup]\nrepo = \"local:/var/tmp/repo\"\nrestic_version = \"0.19.1\"\nrestic_sha256 = \"%s\"\n" "$sha" > /tmp/e2e.toml
+    sed -e "s|^source .*|source $PWD/lib/hb.sh|" -e "/^need_root$/d" -e "/^need_config$/d" -e "/^item_main/d" \
+      tools/hb-install > /tmp/install-functions
+    export HB_CONFIG=/tmp/e2e.toml
+    if bash -c "source /tmp/install-functions; fix_restic && chk_restic" \
+       && ./hb backup init > /dev/null && ./hb backup restic backup -q --host al2023 --tag hb /etc/os-release \
+       && ./hb backup status; then
+      echo "restic e2e ok"
+    else
+      echo "FAILED: restic e2e"; bad=1
+    fi
+    unset HB_CONFIG
   fi
   echo "== the tests (python3.13, as a normal user)"
   runuser -u tester -- python3.13 -B -m unittest discover -s tests > /tmp/tests 2>&1

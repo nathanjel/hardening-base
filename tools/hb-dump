@@ -1,0 +1,462 @@
+#!/usr/bin/python3 -IB
+"""hb-dump — the cluster's databases, dumped by their own tools for the backup.
+
+  hb dump run       dump every database backup.dumps finds into /var/lib/hb/dumps (hb backup
+                    run does this first, so each snapshot carries that night's dumps)
+  hb dump list      the containers each rule finds and where their dumps go; dumps nothing
+  hb dump status    the last run: each dump with its size, or why it failed
+  hb dump check     one-line verdict (exit 0 ok, 1 attention, 2 broken)
+
+A copy of a running database's files isn't a backup of it; a dump is. Each rule in
+backup.dumps names container images and a command that writes a dump to its standard
+output. Every pod that should be running, in any namespace and on any node, with a
+container from one of those images gets the command run in that container (kubectl exec),
+and the output is saved as /var/lib/hb/dumps/<namespace>/<pod>/<container><suffix> (root's
+only). The folder holds exactly the last run's good dumps, plus hb-dump.json, the run's
+record, so a snapshot says itself which dumps it has. A dump that fails leaves no file (older
+ones are in older snapshots) and shows here. A pod that isn't Running counts as failed.
+
+What a container sends is never trusted to stay small. A run's dumps take at most
+backup.dumps_max_mb together (while it runs, the run before is still there as well), and a dump
+stops before the disk under /var/lib/hb gets under 10% free; a stopped dump has failed. Of a
+dump's error output only the end is kept.
+
+  [backup]
+  paths = [..., "/var/lib/hb"]       # the dumps are backed up with hb's state
+  dumps = [
+    { images = ["postgres"], command = ["sh", "-c", 'exec pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"'] },
+  ]
+  dumps_max_mb = 10240               # all of one run's dumps together
+
+images  the image's own name, without registry, path, tag or digest: "postgres" matches
+        postgres:17, docker.io/library/postgres:16-alpine, localhost:32000/postgres@sha256:...
+        but not postgres-exporter. An image belongs to one rule only.
+command what runs in the container; its standard output is the dump, exit 0 means good
+suffix  the file's ending, ".sql" unless set
+
+The check warns when the last run is older than backup.warn_hours, when a dump failed, the
+pods couldn't be listed or no container matched, and when /var/lib/hb/dumps isn't in
+backup.paths. It fails when a database still there has had no good dump for
+backup.fail_hours (the backup's own check covers a backup that stopped running).
+"""
+import json
+import os
+import re
+import selectors
+import shutil
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+import hbkit.start  # noqa: E402,F401  (first: Python 3.11+, and a quiet end when the output pipe closes)
+from hbkit import config, util  # noqa: E402
+
+KUBECTL = ["/snap/bin/microk8s", "kubectl"]
+TIMEOUT = 3600                                  # seconds for one dump
+RECORD = "hb-dump.json"
+RULE_KEYS = {"images", "command", "suffix"}
+# What Kubernetes allows: namespaces and container names are DNS labels (no dots), pod names
+# DNS subdomains. So <namespace>/<pod>/<container><suffix> is one file per container.
+LABEL = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?")
+POD = re.compile(r"[a-z0-9]([-a-z0-9.]*[a-z0-9])?")
+SUFFIX = re.compile(r"\.[A-Za-z0-9][A-Za-z0-9.]*")
+MB = 10**6
+CHUNK = 1 << 16                                 # bytes read from kubectl at a time
+ERR_KEEP = 4096                                 # bytes of a dump's error output kept (its end)
+MIN_FREE_PERCENT = 10                           # a dump never leaves its disk with less free
+SPACE_EVERY = 16 << 20                          # bytes written between two looks at the free space
+
+
+def folder():
+    return os.path.join(util.STATE, "dumps")
+
+
+def rules_problem(rules):
+    """What is wrong with backup.dumps, or None."""
+    if not isinstance(rules, list):
+        return "backup.dumps must be a list of tables"
+    seen = {}
+    for i, r in enumerate(rules, 1):
+        where = f"backup.dumps rule {i}"
+        if not isinstance(r, dict):
+            return f"{where} must be a table"
+        extra = sorted(set(r) - RULE_KEYS)
+        if extra:
+            return f"{where}: unknown keys {', '.join(extra)}"
+        images = r.get("images")
+        if not (isinstance(images, list) and images and all(isinstance(x, str) and x for x in images)):
+            return f"{where}: images must be a list of image names"
+        for x in images:
+            if "/" in x or ":" in x or "@" in x:
+                return f"{where}: {x!r}: the image's own name only, without registry, path or tag"
+            if x in seen:
+                return f"{where}: image {x!r} is already in rule {seen[x]}"
+            seen[x] = i
+        command = r.get("command")
+        if not (isinstance(command, list) and command and all(isinstance(x, str) for x in command) and command[0]):
+            return f"{where}: command must be a list of strings"
+        suffix = r.get("suffix", ".sql")
+        if not (isinstance(suffix, str) and SUFFIX.fullmatch(suffix)):
+            return f"{where}: suffix must look like \".sql\""
+    return None
+
+
+def settings_problem(b):
+    """What is wrong with the [backup] settings hb dump uses, or None."""
+    problem = rules_problem(b["dumps"])
+    if problem:
+        return problem
+    m = b["dumps_max_mb"]
+    if not (isinstance(m, int) and not isinstance(m, bool) and m > 0):
+        return "backup.dumps_max_mb must be a whole number of MB above 0"
+    return None
+
+
+def image_name(image):
+    """postgres, from docker.io/library/postgres:17-alpine@sha256:..."""
+    return image.split("@", 1)[0].rsplit("/", 1)[-1].split(":", 1)[0]
+
+
+def targets(pods, rules):
+    """Every container a rule names, in pods that should be running, as dicts: key (the file's
+    path below the folder), ns, pod, container, image, command, why (None, or why it can't be
+    dumped), sorted by key."""
+    by_image = {x: r for r in rules for x in r["images"]}
+    found, keys = [], set()
+    for p in pods.get("items", []):
+        meta, spec, status = p.get("metadata", {}), p.get("spec", {}), p.get("status", {})
+        phase = status.get("phase", "Unknown")
+        if meta.get("deletionTimestamp") or phase in ("Succeeded", "Failed"):
+            continue                    # going away, or a finished job: no database to dump
+        ns, pod = meta.get("namespace", ""), meta.get("name", "")
+        matched = [(c.get("name", ""), c.get("image", ""), by_image[image_name(c.get("image", ""))])
+                   for c in spec.get("containers", []) if image_name(c.get("image", "")) in by_image]
+        for name, image, rule in matched:
+            key = f"{ns}/{pod}/{name}{rule.get('suffix', '.sql')}"
+            if key in keys:                     # the same container listed twice: one dump, one record
+                continue
+            why = None
+            if not (LABEL.fullmatch(ns) and POD.fullmatch(pod) and LABEL.fullmatch(name)):
+                why = "a name hb won't use in a file name"
+            elif phase != "Running":
+                why = f"pod {phase}"
+            keys.add(key)
+            found.append({"key": key, "ns": ns, "pod": pod, "container": name, "image": image,
+                          "command": rule["command"], "why": why})
+    return sorted(found, key=lambda t: t["key"])
+
+
+def list_pods():
+    """(pods as kubectl's JSON, None) or (None, why not)."""
+    rc, out, err = util.run(*KUBECTL, "get", "pods", "-A", "-o", "json", timeout=300)
+    if rc:
+        return None, f"kubectl get pods: {(err.strip().splitlines() or [f'exit {rc}'])[-1][:200]}"
+    try:
+        return json.loads(out), None
+    except ValueError as e:
+        return None, f"kubectl get pods: {e}"
+
+
+def disk_room(where):
+    """The bytes that may still be written to the disk holding where (a path or an open fd)
+    before it has under MIN_FREE_PERCENT free: 0 or less when it has already."""
+    s = os.statvfs(where)
+    return s.f_bavail * s.f_frsize - s.f_blocks * s.f_frsize * MIN_FREE_PERCENT // 100
+
+
+def write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def stream(cmd, fd, limit):
+    """Run cmd with its standard output into fd: (exit code, the end of its error output, why it
+    was stopped or None, bytes written). It writes at most limit bytes, and never more than the
+    disk has above its MIN_FREE_PERCENT reserve (measured first, counted down with each write,
+    measured again every SPACE_EVERY bytes for other writers); it keeps only the last ERR_KEEP
+    bytes of the error output."""
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+    except OSError as e:
+        return 127, str(e), None, 0
+    deadline = time.monotonic() + TIMEOUT
+    err, size, unchecked, stop = b"", 0, 0, None
+    disk = disk_room(fd)
+    with selectors.DefaultSelector() as sel:
+        sel.register(p.stdout, selectors.EVENT_READ)
+        sel.register(p.stderr, selectors.EVENT_READ)
+        while sel.get_map() and not stop:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                stop = f"timed out after {TIMEOUT} s"
+                break
+            for key, _ in sel.select(timeout=left):
+                chunk = os.read(key.fd, CHUNK)
+                if not chunk:
+                    sel.unregister(key.fileobj)
+                elif key.fileobj is p.stderr:
+                    err = (err + chunk)[-ERR_KEEP:]
+                elif size + len(chunk) > limit:
+                    stop = f"stopped at {mb(limit)}, all that was left of backup.dumps_max_mb"
+                    break
+                elif len(chunk) > disk:
+                    stop = f"stopped: the disk would have under {MIN_FREE_PERCENT}% free"
+                    break
+                else:
+                    try:
+                        write_all(fd, chunk)
+                    except OSError as e:
+                        stop = f"can't write the dump: {e.strerror}"
+                        break
+                    size += len(chunk)
+                    disk -= len(chunk)
+                    unchecked += len(chunk)
+                    if unchecked >= SPACE_EVERY:
+                        unchecked = 0
+                        disk = disk_room(fd)
+    if not stop:
+        try:
+            p.wait(timeout=max(deadline - time.monotonic(), 1))
+        except subprocess.TimeoutExpired:
+            stop = f"timed out after {TIMEOUT} s"
+    if stop:
+        p.kill()
+    p.wait()
+    p.stdout.close()
+    p.stderr.close()
+    return p.returncode, err.decode(errors="replace"), stop, size
+
+
+def dump_one(t, dest, limit):
+    """Run the dump into dest, writing at most limit bytes. (None, bytes) when good, else
+    (why not, 0); no file then."""
+    for d in (os.path.dirname(os.path.dirname(dest)), os.path.dirname(dest)):     # <ns>, <ns>/<pod>
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    part = dest + ".partial"
+    cmd = [*KUBECTL, "exec", "-n", t["ns"], t["pod"], "-c", t["container"], "--", *t["command"]]
+    try:
+        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    except OSError as e:
+        return f"can't write {part}: {e.strerror}", 0
+    try:
+        os.fchmod(fd, 0o600)                        # whatever the umask: a dump is root's only
+        rc, err, stop, size = stream(cmd, fd, limit)
+    finally:
+        os.close(fd)
+    if stop is None and rc == 0 and size > 0:
+        os.rename(part, dest)
+        return None, size
+    try:
+        os.unlink(part)
+    except OSError:
+        pass
+    if stop:
+        return stop, 0
+    if rc:
+        return f"exit {rc}: {(err.strip().splitlines() or [''])[-1][:200]}", 0
+    return "it wrote nothing", 0
+
+
+def read_record():
+    """The last run's record, or None. A run stopped between its two renames leaves no folder;
+    its record is then in dumps.new (it had finished) or the one before in dumps.old."""
+    final = folder()
+    if os.path.exists(final):
+        return util.read_json(os.path.join(final, RECORD), None)
+    for side in (final + ".new", final + ".old"):
+        rec = util.read_json(os.path.join(side, RECORD), None)
+        if rec:
+            return rec
+    return None
+
+
+def recover():
+    """Finish, or undo, a run that stopped between its two renames: the folder is missing then."""
+    final = folder()
+    new, old = final + ".new", final + ".old"
+    if os.path.exists(final):
+        return
+    if util.read_json(os.path.join(new, RECORD), None):
+        os.rename(new, final)                       # it had finished: its swap is done now
+    elif os.path.isdir(old):
+        os.rename(old, final)                       # back to the run before it
+
+
+def dump_all(b):
+    """One run: dumps into a new folder that then replaces the old one. The record is returned."""
+    final = folder()
+    new, old = final + ".new", final + ".old"
+    recover()
+    before = util.read_json(os.path.join(final, RECORD), {}).get("dumps", {})
+    start = int(time.time())
+    rec = {"ts": start, "error": None, "dumps": {}}
+    # Left by a run that was interrupted. With the folder in place, both are out of date: the
+    # disk holds two generations at most, the folder's and the one this run writes.
+    shutil.rmtree(new, ignore_errors=True)
+    shutil.rmtree(old, ignore_errors=True)
+    os.makedirs(new, mode=0o700)
+    pods, rec["error"] = list_pods()
+    room = b["dumps_max_mb"] * MB                   # what this run's dumps may still take
+    if pods is None:                                # nothing dumped: what was there is still owed
+        for key, d in before.items():
+            rec["dumps"][key] = {**d, "ok": False, "error": "the pods couldn't be listed", "bytes": 0}
+    else:
+        for t in targets(pods, b["dumps"]):
+            prev = before.get(t["key"], {})
+            d = {"ns": t["ns"], "pod": t["pod"], "container": t["container"], "image": t["image"],
+                 "first_seen": prev.get("first_seen", start), "last_ok": prev.get("last_ok")}
+            t0 = time.time()
+            if t["why"]:
+                why, size = t["why"], 0
+            elif room <= 0:
+                why, size = f"not run: this run's dumps took all of backup.dumps_max_mb ({b['dumps_max_mb']} MB)", 0
+            elif disk_room(new) <= 0:
+                why, size = f"not run: the disk has under {MIN_FREE_PERCENT}% free", 0
+            else:
+                why, size = dump_one(t, os.path.join(new, t["key"]), room)
+            room -= size
+            d.update(ok=why is None, error=why, bytes=size, seconds=round(time.time() - t0, 1))
+            if why is None:
+                d["last_ok"] = start
+            rec["dumps"][t["key"]] = d
+    rec["seconds"] = int(time.time()) - start
+    util.write_json(os.path.join(new, RECORD), rec)
+    shutil.rmtree(old, ignore_errors=True)
+    if os.path.exists(final):
+        os.rename(final, old)
+    os.rename(new, final)
+    shutil.rmtree(old, ignore_errors=True)
+    return rec
+
+
+def mb(n):
+    return f"{n / 10**6:.1f} MB"
+
+
+def plural(n, word):
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def covered(paths, path):
+    return any(path == p.rstrip("/") or path.startswith(p.rstrip("/") + "/") for p in paths)
+
+
+def verdict(cfg, now=None):
+    now = now or time.time()
+    b = cfg["backup"]
+    problem = settings_problem(b)
+    if problem:
+        return 2, f"fail: {problem}"
+    if not b["dumps"]:
+        return 0, "ok: not configured (backup.dumps is empty)"
+    notes = [] if covered(b["paths"], folder()) else [f"{folder()} isn't in backup.paths"]
+    rec = read_record()
+    if not rec:
+        return 1, "warn: " + "; ".join(["no dumps yet (sudo hb dump run, or the next backup)"] + notes)
+    hours = (now - rec["ts"]) / 3600
+    dumps = rec.get("dumps", {})
+    failed = [d for d in dumps.values() if not d.get("ok")]
+    # Counted up to now while runs come nightly; once they stop, up to the last run only: a backup
+    # that stopped running is hb backup check's to report, not one failure per database.
+    upto = now if hours < b["warn_hours"] else rec["ts"]
+    owed = [d for d in failed
+            if (upto - (d.get("last_ok") or d.get("first_seen", rec["ts"]))) / 3600 >= b["fail_hours"]]
+    if owed:
+        return 2, (f"fail: {plural(len(owed), 'database')} without a good dump for {b['fail_hours']} h or more"
+                   " (sudo hb dump status)")
+    if hours >= b["warn_hours"]:
+        notes.insert(0, f"last dump run {hours:.0f} h ago")
+    if rec.get("error"):
+        notes.append("the pods couldn't be listed (sudo hb dump status)")
+    elif failed:
+        notes.append(f"{len(failed)} of {plural(len(dumps), 'database dump')} failed (sudo hb dump status)")
+    elif not dumps:
+        notes.append("backup.dumps matched no container (sudo hb dump list)")
+    if notes:
+        return 1, "warn: " + "; ".join(notes)
+    size = sum(d.get("bytes", 0) for d in dumps.values())
+    return 0, f"ok: {plural(len(dumps), 'database')} dumped {hours:.0f} h ago, {mb(size)}"
+
+
+def do_run(cfg):
+    os.umask(0o077)
+    rules = cfg["backup"]["dumps"]
+    if not rules:
+        print("nothing to dump (backup.dumps is empty)")
+        return 0
+    os.makedirs(util.STATE, mode=0o700, exist_ok=True)
+    with util.Lock(folder() + ".lock"):
+        rec = dump_all(cfg["backup"])
+    dumps = rec["dumps"]
+    bad = {k: d for k, d in dumps.items() if not d["ok"]}
+    if rec["error"]:
+        print(f"no dumps: {rec['error']}")
+    else:
+        print(f"{len(dumps) - len(bad)} of {plural(len(dumps), 'database')} dumped into {folder()}, "
+              f"{mb(sum(d['bytes'] for d in dumps.values()))}, {rec['seconds']} s")
+    for k, d in sorted(bad.items()):
+        print(f"  FAILED {k}: {d['error']}")
+    return 1 if rec["error"] or bad or not dumps else 0
+
+
+def do_list(cfg):
+    pods, err = list_pods()
+    if pods is None:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
+    found = targets(pods, cfg["backup"]["dumps"])
+    for t in found:
+        print(f"{t['key']:50} {t['container']} ({t['image']})" + (f"  NOT DUMPED: {t['why']}" if t["why"] else ""))
+    print(f"{plural(len(found), 'container')} to dump into {folder()}")
+    return 0
+
+
+def do_status(cfg):
+    rec = read_record()
+    if not rec:
+        print("no dump run yet")
+    else:
+        print(f"last run: {time.strftime('%Y-%m-%d %H:%M', time.localtime(rec['ts']))}, {rec.get('seconds', 0)} s"
+              + (f", {rec['error']}" if rec.get("error") else ""))
+        for k, d in sorted(rec.get("dumps", {}).items()):
+            if d.get("ok"):
+                print(f"  ok      {k:50} {mb(d['bytes']):>10}  {d.get('seconds', 0)} s")
+            else:
+                good = (time.strftime("%Y-%m-%d %H:%M", time.localtime(d["last_ok"])) if d.get("last_ok")
+                        else "never")
+                print(f"  FAILED  {k:50} {d.get('error')} (last good: {good})")
+    print(verdict(cfg)[1])
+    return 0
+
+
+def main(argv):
+    verb = argv[1] if len(argv) > 1 else "status"
+    if verb in ("help", "-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if os.geteuid() != 0:
+        print("error: run with sudo", file=sys.stderr)
+        return 2
+    cfg = config.load()
+    if verb == "check":
+        rc, line = verdict(cfg)
+        print(line)
+        return rc
+    problem = settings_problem(cfg["backup"])
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return 2
+    if verb == "run":
+        return do_run(cfg)
+    if verb == "list":
+        return do_list(cfg)
+    if verb == "status":
+        return do_status(cfg)
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

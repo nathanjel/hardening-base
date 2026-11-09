@@ -16,8 +16,9 @@ class CheckSummaryTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, d)
         os.makedirs(f"{d}/tools")
         shutil.copy(os.path.join(REPO, "hb"), f"{d}/hb")
-        for name, line, rc in (("alpha", "ok: not managed", 0), ("beta", "warn: something", 1),
+        for name, line, rc in (("alpha", "ok: not managed", 0), ("beta", "warn: smartmontools not installed", 1),
                                ("gamma", "ok: fine", 0), ("delta", "ok: microk8s not installed", 0),
+                               ("epsilon", "ok: upgrade: 0 packages; backup not configured", 0),   # the digest
                                ("omega", "fail: broken", 2)):
             with open(f"{d}/tools/hb-{name}", "w") as f:
                 f.write(f"#!/bin/sh\necho 'detail first'\necho '{line}'\nexit {rc}\n")
@@ -26,7 +27,7 @@ class CheckSummaryTest(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         lines = r.stdout.splitlines()
         self.assertEqual(lines[0], "alpha      ok: not managed")       # the verdict is a check's last line
-        self.assertEqual(lines[-1], "3 ok, 1 warn, 1 fail; not managed here: alpha, delta")
+        self.assertEqual(lines[-1], "4 ok, 1 warn, 1 fail; not managed here: alpha, delta")
 
     def test_a_check_that_crashed_is_a_failure_not_a_warning(self):
         d = tempfile.mkdtemp()

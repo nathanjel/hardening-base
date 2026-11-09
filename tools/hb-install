@@ -15,6 +15,11 @@
 #           everything in /etc/hb (secrets, tokens, TOTP keys) is root's, unreadable by
 #           anyone else: apply tightens what isn't. A link there is broken until replaced
 #           by the file itself: where it leads, this can't vouch for
+#   restic  with backup.restic_version set, restic's own release binary of that version at
+#           /usr/local/bin/restic: downloaded from restic's GitHub releases, and installed
+#           only when its SHA-256 is backup.restic_sha256 (take it from the release's
+#           SHA256SUMS, whose signature restic's documentation says how to check). Unset: not
+#           managed; hb backup uses the restic on PATH
 #   units   units/* are installed in /etc/systemd/system. A unit that leaves
 #           units/ is removed only if it carries units/' first line ("# Managed
 #           by hb install"); units other tools write (hb-webshell.service) stay.
@@ -29,10 +34,12 @@ source "$(dirname "$(readlink -f "$0")")/../lib/hb.sh"
 need_root
 need_config
 
-ITEMS=(code link config units timers)
+ITEMS=(code link config restic units timers)
 PREFIX=/opt/hb
 ETC=/etc/hb
 UNITDIR=/etc/systemd/system
+RESTIC_BIN=/usr/local/bin/restic
+RESTIC_RELEASES=https://github.com/restic/restic/releases/download
 # The timers come from /etc/hb/hb.toml as it is when they're checked: read after the config
 # item has copied the checkout's, not when this script starts.
 load_timers() { mapfile -t TIMERS < <(cfg install.timers); }
@@ -122,6 +129,50 @@ fix_config() {
   fi
   chown root:root "$etc" && chmod 600 "$etc" || return 1
   chown -R root:root "$ETC" && chmod -R go-rwx "$ETC"   # only root ever writes here, so nothing to follow
+}
+
+# --- restic ---------------------------------------------------------------------
+# Read when checked, like the timers: after the config item has copied the checkout's hb.toml.
+restic_arch() { case "$(uname -m)" in x86_64) echo amd64 ;; aarch64) echo arm64 ;; *) return 1 ;; esac; }
+restic_asset() { echo "restic_$(cfg backup.restic_version)_linux_$(restic_arch).bz2"; }
+chk_restic() {
+  local v sha have todo
+  v="$(cfg backup.restic_version)"; sha="$(cfg backup.restic_sha256)"
+  [ -n "$v" ] || { echo "not managed (backup.restic_version is empty; hb backup uses the restic on PATH)"; return 0; }
+  [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "backup.restic_version must look like 0.19.1"; return 2; }
+  restic_arch >/dev/null || { echo "no restic release for $(uname -m)"; return 2; }
+  [[ $sha =~ ^[0-9a-f]{64}$ ]] || { echo "backup.restic_sha256 must be the SHA-256 of $(restic_asset) (from the release's SHA256SUMS)"; return 2; }
+  if [ ! -e "$RESTIC_BIN" ] && [ ! -L "$RESTIC_BIN" ]; then
+    todo="will install restic $v at $RESTIC_BIN"
+  elif [ -L "$RESTIC_BIN" ] || [ ! -f "$RESTIC_BIN" ] || [ "$(stat -c %u "$RESTIC_BIN")" != 0 ] \
+       || [ -n "$(find "$RESTIC_BIN" -perm /022)" ]; then
+    todo="$RESTIC_BIN isn't a file only root can change: will replace it with restic $v"
+  else
+    have="$("$RESTIC_BIN" version 2>/dev/null)"     # root's own file: safe to run
+    [[ $have == "restic $v "* ]] && { echo "restic $v at $RESTIC_BIN"; return 0; }
+    todo="will replace ${have:-an unknown restic} at $RESTIC_BIN with restic $v"
+  fi
+  echo "$todo ($(restic_asset), SHA-256 checked)"; return 1
+}
+fix_restic() {
+  local v sha asset tmp rc=1
+  v="$(cfg backup.restic_version)"; sha="$(cfg backup.restic_sha256)"; asset="$(restic_asset)"
+  tmp="$(mktemp -d)" || return 1
+  if ! curl -fsSL --proto =https --proto-redir =https --retry 3 --max-time 600 -o "$tmp/$asset" \
+       "$RESTIC_RELEASES/v$v/$asset"; then
+    echo "  can't download $RESTIC_RELEASES/v$v/$asset" >&2
+  elif ! printf '%s  %s\n' "$sha" "$tmp/$asset" | sha256sum -c --status; then
+    echo "  $asset's SHA-256 is $(sha256sum < "$tmp/$asset" | cut -d' ' -f1), not backup.restic_sha256: not installed" >&2
+  elif ! python3 -I -c 'import bz2, shutil, sys; shutil.copyfileobj(bz2.open(sys.argv[1]), open(sys.argv[2], "wb"))' \
+         "$tmp/$asset" "$tmp/restic" || ! chmod 755 "$tmp/restic"; then
+    echo "  can't unpack $asset" >&2
+  elif [[ "$("$tmp/restic" version 2>/dev/null)" != "restic $v "* ]]; then
+    echo "  $asset doesn't say it is restic $v: not installed" >&2
+  else
+    install -m 755 "$tmp/restic" "$RESTIC_BIN.new" && mv -fT "$RESTIC_BIN.new" "$RESTIC_BIN" && rc=0
+  fi
+  rm -rf "$tmp"
+  return $rc
 }
 
 # --- units ----------------------------------------------------------------------

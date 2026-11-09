@@ -241,5 +241,170 @@ class SnapshotReadTest(CoverageTest.__base__):
         self.assertEqual(self.sees(f"{h}/srv/sub"), ["live-file"])        # what is mounted there, not below it
         self.assertIn(f"live {h}/srv/sub", self.coverage())
 
+# restic for a repository that isn't a folder: `cat config` exits with the code in {code} (restic's
+# own: 10 no repository, 12 the password doesn't open it), saying why on stderr; the rest is logged
+RESTIC_REMOTE = """#!/bin/sh
+echo "$*" >> {log}
+case "$*" in
+  *"cat config"*) c="$(cat {code})"
+                  [ "$c" = 0 ] || {{ echo "Fatal: reason $c"; echo "s3:https://example/bucket/hb"; }} >&2
+                  exit "$c" ;;
+esac
+exit 0
+"""
+
+
+@unittest.skipUnless(can_namespace(), "needs unprivileged user and mount namespaces")
+class RemoteRepoTest(CoverageTest.__base__):
+    """S3 and the like: whether a repository is there is restic's to say, by its exit code; and the
+    database dumps come before the backup."""
+
+    def setUp(self):
+        CoverageTest.setUp(self)
+        d = self.d
+        self.code = f"{d}/code"
+        with open(f"{d}/bin/restic", "w") as f:
+            f.write(RESTIC_REMOTE.format(log=self.log, code=self.code))
+        with open(f"{d}/root/hb", "w") as f:                 # the dispatcher: records what it was asked
+            f.write(f"#!/bin/sh\necho \"hb $*\" >> {self.log}\n")
+        self.answer(0)
+
+    tool = CoverageTest.tool
+
+    def answer(self, code):
+        with open(self.code, "w") as f:
+            f.write(f"{code}\n")
+
+    def config(self, extra=""):
+        with open(f"{self.d}/hb.toml", "w") as f:
+            f.write(f'[backup]\nrepo = "s3:https://s3.us-east-1.amazonaws.com/bucket/hb"\n'
+                    f'password_file = "{self.d}/pw"\npaths = ["{self.d}/a"]\n{extra}'
+                    f'[snapshot]\ndir = "{self.d}/snaps"\n')
+
+    def logged(self):
+        with open(self.log) as f:
+            return [line.split() for line in f]
+
+    def password(self):
+        with open(f"{self.d}/pw", "w") as f:
+            f.write("pw\n")
+
+    def test_restic_says_whether_the_repository_is_there(self):
+        self.config()
+        r = self.tool("status", mounts=False)                     # restic would stop at the file
+        self.assertIn(f"no password in {self.d}/pw: hb backup init makes the repository and it", r.stderr)
+        self.password()
+        for code, words in ((10, "no repository at s3:https://s3.us-east-1.amazonaws.com/bucket/hb yet: hb backup init"),
+                            (12, f"the password in {self.d}/pw doesn't open the repository"),
+                            (1, "can't open the repository at s3:https://s3.us-east-1.amazonaws.com/bucket/hb "
+                                "(restic exit 1): Fatal: reason 1")):
+            self.answer(code)
+            r = self.tool("status", mounts=False)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn(words, r.stderr)
+        self.answer(0)
+        r = self.tool("status", mounts=False)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("snapshots", [w for line in self.logged() for w in line])
+
+    def test_init_only_where_there_is_none(self):
+        self.config()
+        for code in (0, 12):
+            self.answer(code)
+            r = self.tool("init", mounts=False)
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("a repository already exists at s3:", r.stderr)
+        self.assertFalse(os.path.exists(f"{self.d}/pw"))          # no password made for a repository it can't open
+        self.answer(1)
+        r = self.tool("init", mounts=False)
+        self.assertIn("can't tell whether there is a repository", r.stderr)
+        self.answer(10)
+        r = self.tool("init", mounts=False)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.getsize(f"{self.d}/pw") > 0)
+        probe = next(l for l in self.logged() if "cat" in l)
+        self.assertIn("--insecure-no-password", probe)            # asked without the password
+        self.assertEqual(self.logged()[-1][2:], ["init"])
+
+    def test_the_dumps_come_first_and_never_in_a_dry_run(self):
+        rule = '{ images = ["postgres"], command = ["pg_dump"] }'
+        self.config(f"dumps = [{rule}]\n")
+        self.password()
+        r = self.tool("run", mounts=False)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        steps = [l[1] if l[0] == "hb" else l[2] for l in self.logged() if l[0] == "hb" or l[2:3] == ["backup"]]
+        self.assertEqual(steps, ["inventory", "dump", "backup"])
+        os.unlink(self.log)
+        r = self.tool("dry-run", mounts=False)
+        self.assertIn("dry run: no database dumps", r.stderr)
+        self.assertNotIn(["hb", "dump", "run"], self.logged())
+        os.unlink(self.log)
+        self.config()                                             # none configured: not asked at all
+        self.tool("run", mounts=False)
+        self.assertNotIn(["hb", "dump", "run"], self.logged())
+
+    def test_a_failed_dump_never_stops_the_backup(self):
+        self.config('dumps = [{ images = ["postgres"], command = ["pg_dump"] }]\n')
+        self.password()
+        with open(f"{self.d}/root/hb", "w") as f:
+            f.write(f"#!/bin/sh\necho \"hb $*\" >> {self.log}\n[ \"$1\" = dump ] && exit 1\nexit 0\n")
+        r = self.tool("run", mounts=False)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("database dumps incomplete (sudo hb dump status)", r.stderr)
+        self.assertTrue(any(l[2:3] == ["backup"] for l in self.logged()))
+
+    def test_a_pinned_restic_runs_only_as_that_version(self):
+        self.config('restic_version = "9.9.9"\n')
+        r = self.tool("run", mounts=False)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("restic 9.9.9 isn't at /usr/local/bin/restic (backup.restic_version): sudo hb install apply",
+                      r.stderr)
+        self.assertFalse(os.path.exists(self.log))                # the restic on PATH never ran
+
+
+@unittest.skipUnless(can_namespace() and shutil.which("restic"), "needs restic and user namespaces")
+class RealResticTest(unittest.TestCase):
+    """The exit codes above, from restic itself, through a "local:" repository (not a plain folder, so
+    the same way as S3)."""
+
+    def setUp(self):
+        d = self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        os.makedirs(f"{d}/root/tools")
+        with open(f"{d}/root/hb", "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(f"{d}/root/hb", 0o755)
+        os.symlink(os.path.join(REPO, "tools", "hb-config"), f"{d}/root/tools/hb-config")
+        with open(f"{d}/hb.toml", "w") as f:
+            f.write(f'[backup]\nrepo = "local:{d}/repo"\npassword_file = "{d}/pw"\npaths = ["{d}/root"]\n')
+
+    def tool(self, verb):
+        d = self.d
+        env = {**os.environ, "HB_CONFIG": f"{d}/hb.toml", "HB_STATE": f"{d}/state", "HB_CACHE": f"{d}/cache",
+               "HB_ROOT": f"{d}/root"}
+        return subprocess.run(["unshare", "-r", f"{REPO}/tools/hb-backup", *verb.split()], env=env,
+                              capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+
+    def test_init_once_then_the_password_opens_it(self):
+        r = self.tool("status")
+        self.assertIn(f"no password in {self.d}/pw", r.stderr)
+        with open(f"{self.d}/pw", "w") as f:
+            f.write("pw\n")
+        r = self.tool("status")
+        self.assertIn(f"no repository at local:{self.d}/repo yet: hb backup init", r.stderr)
+        os.unlink(f"{self.d}/pw")
+        r = self.tool("init")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.tool("init")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("a repository already exists", r.stderr)
+        r = self.tool("status")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(f"{self.d}/pw", "w") as f:
+            f.write("not-the-password\n")
+        r = self.tool("status")
+        self.assertIn(f"the password in {self.d}/pw doesn't open the repository", r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

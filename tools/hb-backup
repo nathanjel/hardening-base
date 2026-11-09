@@ -3,7 +3,7 @@
 # btrfs snapshot so that every file comes from the same instant.
 #
 #   hb backup init        create the repository and its password (once)
-#   hb backup run         state dump, snapshot, backup, forget old snapshots
+#   hb backup run         state dump, database dumps, snapshot, backup, forget old snapshots
 #   hb backup dry-run     the same, but restic writes nothing: shows the size
 #   hb backup maintain    prune, then check the repository; in the first week of
 #                         a month also read back backup.read_data_percent of the data
@@ -18,6 +18,15 @@
 # needs to know, into /var/lib/hb/state: installed packages, snaps, accounts,
 # firewall zones, enabled units, disks, Docker containers and, with microk8s,
 # its add-ons and every object (secrets included; the repository is encrypted).
+# Then hb dump run dumps the databases backup.dumps names into /var/lib/hb/dumps
+# (a failed dump is noted there and in hb dump check, and the backup goes on).
+#
+# The repository is a folder (backup.repo = "/mnt/backup/restic", with require_mount
+# for a share) or anything restic reaches, such as S3:
+# "s3:https://s3.us-east-1.amazonaws.com/<bucket>/hb", with the credentials restic finds
+# itself (on EC2, the instance role). restic is the one on PATH (dnf install restic), or,
+# with backup.restic_version, its own release at /usr/local/bin/restic, which hb install
+# puts there after checking backup.restic_sha256; then only that version runs.
 #
 # Each run notes what it covered (last-coverage): paths that don't exist, paths read
 # live rather than from the snapshot (not on the root filesystem, or no snapshot),
@@ -28,7 +37,9 @@
 #
 # Config ([backup] in hb.toml): repo, password_file, require_mount, paths,
 # exclude, exclude_if_present, keep_daily, keep_weekly, keep_monthly,
-# warn_hours, fail_hours, read_data_percent. Nothing happens while repo is "".
+# warn_hours, fail_hours, read_data_percent, restic_version, restic_sha256, dumps,
+# dumps_max_mb (the last two are hb dump's).
+# Nothing happens while repo is "".
 #
 # The password file is the only key to the repository. Keep a copy away from
 # this box: without it nobody, you included, can read the backup.
@@ -50,14 +61,26 @@ HOST="$(hostname -s)"
 KEEP=(--keep-daily "$(cfg backup.keep_daily)" --keep-weekly "$(cfg backup.keep_weekly)"
       --keep-monthly "$(cfg backup.keep_monthly)")
 export RESTIC_REPOSITORY="$REPO" RESTIC_PASSWORD_FILE="$PWFILE"
+PIN="$(cfg backup.restic_version)"
+if [ -n "$PIN" ]; then RESTIC=/usr/local/bin/restic; else RESTIC=restic; fi
 
-r() { restic --cache-dir "$CACHE" "$@"; }
+r() { "$RESTIC" --cache-dir "$CACHE" "$@"; }
 
-# need_repo — configured, restic present, and the share mounted. Writing the
-# repository to the local disk because the share was missing would fill it.
+# local_repo — backup.repo is a folder (restic's other backends are "name:...")
+local_repo() { [[ $REPO == /* ]]; }
+# why TEXT — restic's own reason in its output: the Fatal line, else the last line
+why() { local l; l="$(grep -m1 '^Fatal: ' <<< "$1")"; printf '%s' "${l:-${1##*$'\n'}}"; }
+
+# need_repo — configured, restic present (the pinned version, if one is), and the share
+# mounted. Writing the repository to the local disk because the share was missing would fill it.
 need_repo() {
   [ -n "$REPO" ] || die "backup.repo is not set"
-  command -v restic >/dev/null || die "restic is not installed (dnf install restic)"
+  if [ -n "$PIN" ]; then
+    [[ "$("$RESTIC" version 2>/dev/null)" == "restic $PIN "* ]] \
+      || die "restic $PIN isn't at $RESTIC (backup.restic_version): sudo hb install apply"
+  else
+    command -v restic >/dev/null || die "restic is not installed (dnf install restic, or set backup.restic_version)"
+  fi
   if [ -n "$MOUNT" ]; then
     awk -v m="$MOUNT" '$2 == m {found=1} END {exit !found}' /proc/self/mounts \
       || die "$MOUNT is not mounted; refusing to write the backup anywhere else"
@@ -65,13 +88,33 @@ need_repo() {
   fi
   mkdir -p "$STATUS" "$CACHE"
 }
-need_init() { [ -f "$REPO/config" ] || die "no repository at $REPO yet: hb backup init"; }
+# need_init — the repository is there and the password opens it. restic says which: exit 10,
+# no repository; 12, a repository the password doesn't open.
+need_init() {
+  local err rc
+  if local_repo; then [ -f "$REPO/config" ] || die "no repository at $REPO yet: hb backup init"; return; fi
+  # restic stops at a missing password file before it looks for the repository
+  [ -s "$PWFILE" ] || die "no password in $PWFILE: hb backup init makes the repository and it (or put your copy there)"
+  err="$(r cat config 2>&1 >/dev/null)"; rc=$?
+  case $rc in
+    0) ;;
+    10) die "no repository at $REPO yet: hb backup init" ;;
+    12) die "the password in $PWFILE doesn't open the repository at $REPO" ;;
+    *) die "can't open the repository at $REPO (restic exit $rc): $(why "$err")" ;;
+  esac
+}
 take_lock() { exec 9>"$STATUS/lock"; flock -n 9 || die "another hb backup run or maintain is in progress"; }
 
 # --- state dump -------------------------------------------------------------------
 # hb inventory writes it into /var/lib/hb/state, which is backed up with the rest.
 # A piece it can't read is noted there (and in its check), never fatal here.
 dump_state() { "$HB_ROOT/hb" inventory run >/dev/null || log "state dump incomplete (hb inventory show)"; }
+
+# hb dump writes the databases' dumps into /var/lib/hb/dumps; one that failed is in its check.
+dump_databases() {
+  [ -n "$(cfg backup.dumps)" ] || return 0
+  "$HB_ROOT/hb" dump run >&2 || log "database dumps incomplete (sudo hb dump status)"
+}
 
 # --- snapshot -----------------------------------------------------------------------
 take_snapshot() {
@@ -187,7 +230,7 @@ backup_paths() {
   unshare --mount --propagation private -- bash -c '
     snap="$1"; shift
     while [ "$1" != -- ]; do mount --bind "$snap$1" "$1" || exit 1; shift; done; shift
-    exec "$@"' _ "$SNAP" "${binds[@]}" -- restic --cache-dir "$CACHE" "${args[@]}" "$@" "${have[@]}"
+    exec "$@"' _ "$SNAP" "${binds[@]}" -- "$RESTIC" --cache-dir "$CACHE" "${args[@]}" "$@" "${have[@]}"
 }
 
 cmd_run() {
@@ -196,6 +239,7 @@ cmd_run() {
   [ ${#PATHS[@]} -gt 0 ] || die "backup.paths is empty"
   start="$(date +%s)"
   dump_state
+  if [ "$dry" = 1 ]; then log "dry run: no database dumps (hb dump list shows them)"; else dump_databases; fi
   take_snapshot
   trap drop_snapshot EXIT
   if [ "$dry" = 1 ]; then
@@ -227,8 +271,21 @@ cmd_maintain() {
 }
 
 cmd_init() {
+  local err rc
   need_repo
-  [ -f "$REPO/config" ] && die "a repository already exists at $REPO"
+  if local_repo; then
+    [ -f "$REPO/config" ] && die "a repository already exists at $REPO"
+  else
+    # Asked without a password (the file may not exist yet): 10 is no repository, 12 one whose key
+    # needs a password, so one is there.
+    err="$(env -u RESTIC_PASSWORD_FILE "$RESTIC" --cache-dir "$CACHE" --insecure-no-password cat config 2>&1 >/dev/null)"
+    rc=$?
+    case $rc in
+      10) ;;
+      0|12) die "a repository already exists at $REPO" ;;
+      *) die "can't tell whether there is a repository at $REPO (restic exit $rc): $(why "$err")" ;;
+    esac
+  fi
   if [ ! -s "$PWFILE" ]; then
     install -d -m 700 "$(dirname "$PWFILE")"
     head -c 20 /dev/urandom | base32 | fold -w4 | paste -sd- > "$PWFILE"
@@ -301,7 +358,7 @@ case "${1:-check}" in
   maintain) cmd_maintain ;;
   check) cmd_check ;;
   status) cmd_status ;;
-  restic) shift; need_repo; exec restic --cache-dir "$CACHE" "$@" ;;
+  restic) shift; need_repo; exec "$RESTIC" --cache-dir "$CACHE" "$@" ;;
   help|-h|--help) sed -n '2,/^$/s/^# \{0,1\}//p' "$0" ;;
   *) die "unknown verb '$1' (init, run, dry-run, maintain, status, check, restic)" ;;
 esac

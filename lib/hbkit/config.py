@@ -70,6 +70,10 @@ DEFAULTS = {
         "warn_hours": 26,
         "fail_hours": 50,
         "read_data_percent": 10,
+        "restic_version": "",   # "": the restic on PATH; a version: restic's own release, by hb install
+        "restic_sha256": "",
+        "dumps": [],            # hb dump: databases dumped before each backup
+        "dumps_max_mb": 10240,  # all of one run's dumps together
     },
     "restore": {
         "sample_files": 200,

@@ -30,8 +30,10 @@ case "${1:-help}" in
       printf '%-10s %s\n' "$t" "$out"
       [ "$rc" -gt "$worst" ] && worst=$rc
       case "$rc" in 0) ok=$((ok + 1)) ;; 1) warn=$((warn + 1)) ;; *) fail=$((fail + 1)) ;; esac
-      # an "ok" that only means the tool has nothing to do here: green, but nothing is being checked
-      case "$out" in *"not managed"*|*"not configured"*|*"not installed"*) idle+=("$t") ;; esac
+      # an "ok" that only means the tool has nothing to do here: green, but nothing is being checked.
+      # Its first clause says so ("ok: not configured"); a later one may be about another tool
+      # (the digest's "backup not configured")
+      case "${out%%;*}" in "ok: "*"not managed"*|"ok: "*"not configured"*|"ok: "*"not installed"*) idle+=("$t") ;; esac
     done
     printf '\n%d ok, %d warn, %d fail' "$ok" "$warn" "$fail"
     [ ${#idle[@]} -gt 0 ] && printf '; not managed here: %s' "$(IFS=,; echo "${idle[*]}" | sed 's/,/, /g')"

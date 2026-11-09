@@ -1,6 +1,10 @@
 """hb-install: which units it installs and which it removes."""
+import bz2
 import glob
+import hashlib
 import os
+import platform
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -149,6 +153,105 @@ class EtcTest(unittest.TestCase):
             self.assertTrue(lines[0].startswith(f"links in {etc} lead where this can't vouch for: "), (what, lines))
             self.assertEqual(lines[1:], ["rc=2", "fix=1"], what)
             self.assertEqual(oct(os.stat(outside).st_mode & 0o777), "0o644", what)     # never chmod'ed through it
+
+
+# curl as fix_restic calls it: logs the URL, writes {src} to the -o file
+CURL = """#!/bin/sh
+out=""
+while [ $# -gt 1 ]; do [ "$1" = -o ] && out="$2"; shift; done
+echo "$1" >> {log}
+cp {src} "$out"
+"""
+
+
+@unittest.skipUnless(userns_ok(), "needs unprivileged user namespaces (unshare -r)")
+class ResticTest(unittest.TestCase):
+    """The restic item: the pinned release, installed only with the SHA-256 it should have."""
+
+    ARCH = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine())
+
+    def setUp(self):
+        if not self.ARCH:
+            self.skipTest("restic releases are tested for x86_64 and aarch64")
+        d = self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        self.bin, self.log, self.asset = f"{d}/usr-local-bin/restic", f"{d}/curl.log", f"{d}/release.bz2"
+        os.makedirs(os.path.dirname(self.bin))
+        os.makedirs(f"{d}/path")
+        write(f"{d}/path/curl", CURL.format(log=self.log, src=self.asset))
+        os.chmod(f"{d}/path/curl", 0o755)
+        self.release("0.19.1")
+
+    def release(self, says):
+        """The release file: a restic that says it is version `says`. Its SHA-256 is returned."""
+        data = bz2.compress(f"#!/bin/sh\necho 'restic {says} compiled with go1.26 on linux/{self.ARCH}'\n".encode())
+        with open(self.asset, "wb") as f:
+            f.write(data)
+        self.sha = hashlib.sha256(data).hexdigest()
+        return self.sha
+
+    def run_fn(self, script, version="0.19.1", sha=None):
+        sha = self.sha if sha is None else sha
+        write(f"{self.d}/hb.toml", f'[backup]\nrestic_version = "{version}"\nrestic_sha256 = "{sha}"\n')
+        env = dict(os.environ, HB_CONFIG=f"{self.d}/hb.toml", PATH=f"{self.d}/path" + os.pathsep + os.environ["PATH"])
+        p = subprocess.run(["unshare", "-r", "bash", "-c", f'source "$1"; RESTIC_BIN="$2"; {script}', "_", harness(),
+                            self.bin], env=env, capture_output=True, text=True)
+        return p.stdout.splitlines(), p.stderr
+
+    def test_not_managed_without_a_version(self):
+        out, _ = self.run_fn('chk_restic; echo "rc=$?"', version="", sha="")
+        self.assertEqual(out, ["not managed (backup.restic_version is empty; hb backup uses the restic on PATH)", "rc=0"])
+
+    def test_the_settings_are_checked(self):
+        out, _ = self.run_fn('chk_restic; echo "rc=$?"', version="latest")
+        self.assertEqual(out, ["backup.restic_version must look like 0.19.1", "rc=2"])
+        out, _ = self.run_fn('chk_restic; echo "rc=$?"', sha="abc")
+        self.assertEqual(out, [f"backup.restic_sha256 must be the SHA-256 of restic_0.19.1_linux_{self.ARCH}.bz2 "
+                               "(from the release's SHA256SUMS)", "rc=2"])
+
+    def test_installed_when_the_hash_matches(self):
+        out, err = self.run_fn('chk_restic; echo "rc=$?"; fix_restic; echo "fix=$?"; chk_restic; echo "rc=$?"')
+        self.assertEqual(out, [f"will install restic 0.19.1 at {self.bin} (restic_0.19.1_linux_{self.ARCH}.bz2, "
+                               "SHA-256 checked)", "rc=1", "fix=0", f"restic 0.19.1 at {self.bin}", "rc=0"], err)
+        self.assertEqual(oct(os.stat(self.bin).st_mode & 0o777), "0o755")
+        with open(self.log) as f:
+            self.assertEqual(f.read().split(), ["https://github.com/restic/restic/releases/download/v0.19.1/"
+                                                f"restic_0.19.1_linux_{self.ARCH}.bz2"])
+
+    def test_never_installed_with_another_hash(self):
+        out, err = self.run_fn('fix_restic; echo "fix=$?"', sha="0" * 64)
+        self.assertEqual(out, ["fix=1"])
+        self.assertIn(f"SHA-256 is {self.sha}, not backup.restic_sha256: not installed", err)
+        self.assertFalse(os.path.exists(self.bin))
+
+    def test_never_installed_when_it_says_another_version(self):
+        self.release("0.18.0")
+        out, err = self.run_fn('fix_restic; echo "fix=$?"')
+        self.assertEqual(out, ["fix=1"])
+        self.assertIn("doesn't say it is restic 0.19.1: not installed", err)
+        self.assertFalse(os.path.exists(self.bin))
+
+    def test_another_version_or_a_loose_file_is_replaced(self):
+        write(self.bin, "#!/bin/sh\necho 'restic 0.18.0 compiled with go1.24 on linux/x'\n")
+        os.chmod(self.bin, 0o755)
+        out, _ = self.run_fn('chk_restic; echo "rc=$?"')
+        self.assertEqual(out[0], f"will replace restic 0.18.0 compiled with go1.24 on linux/x at {self.bin} with "
+                                 f"restic 0.19.1 (restic_0.19.1_linux_{self.ARCH}.bz2, SHA-256 checked)")
+        os.chmod(self.bin, 0o775)                                  # anyone in its group could change it
+        out, _ = self.run_fn('chk_restic; echo "rc=$?"; fix_restic; chk_restic')
+        self.assertTrue(out[0].startswith(f"{self.bin} isn't a file only root can change: will replace it"), out)
+        self.assertEqual(out[1:], ["rc=1", f"restic 0.19.1 at {self.bin}"])
+
+    def test_a_link_there_is_replaced_never_written_through(self):
+        target = f"{self.d}/elsewhere"
+        write(target, "someone's file\n")
+        os.symlink(target, self.bin)
+        out, _ = self.run_fn('chk_restic; echo "rc=$?"; fix_restic; chk_restic')
+        self.assertTrue(out[0].startswith(f"{self.bin} isn't a file only root can change"), out)
+        self.assertEqual(out[2], f"restic 0.19.1 at {self.bin}")
+        self.assertFalse(os.path.islink(self.bin))
+        with open(target) as f:
+            self.assertEqual(f.read(), "someone's file\n")
 
 
 if __name__ == "__main__":

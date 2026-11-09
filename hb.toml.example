@@ -56,7 +56,9 @@ mdadm = false                 # true: mdmonitor reports RAID events through hb-n
 smartd = false                # true: install smartd and have it report through hb-notify
 
 [backup]
-repo = ""                     # e.g. "/mnt/backup/restic"; nothing runs while empty
+repo = ""                     # e.g. "/mnt/backup/restic"; nothing runs while empty. Or S3:
+                              # "s3:https://s3.<region>.amazonaws.com/<bucket>/hb", with the
+                              # credentials restic finds itself (on EC2: the instance role)
 password_file = "/etc/hb/secrets/restic-password"   # created by hb backup init
 require_mount = ""            # e.g. "/mnt/backup": refuse to run unless this is mounted
 paths = []                    # e.g. ["/etc", "/root", "/home", "/usr/local", "/var/lib/hb"]
@@ -68,6 +70,21 @@ keep_monthly = 12
 warn_hours = 26               # warn when the last good backup is older
 fail_hours = 50               # fail (SMS) when it is older: two nights missed
 read_data_percent = 10        # share of the data read back in the first week of each month
+restic_version = ""           # "": the restic on PATH (dnf install restic). A version such as
+                              # "0.19.1": hb install puts restic's own release at /usr/local/bin/restic
+                              # (where the distribution has none, as on Amazon Linux 2023), and
+                              # hb backup runs only that
+restic_sha256 = ""            # SHA-256 of restic_<version>_linux_<amd64|arm64>.bz2, from the
+                              # release's SHA256SUMS (check its signature: restic's install docs)
+dumps = []                    # hb dump: databases dumped before each backup, by their own tools,
+                              # into /var/lib/hb/dumps/<namespace>/<pod>/<container>.sql (list
+                              # /var/lib/hb in paths). One rule per set of images; every running
+                              # container from them is dumped:
+# dumps = [
+#   { images = ["postgres"], command = ["sh", "-c", 'exec pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"'] },
+# ]
+dumps_max_mb = 10240          # all of one run's dumps together; a dump also stops before the disk
+                              # has under 10% free (a stopped dump has failed)
 
 [restore]
 # hb restore drill (quarterly, hb-restore.timer): random files from the newest snapshot,
