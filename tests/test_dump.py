@@ -1,5 +1,7 @@
 """hb-dump: which containers get dumped, what a run leaves in /var/lib/hb/dumps, and the verdict."""
+import contextlib
 import copy
+import io
 import json
 import os
 import resource
@@ -21,8 +23,9 @@ PG = ["sh", "-c", 'exec pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"']
 
 # kubectl: `get pods` prints {pods} (or fails when {fail_list} exists); `exec -n NS POD -c C -- ...`
 # logs its arguments, then for files in {d} named after NS-POD: noisy- (its bytes of error output
-# first), fail- (an error, exit 1), empty- (nothing), big- (its bytes of output); otherwise it
-# prints a dump naming where it ran and the command it was given.
+# first), fail- (an error, exit 1), term- (SIGTERM to itself, as many times as it says), code-
+# (that exit code, silently), empty- (nothing), big- (its bytes of output); otherwise it prints a
+# dump naming where it ran and the command it was given.
 KUBECTL = """#!/bin/sh
 d={d}
 case "$1" in
@@ -32,6 +35,8 @@ case "$1" in
         ns="$3" pod="$4" c="$6"; shift 7
         [ -e "$d/noisy-$ns-$pod" ] && {{ head -c "$(cat "$d/noisy-$ns-$pod")" /dev/zero | tr '\\0' e; echo; }} >&2
         [ -e "$d/fail-$ns-$pod" ] && {{ echo "pg_dump: warning: something"; echo "pg_dump: error: connection failed" >&2; exit 1; }}
+        [ -e "$d/term-$ns-$pod" ] && {{ n=$(cat "$d/term-$ns-$pod"); [ "$n" -gt 0 ] && {{ echo $((n - 1)) > "$d/term-$ns-$pod"; kill -TERM $$; }}; }}
+        [ -e "$d/code-$ns-$pod" ] && exit "$(cat "$d/code-$ns-$pod")"
         [ -e "$d/empty-$ns-$pod" ] && exit 0
         [ -e "$d/big-$ns-$pod" ] && {{ head -c "$(cat "$d/big-$ns-$pod")" /dev/zero; exit 0; }}
         echo "-- dump of $ns/$pod/$c: $*" ;;
@@ -174,6 +179,24 @@ class DumpTest(unittest.TestCase):
         self.assertEqual(rec["dumps"][TEAM_A]["error"], "exit 1: pg_dump: error: connection failed")
         self.assertEqual(rec["dumps"][SHOP]["error"], "it wrote nothing")
         self.assertEqual(self.files(), ["hb-dump.json", TEAM_B])        # no .partial either
+
+    def test_a_dump_killed_by_a_signal_hb_didnt_send_runs_once_more(self):
+        # snap's scope for kubectl ends when root's user manager stops (a sudo or root's cron job ended)
+        self.pods(PODS[:3])
+        self.touch("term-shop-postgres-0", "1")
+        self.touch("term-team-a-postgresql-0", "2")
+        self.touch("code-team-b-postgresql-0", "3")
+        d = self.run_dumps()["dumps"]
+        self.assertEqual((d[SHOP]["ok"], d[SHOP]["retried"]), (True, "killed by SIGTERM"))
+        self.assertEqual(d[TEAM_A]["error"], "killed by SIGTERM (twice)")
+        self.assertEqual(d[TEAM_B]["error"], "exit 3")                   # no stray colon without a message
+        self.assertNotIn("retried", d[TEAM_B])                            # an exit code isn't retried
+        self.assertEqual(self.files(), ["hb-dump.json", SHOP])
+        self.assertEqual(self.execs(), 2 + 2 + 1)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            dump.do_status(self.cfg())
+        self.assertIn("(run twice: the first killed by SIGTERM)", out.getvalue())
 
     def test_the_folder_holds_only_the_last_run(self):
         self.run_dumps()

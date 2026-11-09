@@ -14,7 +14,9 @@ container from one of those images gets the command run in that container (kubec
 and the output is saved as /var/lib/hb/dumps/<namespace>/<pod>/<container><suffix> (root's
 only). The folder holds exactly the last run's good dumps, plus hb-dump.json, the run's
 record, so a snapshot says itself which dumps it has. A dump that fails leaves no file (older
-ones are in older snapshots) and shows here. A pod that isn't Running counts as failed.
+ones are in older snapshots) and shows here. A pod that isn't Running counts as failed. A dump
+whose kubectl a signal ended that hb didn't send runs once more: snap runs it in a systemd scope
+under root's user manager while one runs, and a sudo or cron session of root's ending stops it.
 
 What a container sends is never trusted to stay small. A run's dumps take at most
 backup.dumps_max_mb together (while it runs, the run before is still there as well), and a dump
@@ -44,6 +46,7 @@ import os
 import re
 import selectors
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -229,34 +232,61 @@ def stream(cmd, fd, limit):
     return p.returncode, err.decode(errors="replace"), stop, size
 
 
+def signal_name(rc):
+    """SIGTERM, for a process that exit code rc (negative) says a signal ended."""
+    try:
+        return signal.Signals(-rc).name
+    except ValueError:
+        return f"signal {-rc}"
+
+
+def into(part, cmd, limit):
+    """stream(), into a new (emptied) part file: (exit code, error output, stop, bytes)."""
+    try:
+        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    except OSError as e:
+        return None, "", f"can't write {part}: {e.strerror}", 0
+    try:
+        os.fchmod(fd, 0o600)                        # whatever the umask: a dump is root's only
+        return stream(cmd, fd, limit)
+    finally:
+        os.close(fd)
+
+
 def dump_one(t, dest, limit):
-    """Run the dump into dest, writing at most limit bytes. (None, bytes) when good, else
-    (why not, 0); no file then."""
+    """Run the dump into dest, writing at most limit bytes: (why not or None, bytes, why it was
+    run twice or None). No file when it failed."""
     for d in (os.path.dirname(os.path.dirname(dest)), os.path.dirname(dest)):     # <ns>, <ns>/<pod>
         os.makedirs(d, mode=0o700, exist_ok=True)
     part = dest + ".partial"
     cmd = [*KUBECTL, "exec", "-n", t["ns"], t["pod"], "-c", t["container"], "--", *t["command"]]
-    try:
-        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    except OSError as e:
-        return f"can't write {part}: {e.strerror}", 0
-    try:
-        os.fchmod(fd, 0o600)                        # whatever the umask: a dump is root's only
-        rc, err, stop, size = stream(cmd, fd, limit)
-    finally:
-        os.close(fd)
+    rc, err, stop, size = into(part, cmd, limit)
+    retried = None
+    # A signal hb didn't send: snap runs each kubectl in a systemd scope, under root's user
+    # manager while one runs (a sudo or a cron job of root's started it), and that manager
+    # stopping ends the scope. A second try gets a scope of its own.
+    if stop is None and rc is not None and rc < 0:
+        retried = f"killed by {signal_name(rc)}"
+        rc, err, stop, size = into(part, cmd, limit)
     if stop is None and rc == 0 and size > 0:
         os.rename(part, dest)
-        return None, size
+        return None, size, retried
     try:
         os.unlink(part)
     except OSError:
         pass
+    last = (err.strip().splitlines() or [""])[-1][:200]
     if stop:
-        return stop, 0
-    if rc:
-        return f"exit {rc}: {(err.strip().splitlines() or [''])[-1][:200]}", 0
-    return "it wrote nothing", 0
+        why = stop
+    elif rc < 0:
+        why = f"killed by {signal_name(rc)}" + (" (twice)" if retried else "")
+    elif rc:
+        why = f"exit {rc}"
+    else:
+        why = "it wrote nothing"
+    if rc and last and not stop:
+        why += f": {last}"
+    return why, 0, retried
 
 
 def read_record():
@@ -308,6 +338,7 @@ def dump_all(b):
             d = {"ns": t["ns"], "pod": t["pod"], "container": t["container"], "image": t["image"],
                  "first_seen": prev.get("first_seen", start), "last_ok": prev.get("last_ok")}
             t0 = time.time()
+            retried = None
             if t["why"]:
                 why, size = t["why"], 0
             elif room <= 0:
@@ -315,9 +346,11 @@ def dump_all(b):
             elif disk_room(new) <= 0:
                 why, size = f"not run: the disk has under {MIN_FREE_PERCENT}% free", 0
             else:
-                why, size = dump_one(t, os.path.join(new, t["key"]), room)
+                why, size, retried = dump_one(t, os.path.join(new, t["key"]), room)
             room -= size
             d.update(ok=why is None, error=why, bytes=size, seconds=round(time.time() - t0, 1))
+            if retried:
+                d["retried"] = retried
             if why is None:
                 d["last_ok"] = start
             rec["dumps"][t["key"]] = d
@@ -422,7 +455,8 @@ def do_status(cfg):
               + (f", {rec['error']}" if rec.get("error") else ""))
         for k, d in sorted(rec.get("dumps", {}).items()):
             if d.get("ok"):
-                print(f"  ok      {k:50} {mb(d['bytes']):>10}  {d.get('seconds', 0)} s")
+                print(f"  ok      {k:50} {mb(d['bytes']):>10}  {d.get('seconds', 0)} s"
+                      + (f"  (run twice: the first {d['retried']})" if d.get("retried") else ""))
             else:
                 good = (time.strftime("%Y-%m-%d %H:%M", time.localtime(d["last_ok"])) if d.get("last_ok")
                         else "never")
