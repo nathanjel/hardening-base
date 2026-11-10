@@ -2,6 +2,7 @@
 import json
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -200,6 +201,17 @@ class RebootCheckTest(unittest.TestCase):
         running = os.uname().release
         out = f"1761000000 kernel {running}\n1762000000 kernel6.12 6.12.40-1.amzn2023.aarch64\n"
         self.assertEqual(self.check(0, rpm=out), (health.OK, f"kernel {running}"))
+
+
+class ReadAgainTest(unittest.TestCase):
+    def test_a_check_command_a_signal_ended_runs_once_more(self):
+        # snap's scope for kubectl ends when root's user manager stops (SIGTERM): the check reads again
+        n = os.path.join(tempfile.mkdtemp(), "runs")
+        cmd = ["sh", "-c", f'c=$(cat {n} 2>/dev/null || echo 0); echo $((c + 1)) > {n}; '
+                           f'[ "$c" -lt 1 ] && kill -TERM $$; echo node1 Ready']
+        self.assertEqual(health.run(*cmd), (0, "node1 Ready\n"))
+        with open(n) as f:
+            self.assertEqual(f.read(), "2\n")
 
 
 if __name__ == "__main__":

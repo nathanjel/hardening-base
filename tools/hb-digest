@@ -72,7 +72,7 @@ def upgrade_line(now):
     if r.get("rebooted_at") and now - r["rebooted_at"] < 30 * 3600:
         parts.append(f"rebooted {datetime.datetime.fromtimestamp(r['rebooted_at']):%H:%M} "
                      f"({r.get('from_kernel', '?')} → {os.uname().release})")
-    elif r.get("needed_since"):
+    elif r.get("needed_since") and util.in_this_boot(r["needed_since"], r.get("needed_boot")):   # no boot since
         days = (now - r["needed_since"]) / 86400
         parts.append(f"reboot waiting{f' {days:.0f} days' if days >= 1 else ''}" +
                      (f" (busy: {r['busy']})" if r.get("busy") else ""))

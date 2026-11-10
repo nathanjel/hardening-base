@@ -2,8 +2,9 @@
 # hb-k8s — microk8s plug-in: keep NodePorts off public addresses, keep
 # service-account tokens out of pods that never talk to the Kubernetes API,
 # stop certificate reissues that restart every container, keep the
-# cluster agent (for joining nodes, unused on one box) on localhost, and keep
-# microk8s's daemons retrying after a failure instead of giving up.
+# cluster agent (for joining nodes, unused on one box) on localhost, keep
+# microk8s's daemons retrying after a failure instead of giving up, and keep the
+# microk8s and kubectl commands root runs from ending with someone else's session.
 #
 #   hb k8s status        one line per item
 #   hb k8s plan          what apply would change (changes nothing)
@@ -30,9 +31,18 @@
 #                  snapd's units give up after 5 failures in 10 s, 100 ms apart, so
 #                  a full disk for a few minutes left Kubernetes down for good.
 #                  Live at once (daemon-reload); nothing restarts.
+#   linger         root lingers (loginctl enable-linger root): root's user manager runs
+#                  from boot, not only while a root session is open. snap runs each
+#                  microk8s and kubectl command in a scope under that manager whenever it
+#                  runs, and the manager stops 10 s after the last root session ends (a
+#                  root cron job's, or a sudo run by a service), ending those commands
+#                  (SIGTERM): hb's dumps and checks, and any other service's. Not done
+#                  where systemd-oomd watches user@.service, as it may end what runs
+#                  there under memory pressure. Never undone here: loginctl
+#                  disable-linger root stops the manager, ending what runs in it.
 #
 # Config ([k8s] in hb.toml): nodeport_addresses, token_off_namespaces,
-# freeze_certs, cluster_agent_bind, keep_restarting.
+# freeze_certs, cluster_agent_bind, keep_restarting, linger_root.
 set -u
 source "$(dirname "$(readlink -f "$0")")/../lib/hb.sh"
 need_root
@@ -41,7 +51,7 @@ need_config
 [ "$(cfg k8s.flavour)" = microk8s ] || die "only microk8s is supported"
 command -v /snap/bin/microk8s >/dev/null || { echo "ok: microk8s not installed"; exit 0; }
 
-ITEMS=(nodeport nodeport_live tokens tokens_live certs agent agent_live restart)
+ITEMS=(nodeport nodeport_live tokens tokens_live certs agent agent_live restart linger)
 SNAPDATA=/var/snap/microk8s/current
 ARGS=$SNAPDATA/args/kube-proxy
 AGENT_ARGS=$SNAPDATA/args/cluster-agent
@@ -56,6 +66,8 @@ FREEZE="$(cfg k8s.freeze_certs)"
 AGENT_BIND="$(cfg k8s.cluster_agent_bind)"
 mapfile -t KEEP_RESTARTING < <(cfg k8s.keep_restarting)
 UNITDIR="${HB_SYSTEMD_DIR:-/etc/systemd/system}"
+LINGER="$(cfg k8s.linger_root)"
+LINGER_DIR="${HB_LINGER_DIR:-/var/lib/systemd/linger}"
 RESTART_SEC=10
 WARN_DAYS="$(cfg health.cert_warn_days)"
 
@@ -259,6 +271,35 @@ fix_restart() {
     mkdir -p "$(dirname "$f")" && chmod 755 "$(dirname "$f")" && restart_text > "$f" && chmod 644 "$f" || return 1
   done
   systemctl daemon-reload
+}
+
+# --- linger ---------------------------------------------------------------------
+manager_active() { [ "$(systemctl is-active user@0.service 2>/dev/null)" = active ]; }
+oomd_watches_user() {
+  [ "$(systemctl is-active systemd-oomd.service 2>/dev/null)" = active ] &&
+    [ "$(systemctl show user@0.service -p ManagedOOMMemoryPressure --value 2>/dev/null)" = kill ]
+}
+chk_linger() {
+  [ "$LINGER" = true ] || { echo "not managed"; return 0; }
+  if oomd_watches_user; then
+    echo "systemd-oomd ends processes in root's user manager under memory pressure (user@.service ManagedOOMMemoryPressure=kill), so root shouldn't linger here"
+    return 2
+  fi
+  [ -e "$LINGER_DIR/root" ] || { echo "root's user manager stops after each root session, ending the microk8s and kubectl commands snap started in it"; return 1; }
+  manager_active || { echo "root lingers, but its user manager isn't running"; return 1; }
+  echo "root lingers: its user manager runs from boot, so no root session ending ends a command"
+}
+fix_linger() {
+  loginctl enable-linger root || return 1
+  # logind starts the manager only for a user it hasn't started yet: after a systemctl stop
+  # user@0.service while a root session is still open, it counts root as started. So start it.
+  systemctl start --no-block user@0.service || return 1
+  local i
+  for i in $(seq 30); do
+    manager_active && return 0
+    sleep 1
+  done
+  log "  root's user manager didn't start within 30 s (systemctl status user@0.service)"; return 1
 }
 
 item_main "$@"

@@ -25,6 +25,7 @@ DEFAULTS = {
         "freeze_certs": False,
         "cluster_agent_bind": "",
         "keep_restarting": [],
+        "linger_root": False,
     },
     "health": {
         "containers": [],

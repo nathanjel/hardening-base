@@ -15,7 +15,6 @@ import re
 import shutil
 import socket
 import ssl
-import subprocess
 import sys
 import time
 import urllib.error
@@ -32,14 +31,10 @@ KUBECTL = ["/snap/bin/microk8s", "kubectl"]
 
 
 def run(*cmd, timeout=30):
-    """(exit code, stdout) of a command; 127 when missing, 124 on timeout."""
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return p.returncode, p.stdout
-    except FileNotFoundError:
-        return 127, ""
-    except subprocess.TimeoutExpired:
-        return 124, ""
+    """(exit code, stdout) of a command; 127 when missing, 124 on timeout. The checks only read,
+    so a run a signal ended (snap's scope for kubectl, util.run_read) runs once more."""
+    rc, out, _ = util.run_read(*cmd, timeout=timeout)
+    return rc, out
 
 
 def check_reboot(cfg):

@@ -20,6 +20,9 @@ freeze_certs = false          # true: microk8s stops reissuing its API certifica
 cluster_agent_bind = ""       # e.g. "127.0.0.1:25000": the join agent, unused on one box
 keep_restarting = []          # e.g. ["kubelite", "k8s-dqlite", "containerd"]: retry every 10 s for as
                               # long as it takes, where snapd's units give up after 5 quick failures
+linger_root = false           # true: root's user manager runs from boot, so a root session ending (a
+                              # root cron job's, a sudo run by a service) no longer ends the microk8s and
+                              # kubectl commands snap ran in it; refused where systemd-oomd watches user@
 
 [health]
 containers = []               # docker containers that must be running

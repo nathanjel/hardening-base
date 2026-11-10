@@ -14,6 +14,8 @@ The dump (root-only; the backup is encrypted):
   packages.txt        packages installed on purpose (dnf repoquery --userinstalled)
   repos.txt           enabled repositories
   units-enabled.txt   enabled systemd units
+  units-user.txt      user units: enabled for every user's manager, and the files in root's
+                      own user-unit folders (they run as root, from boot when root lingers)
   users.txt           people's accounts (uid 1000-59999): name, uid, gid, home, shell, groups
   groups.txt          every group with members
   sudoers.txt         sudoers and sudoers.d, without comments
@@ -36,7 +38,7 @@ The dump (root-only; the backup is encrypted):
 hb rebuild reads it from a snapshot to set up a fresh box the same way.
 
 Drift: each run compares the new dump with the one before, piece by piece:
-kernel and OS, packages, repositories, snaps, accounts, groups, enabled units,
+kernel and OS, packages, repositories, snaps, accounts, groups, enabled units, user units,
 listening sockets, firewall zones, sudoers, SSH keys, cron, containers, add-ons,
 Kubernetes objects (added, removed, changed; values never shown) and network
 addresses. Changes go to /var/lib/hb/inventory/drift.jsonl (90 days kept). A
@@ -49,6 +51,7 @@ import glob
 import hashlib
 import json
 import os
+import pwd
 import re
 import shutil
 import sys
@@ -84,9 +87,13 @@ def state_root():
 
 
 def sh(*cmd, timeout=300):
-    rc, out, err = util.run(*cmd, timeout=timeout)
+    """A command's output, or RuntimeError. Everything here only reads, so a run a signal ended
+    (snap's scope for microk8s and kubectl, util.run_read) runs once more."""
+    rc, out, err = util.run_read(*cmd, timeout=timeout)
     if rc:
-        raise RuntimeError(f"{' '.join(cmd[:3])}: exit {rc}: {(err or out).strip()[-200:]}")
+        what = f"killed by {util.signal_name(rc)} (twice)" if rc < 0 else f"exit {rc}"
+        tail = (err or out).strip()[-200:]
+        raise RuntimeError(f"{' '.join(cmd[:3])}: {what}" + (f": {tail}" if tail else ""))
     return out
 
 
@@ -161,6 +168,20 @@ def ssh_keys_txt(files=None):
         keys = [line.strip() for line in out.splitlines() if line.strip()] if rc == 0 else []
         lines += [f"{f} {k}\n" for k in keys] or [f"{f} (no keys)\n"]
     return "".join(lines)
+
+
+def units_user_txt(home=None):
+    """Enabled user units (for every user's manager), then the files in root's own user-unit
+    folders. Root's manager runs them as root: while a root session is open, or from boot when
+    root lingers (hb k8s, k8s.linger_root), so something put there would be easy to miss."""
+    lines = [line.split()[0] for line in
+             sh("systemctl", "--global", "list-unit-files", "--state=enabled", "--no-legend").splitlines() if line.strip()]
+    home = home or pwd.getpwuid(0).pw_dir
+    for sub in (".config/systemd/user", ".local/share/systemd/user"):
+        for top, dirs, files in os.walk(os.path.join(home, sub)):
+            dirs.sort()
+            lines += [os.path.join(top, f) for f in sorted(files)]
+    return "".join(f"{line}\n" for line in lines)
 
 
 def cron_txt():
@@ -240,7 +261,8 @@ def pieces():
     p = [("system.txt", system_txt), ("users.txt", users_txt), ("groups.txt", groups_txt),
          ("sudoers.txt", sudoers_txt), ("ssh-keys.txt", ssh_keys_txt), ("cron.txt", cron_txt),
          ("disks.txt", disks_txt), ("network.txt", network_txt),
-         ("units-enabled.txt", lambda: sh("systemctl", "list-unit-files", "--state=enabled", "--no-legend"))]
+         ("units-enabled.txt", lambda: sh("systemctl", "list-unit-files", "--state=enabled", "--no-legend")),
+         ("units-user.txt", units_user_txt)]
     if have("ss"):
         p.append(("listening.txt", listening_txt))
     if have("dnf"):
@@ -397,6 +419,7 @@ DRIFT = [
     ("user", "users.txt", p_first, ADDED, True),
     ("group", "groups.txt", p_first, ADDED, True),
     ("unit", "units-enabled.txt", p_words, ENABLED, False),
+    ("user unit", "units-user.txt", p_set, ADDED, False),
     ("listening", "listening.txt", p_listening, ADDED, True),
     ("firewall", "firewalld.txt", p_firewalld, ADDED, True),
     ("sudoers", "sudoers.txt", p_set, ADDED, False),

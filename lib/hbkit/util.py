@@ -3,6 +3,7 @@ import fcntl
 import json
 import os
 import re
+import signal
 import subprocess
 import tempfile
 
@@ -20,6 +21,61 @@ def run(*cmd, timeout=30, input=None, **kw):
         return 127, "", f"{cmd[0]}: not found"
     except subprocess.TimeoutExpired:
         return 124, "", f"{cmd[0]}: timed out after {timeout}s"
+
+
+def run_read(*cmd, **kw):
+    """run() for a command that only reads, so it may simply run again: once more when a signal
+    ended it (run's own timeout is 124, not a signal). A negative exit code from here means both
+    tries ended that way. The signal comes from snap: it runs each microk8s and kubectl command
+    in a systemd scope, under root's user manager while one runs. Root's sessions start that
+    manager (cron's root jobs; sudo or su run by a service: a sudo inside a login opens none), and
+    it stops after the last of them ends, ending its scopes (SIGTERM). A second try gets a scope of
+    its own. k8s.linger_root keeps that manager running (hb k8s); this stays as the backstop."""
+    rc, out, err = run(*cmd, **kw)
+    if rc < 0:
+        rc, out, err = run(*cmd, **kw)
+    return rc, out, err
+
+
+def signal_name(rc):
+    """SIGTERM, for a process that exit code rc (negative) says a signal ended."""
+    try:
+        return signal.Signals(-rc).name
+    except ValueError:
+        return f"signal {-rc}"
+
+
+def boot_time():
+    """When this box last booted (epoch seconds, from /proc/stat), or 0 when that can't be read."""
+    try:
+        with open("/proc/stat") as f:
+            for line in f:
+                if line.startswith("btime "):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def boot_id():
+    """This boot's id, which the kernel draws at random at every boot; "" when it can't be read."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def in_this_boot(at, boot, current=None):
+    """Whether something recorded at `at` (epoch seconds), in the boot whose id is `boot`, happened
+    since this box last booted. The id decides, against `current` (this boot's, read when not
+    given). Without both (state written before hb kept the id, or one that can't be read) the boot
+    time does, but that is only the clock minus the uptime: it moves when the clock is stepped
+    (chrony does at boot), so it can put the boot after `at`."""
+    current = boot_id() if current is None else current
+    if boot and current:
+        return boot == current
+    return at > boot_time()
 
 
 # The kernel's own packages: kernel-core (and the kernel meta package) on Fedora; kernel,

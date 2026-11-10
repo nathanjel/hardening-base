@@ -46,7 +46,6 @@ import os
 import re
 import selectors
 import shutil
-import signal
 import subprocess
 import sys
 import time
@@ -232,14 +231,6 @@ def stream(cmd, fd, limit):
     return p.returncode, err.decode(errors="replace"), stop, size
 
 
-def signal_name(rc):
-    """SIGTERM, for a process that exit code rc (negative) says a signal ended."""
-    try:
-        return signal.Signals(-rc).name
-    except ValueError:
-        return f"signal {-rc}"
-
-
 def into(part, cmd, limit):
     """stream(), into a new (emptied) part file: (exit code, error output, stop, bytes)."""
     try:
@@ -266,7 +257,7 @@ def dump_one(t, dest, limit):
     # manager while one runs (a sudo or a cron job of root's started it), and that manager
     # stopping ends the scope. A second try gets a scope of its own.
     if stop is None and rc is not None and rc < 0:
-        retried = f"killed by {signal_name(rc)}"
+        retried = f"killed by {util.signal_name(rc)}"
         rc, err, stop, size = into(part, cmd, limit)
     if stop is None and rc == 0 and size > 0:
         os.rename(part, dest)
@@ -279,7 +270,7 @@ def dump_one(t, dest, limit):
     if stop:
         why = stop
     elif rc < 0:
-        why = f"killed by {signal_name(rc)}" + (" (twice)" if retried else "")
+        why = f"killed by {util.signal_name(rc)}" + (" (twice)" if retried else "")
     elif rc:
         why = f"exit {rc}"
     else:

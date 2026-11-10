@@ -85,9 +85,11 @@ class UpgradeTest(unittest.TestCase):
     def setUp(self):
         temp_state(self)
         self.enterContext(contextlib.redirect_stdout(io.StringIO()))
-        self.fake, self.busy, self.notes = Fake(), [], []
+        self.fake, self.busy, self.notes, self.booted = Fake(), [], [], 0     # booted long before any wait
+        self.boot = "boot-1"
         for name, val in (("run", self.fake), ("busy", lambda: list(self.busy)), ("ask", lambda q: False),
-                          ("notify", lambda *a: self.notes.append(a))):
+                          ("notify", lambda *a: self.notes.append(a)), ("boot_time", lambda: self.booted),
+                          ("boot_id", lambda: self.boot)):
             self.addCleanup(setattr, up.util, name, getattr(up.util, name))
             setattr(up.util, name, val)
 
@@ -332,6 +334,116 @@ class AmazonLinuxUpgradeTest(unittest.TestCase):
         st["reboot"]["needed_since"] -= 8 * 86400
         up.save_state(st)
         self.assertEqual(up.verdict(cfg(**self.AL))[0], 1)    # a week later: the check warns
+
+    def test_a_reboot_by_hand_ends_the_wait(self):
+        # upgrade.reboot = never: the person reboots when they choose, and from then on the check
+        # mustn't say "reboot waiting" (nor warn about the days it waited) until the next night.
+        self.fake.restart = 1
+        self.assertEqual(up.do_run(cfg(**self.AL), now=NIGHT), 0)
+        st = up.load_state()
+        st["reboot"]["needed_since"] -= 8 * 86400
+        up.save_state(st)
+        self.assertEqual(up.verdict(cfg(**self.AL))[0], 1)
+        self.booted, self.boot = int(time.time()) - 60, "boot-2"   # then the box booted
+        rc, line = up.verdict(cfg(**self.AL))
+        self.assertEqual(rc, 0)
+        self.assertNotIn("reboot waiting", line)
+        self.assertIn(f"; rebooted {datetime.datetime.fromtimestamp(self.booted):%d %b %H:%M}", line)
+        self.assertNotIn("→", line)                            # not hb's reboot: it can't name the kernels
+        # a run after that boot still finds a reboot needed: a new wait, counted from now
+        up.do_run(cfg(**self.AL), now=NIGHT)
+        self.assertGreater(up.load_state()["reboot"]["needed_since"], self.booted)
+        rc, line = up.verdict(cfg(**self.AL))
+        self.assertEqual(rc, 0)
+        self.assertIn("reboot waiting, for you (upgrade.reboot = never)", line)
+
+    def test_hb_upgrade_now_reboots_and_the_check_names_the_kernels(self):
+        self.fake.restart = 1
+        up.util.ask = lambda q: True                           # sudo hb upgrade now: "reboot now?" yes
+        self.assertEqual(up.do_run(cfg(**self.AL), manual=True), 0)
+        self.assertTrue(self.fake.did("systemctl", "reboot"))
+        self.assertIn("reboot waiting", up.verdict(cfg(**self.AL))[1])   # until the box is back up
+        self.booted, self.boot = int(time.time()) + 30, "boot-2"
+        rc, line = up.verdict(cfg(**self.AL))
+        self.assertEqual(rc, 0)
+        self.assertIn(f"({os.uname().release} → {os.uname().release})", line)
+
+    def test_a_clock_step_is_no_reboot(self):
+        # The boot time in /proc/stat is the clock minus the uptime: a step forward after the wait was
+        # recorded (chrony's, early after a boot) moves it past the wait. The boot id stays.
+        self.fake.restart = 1
+        self.booted = int(time.time()) - 60
+        up.do_run(cfg(**self.AL), now=NIGHT)
+        since = up.load_state()["reboot"]["needed_since"]
+        self.booted = since + 120                              # the clock stepped 2 minutes forward
+        rc, line = up.verdict(cfg(**self.AL))
+        self.assertEqual(rc, 0)
+        self.assertIn("reboot waiting, for you", line)
+        self.assertNotIn("rebooted", line)
+        up.do_run(cfg(**self.AL), now=NIGHT)
+        self.assertEqual(up.load_state()["reboot"]["needed_since"], since)   # the same wait: its deadlines stand
+
+    def test_a_wait_recorded_before_hb_kept_the_boot_id(self):
+        # State an older hb wrote has no boot id beside the wait: the boot time decides, as it did.
+        self.fake.restart = 1
+        up.do_run(cfg(**self.AL), now=NIGHT)
+        st = up.load_state()
+        del st["reboot"]["needed_boot"]
+        st["reboot"]["needed_since"] -= 3600                    # recorded an hour ago
+        since = st["reboot"]["needed_since"]
+        up.save_state(st)
+        self.assertIn("reboot waiting", up.verdict(cfg(**self.AL))[1])        # booted before it: same boot
+        up.do_run(cfg(**self.AL), now=NIGHT)
+        st = up.load_state()
+        self.assertEqual((st["reboot"]["needed_since"], st["reboot"]["needed_boot"]), (since, "boot-1"))
+        del st["reboot"]["needed_boot"]
+        up.save_state(st)
+        self.booted, self.boot = since + 60, "boot-2"          # booted after it
+        self.assertIn("; rebooted ", up.verdict(cfg(**self.AL))[1])
+        up.do_run(cfg(**self.AL), now=NIGHT)
+        st = up.load_state()
+        self.assertGreater(st["reboot"]["needed_since"], self.booted)          # a new wait, in this boot
+        self.assertEqual(st["reboot"]["needed_boot"], "boot-2")
+        self.boot = ""                                          # an id that can't be read: the boot time decides
+        self.assertIn("reboot waiting", up.verdict(cfg(**self.AL))[1])
+
+    def test_an_unreadable_id_keeps_the_one_kept(self):
+        # A run that can't read the id keeps the wait by its time, and mustn't drop the id it has:
+        # without it, a later clock step would fake a reboot again.
+        self.fake.restart = 1
+        up.do_run(cfg(**self.AL), now=NIGHT)
+        since = up.load_state()["reboot"]["needed_since"]
+        self.boot = ""
+        up.do_run(cfg(**self.AL), now=NIGHT)
+        self.assertEqual(up.load_state()["reboot"]["needed_boot"], "boot-1")
+        self.boot, self.booted = "boot-1", since + 120          # readable again, and the clock stepped
+        rc, line = up.verdict(cfg(**self.AL))
+        self.assertIn("reboot waiting", line)
+        up.do_run(cfg(**self.AL), now=NIGHT)
+        self.assertEqual(up.load_state()["reboot"]["needed_since"], since)
+
+    def test_a_new_wait_with_an_unreadable_id_drops_the_old_boots(self):
+        self.fake.restart = 1
+        up.do_run(cfg(**self.AL), now=NIGHT)
+        st = up.load_state()
+        st["reboot"]["needed_since"] -= 3600
+        up.save_state(st)
+        self.boot, self.booted = "", int(time.time()) - 600     # rebooted since; the id can't be read
+        up.do_run(cfg(**self.AL), now=NIGHT)
+        r = up.load_state()["reboot"]
+        self.assertGreater(r["needed_since"], self.booted)      # a new wait
+        self.assertEqual(r["needed_boot"], "")                  # not the last boot's id
+        self.boot = "boot-2"                                    # readable again: still this boot's wait
+        self.assertIn("reboot waiting", up.verdict(cfg(**self.AL))[1])
+
+    def test_no_reboot_needed_forgets_the_wait(self):
+        self.fake.restart = 1
+        up.do_run(cfg(**self.AL), now=NIGHT)
+        self.fake.restart = 0
+        up.do_run(cfg(**self.AL), now=NIGHT)
+        r = up.load_state()["reboot"]
+        self.assertNotIn("needed_since", r)
+        self.assertNotIn("needed_boot", r)
 
     SSHD = [{"packages": ["openssh-server"], "test": ["/usr/sbin/sshd", "-t"], "unit": "sshd"}]
 
@@ -589,9 +701,27 @@ class BusyChecksTest(unittest.TestCase):
         self.assertEqual(self.run_check("tmux", HB_TMUX_DIR=d), (1, "tmux session agent runs sleep"))
 
 
+class BootTimeTest(unittest.TestCase):
+    def test_boot_time_is_in_the_past(self):
+        self.assertTrue(0 < up.util.boot_time() <= time.time())
+
+    def test_boot_id_is_this_boots(self):
+        b = up.util.boot_id()
+        self.assertRegex(b, r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+        self.assertEqual(up.util.boot_id(), b)
+        self.assertTrue(up.util.in_this_boot(0, b))             # the id decides, whatever the time
+        self.assertFalse(up.util.in_this_boot(time.time(), "00000000-0000-0000-0000-000000000000"))
+        self.assertTrue(up.util.in_this_boot(time.time(), None))
+        self.assertFalse(up.util.in_this_boot(0, None))
+
+
 class DigestTest(unittest.TestCase):
     def setUp(self):
         self.state = temp_state(self)
+        for name in ("boot_time", "boot_id"):
+            self.addCleanup(setattr, digest.util, name, getattr(digest.util, name))
+        digest.util.boot_time = lambda: 0                      # booted long before the reboot began waiting
+        digest.util.boot_id = lambda: "boot-1"
         now = time.time()
         with open(os.path.join(self.state, "status.json"), "w") as f:
             json.dump({"ts": now, "checks": {"backup": {"level": "ok", "detail": "ok: last backup 3 h ago"},
@@ -601,8 +731,8 @@ class DigestTest(unittest.TestCase):
         os.makedirs(os.path.join(self.state, "upgrade"))
         with open(os.path.join(self.state, "upgrade", "state.json"), "w") as f:
             json.dump({"dnf": {"at": now - 3600, "rc": 0, "changed": ["bash.x86_64", "kernel-core.x86_64"]},
-                       "reboot": {"needed_since": now - 8 * 86400, "busy": "tmux session web runs claude",
-                                  "why": "kernel 7.2.14 is installed"}}, f)
+                       "reboot": {"needed_since": now - 8 * 86400, "needed_boot": "boot-1",
+                                  "busy": "tmux session web runs claude", "why": "kernel 7.2.14 is installed"}}, f)
 
     def test_compose(self):
         yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
@@ -619,6 +749,31 @@ class DigestTest(unittest.TestCase):
         self.assertIn(f"reminder: {yesterday}: clean.dry_run = false", banner)
         stale = status.render({"ts": time.time(), "checks": {}}, [], {"ts": time.time() - 2 * 86400, "short": "x"})
         self.assertNotIn("last night", stale)
+
+    def test_a_boot_since_ends_the_wait(self):
+        digest.util.boot_time = lambda: time.time() - 60     # rebooted by hand after the night's run
+        digest.util.boot_id = lambda: "boot-2"
+        text, short, _ = digest.compose({"digest": {"reminders": []}})
+        self.assertIn("upgrade: 2 packages, new kernel", short)
+        self.assertNotIn("reboot waiting", short)
+        self.assertNotIn("A REBOOT HAS WAITED", text)
+
+    def test_a_clock_step_is_no_reboot(self):
+        digest.util.boot_time = lambda: time.time() - 60     # the clock stepped: the boot time moved, the id didn't
+        text, short, _ = digest.compose({"digest": {"reminders": []}})
+        self.assertIn("reboot waiting 8 days", short)
+        self.assertIn("A REBOOT HAS WAITED", text)
+
+    def test_a_wait_recorded_before_hb_kept_the_boot_id(self):
+        path = os.path.join(self.state, "upgrade", "state.json")
+        with open(path) as f:
+            st = json.load(f)
+        del st["reboot"]["needed_boot"]
+        with open(path, "w") as f:
+            json.dump(st, f)
+        self.assertIn("reboot waiting 8 days", digest.compose({"digest": {"reminders": []}})[1])
+        digest.util.boot_time = lambda: time.time() - 60     # the boot time decides
+        self.assertNotIn("reboot waiting", digest.compose({"digest": {"reminders": []}})[1])
 
     def test_drift_and_disk_scan(self):
         now = time.time()

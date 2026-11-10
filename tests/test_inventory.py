@@ -111,6 +111,46 @@ def dump(root, files):
         write(os.path.join(root, name), text if isinstance(text, str) else json.dumps({"items": text}))
 
 
+def self_killing(kills):
+    """A command that SIGTERMs itself on its first `kills` runs, then answers; and its run counter."""
+    n = os.path.join(tempfile.mkdtemp(), "runs")
+    return ["sh", "-c", f'c=$(cat {n} 2>/dev/null || echo 0); echo $((c + 1)) > {n}; '
+                        f'[ "$c" -lt {kills} ] && kill -TERM $$; echo answer'], n
+
+
+def runs(n):
+    with open(n) as f:
+        return int(f.read())
+
+
+class ReadAgainTest(unittest.TestCase):
+    """snap's scope for microk8s and kubectl ends when root's user manager stops (SIGTERM); the
+    state dump only reads, so a command a signal ended runs once more."""
+
+    def test_a_command_a_signal_ended_runs_once_more(self):
+        cmd, n = self_killing(1)
+        self.assertEqual(inventory.sh(*cmd), "answer\n")
+        self.assertEqual(runs(n), 2)
+
+    def test_killed_twice_says_so(self):
+        cmd, n = self_killing(2)
+        with self.assertRaises(RuntimeError) as e:
+            inventory.sh(*cmd)
+        self.assertTrue(str(e.exception).endswith(": killed by SIGTERM (twice)"), str(e.exception))
+        self.assertEqual(runs(n), 2)
+
+    def test_hbs_own_timeout_and_an_exit_code_run_once(self):
+        n = os.path.join(tempfile.mkdtemp(), "runs")
+        with self.assertRaises(RuntimeError) as e:
+            inventory.sh("sh", "-c", f"echo 1 >> {n}; sleep 5", timeout=1)
+        self.assertIn(": exit 124: sh: timed out after 1s", str(e.exception))
+        with self.assertRaises(RuntimeError) as e:
+            inventory.sh("sh", "-c", f"echo 1 >> {n}; exit 3")
+        self.assertTrue(str(e.exception).endswith(": exit 3"), str(e.exception))   # no stderr: no colon after
+        with open(n) as f:
+            self.assertEqual(f.read(), "1\n1\n")
+
+
 class PiecesTest(unittest.TestCase):
     def test_listening(self):
         self.assertEqual(inventory.listening_lines(SS), [
@@ -143,6 +183,19 @@ class PiecesTest(unittest.TestCase):
         self.assertEqual(d["wg target"], "DROP")
         self.assertEqual(d["wg rich rules"], "")
 
+    def test_units_user_txt(self):
+        home = tempfile.mkdtemp()
+        write(os.path.join(home, ".config/systemd/user/default.target.wants/x.service"), "")
+        write(os.path.join(home, ".config/systemd/user/x.service"), "[Service]\nExecStart=/bin/true\n")
+        self.addCleanup(setattr, inventory, "sh", inventory.sh)
+        inventory.sh = lambda *cmd, **kw: ("dbus.socket enabled enabled\nsystemd-tmpfiles-clean.timer enabled enabled\n"
+                                           if cmd[:2] == ("systemctl", "--global") else "")
+        self.assertEqual(inventory.units_user_txt(home),
+                         "dbus.socket\nsystemd-tmpfiles-clean.timer\n"
+                         f"{home}/.config/systemd/user/x.service\n"
+                         f"{home}/.config/systemd/user/default.target.wants/x.service\n")
+        self.assertEqual(inventory.units_user_txt(tempfile.mkdtemp()), "dbus.socket\nsystemd-tmpfiles-clean.timer\n")
+
 
 class DriftTest(unittest.TestCase):
     def setUp(self):
@@ -154,6 +207,7 @@ class DriftTest(unittest.TestCase):
             "system.txt": "2026-11-01T04:00:00+0100\nLinux box 7.2.13 #1 x86_64\nPRETTY_NAME=\"Fedora 44\"\n",
             "packages.txt": "git\nrestic\n",
             "units-enabled.txt": "sshd.service enabled disabled\n",
+            "units-user.txt": "dbus.socket\n",
             "snaps.txt": "Name Version Rev Tracking Publisher Notes\nmicrok8s v1.35.6 9072 1.35/stable canonical** classic,held\n",
             "groups.txt": "wheel 10 alice\n",
             "k8s/objects.json": [dep, obj("Secret", "tls", "shop", data={"k": "old"})],
@@ -165,6 +219,7 @@ class DriftTest(unittest.TestCase):
             "system.txt": "2026-11-02T04:00:00+0100\nLinux box 7.2.14 #1 x86_64\nPRETTY_NAME=\"Fedora 44\"\n",
             "packages.txt": "git\nnmap\n",
             "units-enabled.txt": "sshd.service enabled disabled\nevil.service enabled disabled\n",
+            "units-user.txt": "dbus.socket\n/root/.config/systemd/user/default.target.wants/evil.service\n",
             "snaps.txt": "Name Version Rev Tracking Publisher Notes\nmicrok8s v1.35.7 9100 1.35/stable canonical** classic\n",
             "groups.txt": "wheel 10 alice,mallory\n",
             "listening.txt": "tcp 0.0.0.0:4444 nc\n",              # new piece: not compared
@@ -186,6 +241,7 @@ class DriftTest(unittest.TestCase):
             "snap changed: microk8s: v1.35.6 1.35/stable classic,held → v1.35.7 1.35/stable classic",
             "group changed: wheel: 10 alice → 10 alice,mallory",
             "unit enabled: evil.service",
+            "user unit added: /root/.config/systemd/user/default.target.wants/evil.service",
             "k8s added: shop/EndpointSlice/host",
             "k8s changed: shop/Secret/tls",
         ])
@@ -194,6 +250,7 @@ class DriftTest(unittest.TestCase):
             "snap changed: microk8s: v1.35.6 1.35/stable classic,held → v1.35.7 1.35/stable classic",
             "group changed: wheel: 10 alice → 10 alice,mallory",
             "unit enabled: evil.service",
+            "user unit added: /root/.config/systemd/user/default.target.wants/evil.service",
             "k8s added: shop/EndpointSlice/host",
         ])
 

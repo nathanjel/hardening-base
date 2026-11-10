@@ -499,11 +499,18 @@ def do_run(cfg, manual=False, now=None):
         r.pop("unknown", None)
     if not why:
         r.pop("needed_since", None)
+        r.pop("needed_boot", None)
         r.pop("busy", None)
         save_state(st)
         log(f"can't tell whether a reboot is needed: {unknown}" if unknown else "no reboot needed")
         return 2 if failed else 0
-    r.setdefault("needed_since", int(time.time()))
+    boot = util.boot_id()                                  # read once: it decides, and it is kept
+    if not (r.get("needed_since") and util.in_this_boot(r["needed_since"], r.get("needed_boot"), boot)):
+        r["needed_since"] = int(time.time())               # a boot answered the last wait: this one is new
+        r["needed_boot"] = boot                            # "" when unreadable: then the boot time decides
+    elif boot:
+        r["needed_boot"] = boot                            # the same id, or the first for a wait from before
+                                                           # hb kept it; unreadable, the one kept stays
     r["why"] = why
     if failed and not manual:
         r.pop("busy", None)
@@ -621,6 +628,10 @@ def verdict(cfg):
     r = st.get("reboot", {})
     if r.get("unknown") and not r.get("needed_since"):
         return 1, f"warn: {summary(st)}; can't tell whether a reboot is needed: {r['unknown']}"
+    if r.get("needed_since") and not util.in_this_boot(r["needed_since"], r.get("needed_boot")):
+        how = (f" ({r.get('from_kernel', '?')} → {os.uname().release})"   # rebooted since: by hb, or by hand
+               if r.get("rebooted_at", 0) >= r["needed_since"] else "")
+        return 0, f"ok: {summary(st)}; rebooted {datetime.datetime.fromtimestamp(util.boot_time()):%d %b %H:%M}{how}"
     if r.get("needed_since"):
         days = (time.time() - r["needed_since"]) / 86400
         wait = f"reboot waiting {days:.0f} days" if days >= 1 else "reboot waiting"
