@@ -3,8 +3,9 @@
 # service-account tokens out of pods that never talk to the Kubernetes API,
 # stop certificate reissues that restart every container, keep the
 # cluster agent (for joining nodes, unused on one box) on localhost, keep
-# microk8s's daemons retrying after a failure instead of giving up, and keep the
-# microk8s and kubectl commands root runs from ending with someone else's session.
+# microk8s's daemons retrying after a failure instead of giving up, keep the
+# microk8s and kubectl commands root runs from ending with someone else's session,
+# and keep pods away from the instance metadata service (and the instance role).
 #
 #   hb k8s status        one line per item
 #   hb k8s plan          what apply would change (changes nothing)
@@ -40,24 +41,51 @@
 #                  where systemd-oomd watches user@.service, as it may end what runs
 #                  there under memory pressure. Never undone here: loginctl
 #                  disable-linger root stops the manager, ending what runs in it.
+#   metadata       nft table inet hb_metadata drops what pods and containers send to the
+#                  instance metadata service (169.254.169.254, fd00:ec2::254): what the
+#                  host forwards, and what host-network pods send (matched by the cgroup the
+#                  kubelet puts every pod in, kubepods). So no pod gets the instance role's
+#                  credentials, whatever the hop limit; the host's own programs still reach
+#                  it. hb-metadata-block.service loads it in one transaction before containerd
+#                  and kubelite start, making the cgroup if the kubelet hasn't yet, and again
+#                  whenever kubelite restarts. It fails closed: drop-ins let containerd and
+#                  kubelite start only while the table is loaded. nftables.service no longer
+#                  flushes the whole ruleset (on stop, reload, or the restart a package update
+#                  does); it loads its file together with hb's table in one transaction, and
+#                  that file must change nothing (hb loads it into a network namespace of its
+#                  own, seeded with this node's tables, to see). A hand-run `nft flush
+#                  ruleset` still drops the table; the check shows it. Not with the systemd
+#                  cgroup driver (hb can't make its cgroup first). Not covered: host-network
+#                  containers outside kubepods (docker run --network host), and a proxy on
+#                  the host that fetches URLs for pods. Undone by hand: disable the unit,
+#                  remove the three drop-ins, daemon-reload, nft delete table inet hb_metadata.
+#   metadata_live  a pod's request to the metadata service is dropped by hb's rule: from the
+#                  network of a pod running here (nsenter), curl (no proxy, no curlrc) opens a
+#                  connection to it from a port picked for this one try; it must time out while
+#                  a counter hb puts in its chain for just that address and port (and takes out
+#                  again) rises. One try at a time. An answer means a pod can reach the role
+#                  (broken: an eBPF dataplane routing past the host's hooks, say); anything else
+#                  (a refusal, a timeout without the count) isn't proof. It never gets a token,
+#                  so it fetches no credentials. (fix: wait for a pod, up to 60 s)
 #
 # Config ([k8s] in hb.toml): nodeport_addresses, token_off_namespaces,
-# freeze_certs, cluster_agent_bind, keep_restarting, linger_root.
+# freeze_certs, cluster_agent_bind, keep_restarting, linger_root, block_metadata.
 set -u
 source "$(dirname "$(readlink -f "$0")")/../lib/hb.sh"
 need_root
 need_config
 
 [ "$(cfg k8s.flavour)" = microk8s ] || die "only microk8s is supported"
-command -v /snap/bin/microk8s >/dev/null || { echo "ok: microk8s not installed"; exit 0; }
+MK="${HB_MICROK8S:-/snap/bin/microk8s}"
+command -v "$MK" >/dev/null || { echo "ok: microk8s not installed"; exit 0; }
 
-ITEMS=(nodeport nodeport_live tokens tokens_live certs agent agent_live restart linger)
-SNAPDATA=/var/snap/microk8s/current
+ITEMS=(nodeport nodeport_live tokens tokens_live certs agent agent_live restart linger metadata metadata_live)
+SNAPDATA="${HB_SNAPDATA:-/var/snap/microk8s/current}"
 ARGS=$SNAPDATA/args/kube-proxy
 AGENT_ARGS=$SNAPDATA/args/cluster-agent
 NO_REISSUE=$SNAPDATA/var/lock/no-cert-reissue
 SERVER_CRT=$SNAPDATA/certs/server.crt
-k() { /snap/bin/microk8s kubectl "$@"; }
+k() { "$MK" kubectl "$@"; }
 
 mapfile -t NODEPORT_ADDRS < <(cfg k8s.nodeport_addresses)
 mapfile -t TOKEN_OFF_NS < <(cfg k8s.token_off_namespaces)
@@ -68,6 +96,11 @@ mapfile -t KEEP_RESTARTING < <(cfg k8s.keep_restarting)
 UNITDIR="${HB_SYSTEMD_DIR:-/etc/systemd/system}"
 LINGER="$(cfg k8s.linger_root)"
 LINGER_DIR="${HB_LINGER_DIR:-/var/lib/systemd/linger}"
+METADATA="$(cfg k8s.block_metadata)"
+NFT_DIR="${HB_NFT_DIR:-/etc/nftables}"
+CGROUP_ROOT="${HB_CGROUP_ROOT:-/sys/fs/cgroup}"
+MD_WAIT="${HB_MD_WAIT:-60}"     # seconds metadata_live's fix waits, at most, for a pod to try from
+PROC="${HB_PROC:-/proc}"
 RESTART_SEC=10
 WARN_DAYS="$(cfg health.cert_warn_days)"
 
@@ -300,6 +333,277 @@ fix_linger() {
     sleep 1
   done
   log "  root's user manager didn't start within 30 s (systemctl status user@0.service)"; return 1
+}
+
+# --- metadata -------------------------------------------------------------------
+MD_UNIT=hb-metadata-block.service
+MD_RULES=$NFT_DIR/hb-metadata.nft
+MD_SERVICE_LOAD=$NFT_DIR/hb-nftables-service.nft   # what nftables.service loads instead of its file alone
+MD_CG=kubepods        # where the kubelet puts every pod with the cgroupfs driver (microk8s's)
+MD_V4=169.254.169.254
+MD_V6=fd00:ec2::254
+MD_NFT_DROPIN=$UNITDIR/nftables.service.d/10-hb-keep-tables.conf
+md_gate_dropin() { echo "$UNITDIR/snap.microk8s.daemon-$1.service.d/10-hb-metadata.conf"; }
+
+md_rules_text() {
+  printf '%s\n' "# Managed by hb k8s (k8s.block_metadata); changes made here are overwritten." \
+    "# One transaction: it replaces the whole table, or leaves the one loaded before if it fails." \
+    "# What the host forwards comes from pods and containers; host-network pods send from the host" \
+    "# itself and are matched by the cgroup the kubelet puts every pod in." \
+    "table inet hb_metadata" "delete table inet hb_metadata" "table inet hb_metadata {" \
+    "	chain forward {" "		type filter hook forward priority -10; policy accept;" \
+    "		ip daddr $MD_V4 counter drop comment \"pods and containers\"" \
+    "		ip6 daddr $MD_V6 counter drop comment \"pods and containers\"" "	}" \
+    "	chain output {" "		type filter hook output priority -10; policy accept;" \
+    "		ip daddr $MD_V4 socket cgroupv2 level 1 \"$MD_CG\" counter drop comment \"host-network pods\"" \
+    "		ip6 daddr $MD_V6 socket cgroupv2 level 1 \"$MD_CG\" counter drop comment \"host-network pods\"" \
+    "	}" "}"
+}
+md_unit_text() {
+  printf '%s\n' "# Managed by hb k8s (k8s.block_metadata); changes made here are overwritten." \
+    "[Unit]" "Description=hb: keep pods and containers away from the instance metadata service" \
+    "# Loaded before containerd and kubelite start (their hb drop-ins wait for it), so before any" \
+    "# pod runs, and again whenever kubelite or nftables.service restarts." \
+    "After=nftables.service" \
+    "Before=snap.microk8s.daemon-containerd.service snap.microk8s.daemon-kubelite.service" \
+    "PartOf=nftables.service snap.microk8s.daemon-kubelite.service" "" \
+    "[Service]" "Type=oneshot" "RemainAfterExit=yes" \
+    "# The rules name the pods' cgroup, so it has to exist first; the kubelet uses the one it finds." \
+    "ExecStart=/usr/bin/mkdir -p $CGROUP_ROOT/$MD_CG" \
+    "ExecStart=/usr/sbin/nft -f $MD_RULES" \
+    "# Nothing takes the table away on stop: stopping kubelite leaves its containers running." "" \
+    "[Install]" "WantedBy=multi-user.target"
+}
+md_gate_text() {
+  printf '%s\n' "# Managed by hb k8s (k8s.block_metadata); changes made here are overwritten." \
+    "# Fails closed: this starts only while hb's metadata block is loaded, so no container runs without it." \
+    "[Unit]" "Wants=$MD_UNIT" "After=$MD_UNIT" "" "[Service]" \
+    "ExecStartPre=/bin/sh -c '/usr/sbin/nft list chain inet hb_metadata output >/dev/null'"
+}
+# the file nftables.service loads: nft -f FILE in its own unit file's ExecStart (not the one
+# hb's drop-in puts in its place)
+nft_service_file() {
+  local unit; unit="$(systemctl show nftables.service -p FragmentPath --value 2>/dev/null)"
+  [ -f "$unit" ] && sed -nE 's/^ExecStart=.*\/nft -f (\/[^ ]+).*/\1/p' "$unit" | head -1
+}
+nft_service_present() { [ "$(systemctl show nftables.service -p LoadState --value 2>/dev/null)" = loaded ]; }
+md_service_load_text() {   # $1 = nftables.service's file
+  printf '%s\n' "# Managed by hb k8s (k8s.block_metadata); changes made here are overwritten." \
+    "# What nftables.service loads: its own file, then hb's table, in one transaction." \
+    "include \"$1\"" "include \"$MD_RULES\""
+}
+md_nft_dropin_text() {
+  printf '%s\n' "# Managed by hb k8s (k8s.block_metadata); changes made here are overwritten." \
+    "# On a Kubernetes node kube-proxy, the CNI and hb keep tables of their own: this service never" \
+    "# flushes the whole ruleset, and it loads its file together with hb's table in one transaction." \
+    "[Service]" "ExecStartPre=/usr/bin/mkdir -p $CGROUP_ROOT/$MD_CG" \
+    "ExecStart=" "ExecStart=/usr/sbin/nft -f $MD_SERVICE_LOAD" \
+    "ExecReload=" "ExecReload=/usr/sbin/nft -f $MD_SERVICE_LOAD" "ExecStop="
+}
+# md_service_file_changes FILE — load FILE in a network namespace of its own, seeded with this
+# node's tables (a rule in each), and print what that changed; nothing when it changes nothing.
+# Includes and several commands on a line count, as nft itself runs them.
+md_service_file_changes() {
+  local seed
+  seed="$( { nft list tables 2>/dev/null; echo "table inet hb_metadata"; } | sort -u \
+    | awk 'NF == 3 && $1 == "table" {printf "add table %s %s\nadd chain %s %s hb_seen\nadd rule %s %s hb_seen counter\n", $2, $3, $2, $3, $2, $3}')"
+  unshare --net -- bash -c '
+    printf "%s\n" "$1" | nft -f /dev/stdin 2>/dev/null || { echo "a scratch ruleset could not be made"; exit; }
+    before="$(nft list ruleset)"
+    out="$(nft -f "$2" 2>&1)" || { echo "it does not load: $(head -1 <<<"$out")"; exit; }
+    after="$(nft list ruleset)"
+    [ "$before" = "$after" ] || diff <(echo "$before") <(echo "$after") | grep -E "^[<>]" | head -3 | tr "\t\n" "  "
+  ' _ "$seed" "$1" 2>&1
+}
+# effective_cmds UNIT SETTING — the commands systemd runs for SETTING (ExecStart, ExecStop, ...)
+# after every drop-in, from its own D-Bus property, one per line as JSON: [path, [argv...],
+# ignore_errors]. Each argument stays one (systemctl show joins them with spaces, so a command
+# quoted wrongly looks the same there); ignore_errors is the - prefix, a path unlike argv[0] the @.
+# It fails (and prints nothing to compare) unless every step worked: the unit's object, the
+# property read, and a reply of the type systemd serves commands in. A failed read is never "none".
+effective_cmds() {
+  local reply obj
+  reply="$(busctl --json=short call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager \
+             LoadUnit s "$1" 2>/dev/null)" || return 1
+  obj="$(python3 -I -c 'import json, sys
+d = json.loads(sys.stdin.read())
+if d.get("type") != "o" or len(d.get("data", [])) != 1: sys.exit(1)
+print(d["data"][0])' <<<"$reply" 2>/dev/null)" || return 1
+  reply="$(busctl --json=short get-property org.freedesktop.systemd1 "$obj" org.freedesktop.systemd1.Service "$2" 2>/dev/null)" || return 1
+  python3 -I -c 'import json, sys
+d = json.loads(sys.stdin.read())
+if d.get("type") != "a(sasbttttuii)" or not isinstance(d.get("data"), list): sys.exit(1)
+for c in d["data"]: print(json.dumps([c[0], c[1], c[2]]))' <<<"$reply" 2>/dev/null
+}
+# md_cmd PATH ARG... — that command as effective_cmds shows it: its own path, failures not ignored
+md_cmd() { python3 -I -c 'import json, sys; print(json.dumps([sys.argv[1], sys.argv[1:], False]))' "$@"; }
+# md_runs UNIT SETTING=COMMANDS... — each SETTING runs exactly COMMANDS (md_cmd lines; empty: none)
+md_runs() {
+  local u="$1" a out; shift
+  for a in "$@"; do
+    out="$(effective_cmds "$u" "${a%%=*}")" || return 1        # read it, or it isn't known to be safe
+    [ "$out" = "${a#*=}" ] || return 1
+  done
+}
+md_orders() { systemctl show "$1" -p "$2" --value 2>/dev/null | tr ' ' '\n' | grep -qxF "$MD_UNIT"; }
+md_gate_cmd() { md_cmd /bin/sh -c '/usr/sbin/nft list chain inet hb_metadata output >/dev/null'; }
+# md_live_ok LISTING — the loaded table drops both addresses in both chains, the output rules
+# naming the pods' cgroup (nft prints the cgroup's id once it is gone)
+md_live_ok() {
+  awk -v cg="\"$MD_CG\"" -v v4="ip daddr $MD_V4 " -v v6="ip6 daddr $MD_V6 " '
+    /^[[:space:]]*chain / {c = $2}
+    c == "forward" && / drop/ && index($0, v4) {f4 = 1}
+    c == "forward" && / drop/ && index($0, v6) {f6 = 1}
+    c == "output" && / drop/ && index($0, v4 "socket cgroupv2 level 1 " cg " ") {o4 = 1}
+    c == "output" && / drop/ && index($0, v6 "socket cgroupv2 level 1 " cg " ") {o6 = 1}
+    END {exit !(f4 && f6 && o4 && o6)}' <<<"$1"
+}
+md_drops() { grep ' drop' <<<"$1" | grep -oE 'packets [0-9]+' | awk '{n += $2} END {print n + 0}'; }
+
+chk_metadata() {
+  [ "$METADATA" = true ] || { echo "not managed"; return 0; }
+  command -v nft >/dev/null || { echo "needs nft (dnf install nftables)"; return 2; }
+  command -v busctl >/dev/null || { echo "needs busctl (systemd's) to read what systemd will run"; return 2; }
+  [ -e "$CGROUP_ROOT/cgroup.controllers" ] || { echo "needs cgroup v2: host-network pods are matched by their cgroup"; return 2; }
+  if [ -d "$CGROUP_ROOT/kubepods.slice" ]; then
+    echo "the kubelet uses the systemd cgroup driver (kubepods.slice), whose cgroup hb can't make before the kubelet does"; return 2
+  fi
+  local conf="" changes
+  if nft_service_present; then
+    conf="$(nft_service_file)"
+    [ -n "$conf" ] || { echo "can't tell which file nftables.service loads"; return 2; }
+    changes="$(md_service_file_changes "$conf")"
+    if [ -n "$changes" ]; then
+      echo "nftables.service's file $conf changes the ruleset ($changes): on this node keep firewall rules in a unit of their own, as microk8s-management-firewall does, and leave that file without rules"
+      return 2
+    fi
+  fi
+  # the files hb writes, and what systemd will run once every drop-in (a later one too) is applied
+  local live d u cmds todo=() none="ExecStartPre= ExecStartPost= ExecStop= ExecStopPost= ExecCondition= ExecReload="
+  cmp -s "$MD_RULES" <(md_rules_text) || todo+=("rule file")
+  # shellcheck disable=SC2086
+  { cmp -s "$UNITDIR/$MD_UNIT" <(md_unit_text) &&
+    md_runs "$MD_UNIT" "ExecStart=$(md_cmd /usr/bin/mkdir -p "$CGROUP_ROOT/$MD_CG"; md_cmd /usr/sbin/nft -f "$MD_RULES")" $none; } \
+    || todo+=("$MD_UNIT")
+  [ "$(systemctl is-enabled "$MD_UNIT" 2>/dev/null)" = enabled ] || todo+=("not loaded at boot")
+  for d in containerd kubelite; do
+    u="snap.microk8s.daemon-$d.service"
+    { cmp -s "$(md_gate_dropin "$d")" <(md_gate_text) && cmds="$(effective_cmds "$u" ExecStartPre)" && grep -qxF "$(md_gate_cmd)" <<<"$cmds" &&
+      md_orders "$u" After && md_orders "$u" Wants; } || todo+=("$d may start without it")
+  done
+  if [ -n "$conf" ]; then
+    { cmp -s "$MD_SERVICE_LOAD" <(md_service_load_text "$conf") && cmp -s "$MD_NFT_DROPIN" <(md_nft_dropin_text) &&
+      md_runs nftables.service "ExecStart=$(md_cmd /usr/sbin/nft -f "$MD_SERVICE_LOAD")" "ExecReload=$(md_cmd /usr/sbin/nft -f "$MD_SERVICE_LOAD")" \
+        "ExecStartPre=$(md_cmd /usr/bin/mkdir -p "$CGROUP_ROOT/$MD_CG")" ExecStartPost= ExecStop= ExecStopPost= ExecCondition=; } \
+      || todo+=("nftables.service may flush every table or load without hb's")
+  fi
+  live="$(nft list table inet hb_metadata 2>/dev/null)"
+  if ! md_live_ok "$live"; then
+    if [ -z "$live" ]; then todo=("pods can reach the instance metadata service, and with it the instance role" "${todo[@]}")
+    else todo=("the loaded rules don't block it all (a pods' cgroup that was made again?)" "${todo[@]}"); fi
+  fi
+  if [ ${#todo[@]} -gt 0 ]; then local out; out="$(printf '%s; ' "${todo[@]}")"; echo "${out%; }"; return 1; fi
+  echo "pods, containers and host-network pods can't reach the instance metadata service, and containerd and kubelite start only with that in place ($(md_drops "$live") packets dropped since it was loaded)"
+}
+fix_metadata() {
+  local d conf=""
+  keep_copy "$MD_RULES"; keep_copy "$UNITDIR/$MD_UNIT"; keep_copy "$MD_NFT_DROPIN"; keep_copy "$MD_SERVICE_LOAD"
+  for d in containerd kubelite; do keep_copy "$(md_gate_dropin "$d")"; done
+  install -d -m 755 "$NFT_DIR" "$UNITDIR" && mkdir -p "$CGROUP_ROOT/$MD_CG" || return 1
+  # a rule file nft doesn't take never replaces the one in place
+  local tmp; tmp="$(mktemp "$NFT_DIR/.hb-metadata.XXXXXX")" || return 1
+  if ! { md_rules_text > "$tmp" && chmod 644 "$tmp" && nft -c -f "$tmp"; }; then
+    log "  nft doesn't accept the rules"; rm -f "$tmp"; return 1
+  fi
+  mv -f "$tmp" "$MD_RULES" || return 1
+  nft_service_present && conf="$(nft_service_file)"
+  (
+    umask 022
+    md_unit_text > "$UNITDIR/$MD_UNIT" || exit 1
+    for d in containerd kubelite; do
+      mkdir -p "$(dirname "$(md_gate_dropin "$d")")" && md_gate_text > "$(md_gate_dropin "$d")" || exit 1
+    done
+    if [ -n "$conf" ]; then
+      md_service_load_text "$conf" > "$MD_SERVICE_LOAD" && nft -c -f "$MD_SERVICE_LOAD" || exit 1
+      mkdir -p "${MD_NFT_DROPIN%/*}" && md_nft_dropin_text > "$MD_NFT_DROPIN" || exit 1
+    fi
+  ) || return 1
+  systemctl daemon-reload || return 1
+  systemctl enable "$MD_UNIT" >/dev/null 2>&1 || { log "  couldn't enable $MD_UNIT"; return 1; }
+  systemctl restart "$MD_UNIT" || { log "  $MD_UNIT didn't load the rules (systemctl status $MD_UNIT)"; return 1; }
+}
+
+# up to three pods' network namespaces on this node: "PID" of a process in each, one per namespace
+md_pod_netns() {
+  local host pid ns seen=" "
+  host="$(readlink "$PROC/1/ns/net" 2>/dev/null)"
+  find "${HB_POD_CGROUPS:-$CGROUP_ROOT/$MD_CG}" -name cgroup.procs -exec cat {} + 2>/dev/null | while read -r pid; do
+    ns="$(readlink "$PROC/$pid/ns/net" 2>/dev/null)" || continue
+    [ -n "$ns" ] && [ "$ns" != "$host" ] && [[ $seen != *" $ns "* ]] || continue
+    seen+="$ns "; echo "$pid"
+    [ "$(wc -w <<<"$seen")" -ge 3 ] && break
+  done
+}
+# md_probe PID SECONDS — try the metadata service from PID's network, within SECONDS: prints
+# "blocked" (no answer, and hb's chain saw this very try: a counter for its source address and
+# port, put in ahead of the drops for this try alone and taken out after), "answered ...", or
+# "unproven WHY". Callers hold the probe lock, so tries never overlap.
+md_probe() {
+  local pid=$1 t=$2 net="$PROC/$1/ns/net" src port token handle code rc seen curl
+  curl="$(command -v curl)"                       # found before env -i empties the environment
+  src="$(timeout 3 nsenter --net="$net" -- ip -4 -o route get "$MD_V4" 2>/dev/null | sed -nE 's/.* src ([0-9.]+).*/\1/p')"
+  [[ $src =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { echo "unproven (no route to it from there)"; return; }
+  port=$((61000 + RANDOM % 1000)) token="hb probe $$ $RANDOM"
+  nft insert rule inet hb_metadata forward ip saddr "$src" ip daddr "$MD_V4" tcp sport "$port" counter comment "\"$token\"" 2>/dev/null \
+    || { echo "unproven (couldn't put its counter in)"; return; }
+  handle="$(nft -a list chain inet hb_metadata forward 2>/dev/null | grep -F "comment \"$token\"" | sed -nE 's/.*# handle ([0-9]+).*/\1/p')"
+  code="$(timeout "$t" nsenter --net="$net" -- env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            "$curl" -q --noproxy '*' -s -o /dev/null -w '%{http_code}' --local-port "$port" \
+            --connect-timeout 2 --max-time $((t - 1)) "http://$MD_V4/latest/meta-data/" 2>/dev/null)"
+  rc=$?
+  seen="$(nft list chain inet hb_metadata forward 2>/dev/null | grep -F "comment \"$token\"" | grep -oE 'packets [0-9]+' | awk '{print $2}')"
+  [ -n "$handle" ] && nft delete rule inet hb_metadata forward handle "$handle" 2>/dev/null
+  if [ -n "$code" ] && [ "$code" != 000 ]; then echo "answered HTTP $code"; return; fi
+  case $rc in
+    52|56) echo "answered (a connection, then nothing)" ;;           # it got as far as the service
+    28) if [ "${seen:-0}" -gt 0 ]; then echo blocked; else echo "unproven (no answer, but hb's rule didn't see it)"; fi ;;
+    7) echo "unproven (refused by something else)" ;;
+    *) echo "unproven (couldn't try: exit $rc)" ;;
+  esac
+}
+chk_metadata_live() {
+  [ "$METADATA" = true ] || { echo "not managed"; return 0; }
+  local t; for t in nsenter curl ip flock; do command -v $t >/dev/null || { echo "needs $t to try from a pod"; return 2; }; done
+  nft list table inet hb_metadata >/dev/null 2>&1 || { echo "not loaded (the metadata item)"; return 1; }
+  local pids pid result left why="" tried=0 start=$SECONDS budget="${MD_BUDGET:-20}" lock
+  mapfile -t pids < <(md_pod_netns)
+  [ ${#pids[@]} -gt 0 ] || { echo "no pod runs here to try from"; return 1; }
+  # one try at a time (hb-status's check and one by hand, say); the lock goes with this shell
+  mkdir -p "$HB_STATE" && exec {lock}>"$HB_STATE/metadata-probe.lock" && flock -w "$budget" "$lock" \
+    || { echo "another try is still running"; return 1; }
+  for pid in "${pids[@]}"; do
+    left=$((budget - (SECONDS - start)))
+    [ "$left" -ge 4 ] || break                       # each try needs 2 s to connect and a little more
+    result="$(md_probe "$pid" $((left < 5 ? left : 5)))"
+    tried=$((tried + 1))
+    case "$result" in
+      blocked) echo "a pod's request to the instance metadata service was just dropped by hb's rule"; return 0 ;;
+      answered*) echo "a pod reached the instance metadata service ($result, from the network of process $pid): pods can get the instance role"; return 2 ;;
+      *) why="${result#unproven }" ;;
+    esac
+  done
+  echo "not confirmed: $tried pods tried, none dropped by hb's rule (last: $why)"; return 1
+}
+fix_metadata_live() {
+  log "  waiting up to ${MD_WAIT} s for a pod to try from"
+  local end=$((SECONDS + MD_WAIT)) left rc
+  while left=$((end - SECONDS)); [ "$left" -gt 0 ]; do
+    ( MD_BUDGET=$left chk_metadata_live >/dev/null ); rc=$?      # its own shell: the lock goes with it
+    [ $rc -eq 0 ] && return 0
+    [ $rc -eq 2 ] && return 1
+    [ $((end - SECONDS)) -gt 1 ] && sleep 1
+  done
+  return 1
 }
 
 item_main "$@"

@@ -10,6 +10,9 @@ permit_root_login = ""        # "no" to forbid root over SSH
 sysctl = []                   # "key = value"; * matches any one name, e.g.
                               # ["net.ipv4.conf.*.send_redirects = 0", "kernel.yama.ptrace_scope = 1"]
 llmnr = ""                    # "no" to switch off systemd-resolved's LLMNR responder (5355)
+x11_forwarding = ""           # "no" to switch off X11 forwarding over SSH (sshd drop-in, like permit_root_login)
+journal_max_use = ""          # e.g. "2G": the most the journal keeps on disk (journald's SystemMaxUse); a
+                              # drop-in read after hb's that sets it too belongs in remove_files
 
 [k8s]
 flavour = "microk8s"          # the only one supported
@@ -23,6 +26,11 @@ keep_restarting = []          # e.g. ["kubelite", "k8s-dqlite", "containerd"]: r
 linger_root = false           # true: root's user manager runs from boot, so a root session ending (a
                               # root cron job's, a sudo run by a service) no longer ends the microk8s and
                               # kubectl commands snap ran in it; refused where systemd-oomd watches user@
+block_metadata = false        # true (on a cloud instance): nft drops what pods, containers and host-network
+                              # pods send to the instance metadata service, so none of them gets the
+                              # instance role; the host's own programs still reach it. containerd and
+                              # kubelite start only with it in place; nftables.service stops flushing the
+                              # whole ruleset. Needs the cgroupfs driver (microk8s's)
 
 [health]
 containers = []               # docker containers that must be running

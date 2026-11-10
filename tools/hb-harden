@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # hb-harden — host settings that close doors: unwanted accounts, stray files
-# (root's keys, cloud-init sudo rules), root login over SSH, NOPASSWD audit,
-# kernel settings (sysctl) and systemd-resolved's LLMNR responder.
+# (root's keys, cloud-init sudo rules), root login and X11 forwarding over SSH,
+# NOPASSWD audit, kernel settings (sysctl), systemd-resolved's LLMNR responder and
+# how much the journal keeps.
 #
 #   hb harden status        one line per item
 #   hb harden plan          what apply would change (changes nothing)
@@ -9,8 +10,8 @@
 #   hb harden check         one-line verdict (exit 0 ok, 1 pending, 2 broken)
 #
 # Config ([harden] in hb.toml): remove_accounts, remove_files, permit_root_login,
-# sysctl ("key = value" lines; * stands for any one name, such as an interface),
-# llmnr.
+# x11_forwarding, sysctl ("key = value" lines; * stands for any one name, such as an
+# interface), llmnr, journal_max_use.
 # Every file or folder it changes or removes is copied to /var/lib/hb/backup/<run>/
 # first; a deleted account's home is kept there as a tarball.
 set -u
@@ -18,14 +19,18 @@ source "$(dirname "$(readlink -f "$0")")/../lib/hb.sh"
 need_root
 need_config
 
-ITEMS=(files accounts root_login nopasswd sysctl llmnr)
-SSHD_DROPIN=/etc/ssh/sshd_config.d/10-hb-harden.conf
+ITEMS=(files accounts root_login x11 nopasswd sysctl llmnr journal)
+SSHD_DROPIN="${HB_SSHD_DIR:-/etc/ssh/sshd_config.d}/10-hb-harden.conf"
 SYSCTL_FILE=/etc/sysctl.d/90-hb.conf
 RESOLVED_DROPIN=/etc/systemd/resolved.conf.d/90-hb.conf
+JOURNALD_DROPIN="${HB_JOURNALD_DIR:-/etc/systemd/journald.conf.d}/90-hb.conf"
+JOURNALD_REMOVED="$HB_STATE/harden/journald-settings-removed"   # touched when files removes journald's settings
 
 mapfile -t REMOVE_FILES < <(cfg harden.remove_files)
 mapfile -t REMOVE_ACCOUNTS < <(cfg harden.remove_accounts)
 ROOT_LOGIN="$(cfg harden.permit_root_login)"
+X11="$(cfg harden.x11_forwarding)"
+JOURNAL_MAX="$(cfg harden.journal_max_use)"
 mapfile -t SYSCTL < <(cfg harden.sysctl)
 LLMNR="$(cfg harden.llmnr)"
 
@@ -47,11 +52,15 @@ chk_files() {
   echo "will move away: ${present[*]}"; return 1
 }
 fix_files() {
-  local f sudoers=0
+  local f sudoers=0 journald
   for f in "${REMOVE_FILES[@]}"; do
     exists "$f" || continue
     safe_path "$f" || return 1
+    # journald's settings (a drop-in, or a folder of them): the journal item then sees a change
+    journald=0
+    { [[ $f == *journald* ]] || { [ -d "$f" ] && [ -n "$(find "$f" -name '*journald*' -print -quit 2>/dev/null)" ]; }; } && journald=1
     keep_copy "$f" && rm -rf --one-file-system -- "$f" || return 1
+    [ $journald = 1 ] && { mkdir -p "${JOURNALD_REMOVED%/*}" && touch "$JOURNALD_REMOVED"; }
     [[ $f == /etc/sudoers* ]] && sudoers=1
   done
   if [ $sudoers = 1 ] && ! visudo -cq; then
@@ -97,26 +106,45 @@ fix_accounts() {
   return $failed
 }
 
-# --- root_login: sshd PermitRootLogin ------------------------------------------
-chk_root_login() {
-  [ -z "$ROOT_LOGIN" ] && { echo "not managed"; return 0; }
-  local have
-  have="$(sshd -T 2>/dev/null | awk '$1 == "permitrootlogin" {print $2}')"
-  [ "$have" = "$ROOT_LOGIN" ] && { echo "PermitRootLogin $have"; return 0; }
-  echo "PermitRootLogin $have → $ROOT_LOGIN (via $SSHD_DROPIN)"; return 1
+# --- root_login and x11: sshd's PermitRootLogin and X11Forwarding -----------------
+# Both live in one drop-in, written whole from the config by either item.
+sshd_text() {
+  printf '# Managed by hb-harden. Files here are read in name order and the first\n# value wins, so this one sorts before the distribution defaults.\n'
+  [ -n "$ROOT_LOGIN" ] && printf 'PermitRootLogin %s\n' "$ROOT_LOGIN"
+  [ -n "$X11" ] && printf 'X11Forwarding %s\n' "$X11"
+  return 0
 }
-fix_root_login() {
+sshd_has() { sshd -T 2>/dev/null | awk -v k="$1" '$1 == k {print $2}'; }
+write_sshd_dropin() {
+  local before had=0
+  [ -e "$SSHD_DROPIN" ] && { had=1; before="$(cat "$SSHD_DROPIN")"; }
   keep_copy "$SSHD_DROPIN"
-  printf '# Managed by hb-harden. Files here are read in name order and the first\n# value wins, so this one sorts before the distribution defaults.\nPermitRootLogin %s\n' \
-    "$ROOT_LOGIN" > "$SSHD_DROPIN"
-  chmod 600 "$SSHD_DROPIN"
+  sshd_text > "$SSHD_DROPIN" && chmod 600 "$SSHD_DROPIN" || return 1
   if ! sshd -t; then
-    log "sshd -t rejected the config; removing $SSHD_DROPIN"
-    rm -f "$SSHD_DROPIN"
+    log "sshd -t rejected the config; putting $SSHD_DROPIN back as it was"
+    if [ $had = 1 ]; then printf '%s\n' "$before" > "$SSHD_DROPIN"; else rm -f "$SSHD_DROPIN"; fi
     return 1
   fi
   systemctl reload sshd
 }
+
+chk_root_login() {
+  [ -z "$ROOT_LOGIN" ] && { echo "not managed"; return 0; }
+  local have
+  have="$(sshd_has permitrootlogin)"
+  [ "$have" = "$ROOT_LOGIN" ] && { echo "PermitRootLogin $have"; return 0; }
+  echo "PermitRootLogin $have → $ROOT_LOGIN (via $SSHD_DROPIN)"; return 1
+}
+fix_root_login() { write_sshd_dropin; }
+
+chk_x11() {
+  [ -z "$X11" ] && { echo "not managed"; return 0; }
+  case "$X11" in yes|no) ;; *) echo "harden.x11_forwarding must be yes or no"; return 2 ;; esac
+  local have; have="$(sshd_has x11forwarding)"
+  [ "$have" = "$X11" ] && { echo "X11Forwarding $have"; return 0; }
+  echo "X11Forwarding $have → $X11 (via $SSHD_DROPIN)"; return 1
+}
+fix_x11() { write_sshd_dropin; }
 
 # --- nopasswd: report sudo rules without a password -----------------------------
 chk_nopasswd() {
@@ -204,6 +232,66 @@ fix_llmnr() {
   install -d -m 755 "${RESOLVED_DROPIN%/*}" && ( umask 022; llmnr_text > "$RESOLVED_DROPIN" ) || return 1
   log "  restarting systemd-resolved (name lookups on this host pause for a moment)"
   systemctl restart systemd-resolved
+}
+
+# --- journal: how much the journal keeps on disk (journald's SystemMaxUse) ---------
+# journald reads its drop-ins in name order and the last value wins, so a drop-in that
+# sorts after hb's and sets SystemMaxUse too overrules it: that one goes in remove_files.
+journal_text() { printf '# Managed by hb-harden from hb.toml (harden.journal_max_use).\n[Journal]\nSystemMaxUse=%s\n' "$JOURNAL_MAX"; }
+# every file journald reads that sets SystemMaxUse, in the order it reads them: "FILE VALUE"
+journal_setters() {
+  systemd-analyze cat-config systemd/journald.conf 2>/dev/null | awk '
+    /^# \// {f = $2; next}
+    /^[[:space:]]*SystemMaxUse[[:space:]]*=/ {v = $0; sub(/^[^=]*=[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v); print f, v}'
+}
+# listed_for_removal FILE — FILE, or a folder it's in, is in harden.remove_files
+listed_for_removal() { local r; for r in "${REMOVE_FILES[@]}"; do [[ $1 == "$r" || $1 == "$r"/* ]] && return 0; done; return 1; }
+# the latest change (ns since the epoch, ctime, which no one can set back) to what journald reads
+# its settings from: every file it reads; the drop-in folders, whose time changes when a file is
+# added to or removed from them; their parents, for a whole folder removed (not /run/systemd,
+# which changes all the time); and hb's mark for settings its files item removed
+journal_changed_ns() {
+  local f paths=("${JOURNALD_DROPIN%/*}" /etc/systemd/journald.conf.d /run/systemd/journald.conf.d
+                 /usr/local/lib/systemd/journald.conf.d /usr/lib/systemd/journald.conf.d
+                 /etc/systemd /usr/local/lib/systemd /usr/lib/systemd "$JOURNALD_REMOVED")
+  while read -r f; do paths+=("$f"); done < <(systemd-analyze cat-config systemd/journald.conf 2>/dev/null | awk '/^# \// {print $2}')
+  stat -c %.9Z "${paths[@]}" 2>/dev/null | tr -d . | sort -n | tail -1
+}
+# when the running journald was started (ns since the epoch; 0 when systemd can't say). It reads
+# its settings after that, so a change before it is in effect.
+journald_started_ns() {
+  local t; t="$(systemctl show systemd-journald.service -p ExecMainStartTimestamp --value --timestamp=us+utc 2>/dev/null)"
+  case "$t" in ""|n/a) echo 0; return ;; esac
+  date -d "$t" +%s%N 2>/dev/null || echo 0
+}
+chk_journal() {
+  [ -z "$JOURNAL_MAX" ] && { echo "not managed"; return 0; }
+  [[ $JOURNAL_MAX =~ ^[0-9]+(\.[0-9]+)?[KMGT]$ ]] || { echo "harden.journal_max_use must be a size such as 500M or 2G"; return 2; }
+  local LC_ALL=C f v last="" lastv="(journald's default)" mine="${JOURNALD_DROPIN##*/}" later=()   # systemd sorts bytewise
+  while read -r f v; do
+    last=$f lastv=$v
+    [[ $f == */journald.conf.d/* && $f != "$JOURNALD_DROPIN" ]] || continue
+    [[ "${f##*/}" > "$mine" ]] && ! listed_for_removal "$f" && later+=("$f")
+  done < <(journal_setters)
+  if [ ${#later[@]} -gt 0 ]; then
+    echo "${later[*]} sets SystemMaxUse after hb's $mine, so it would win: list it in harden.remove_files"; return 2
+  fi
+  local usage; usage="$(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+[KMGT]?B? in' | cut -d' ' -f1)"
+  if [ "$last" != "$JOURNALD_DROPIN" ] || ! cmp -s "$JOURNALD_DROPIN" <(journal_text); then
+    echo "SystemMaxUse=$lastv${last:+ (${last})} → $JOURNAL_MAX via $JOURNALD_DROPIN${usage:+; the journal now takes $usage}"; return 1
+  fi
+  # journald reads its settings when it starts, so it must have started after they last changed
+  # (a file written, or one removed): to the nanosecond, as both can fall in the same second
+  if [ "$(journald_started_ns)" -le "$(journal_changed_ns)" ]; then
+    echo "SystemMaxUse=$JOURNAL_MAX is written, but journald started before its settings last changed (apply restarts it)"; return 1
+  fi
+  echo "SystemMaxUse=$JOURNAL_MAX${usage:+ (the journal now takes $usage)}"
+}
+fix_journal() {
+  keep_copy "$JOURNALD_DROPIN"
+  install -d -m 755 "${JOURNALD_DROPIN%/*}" && ( umask 022; journal_text > "$JOURNALD_DROPIN" ) || return 1
+  # Services' output streams survive this: journald keeps them in systemd's store across restarts.
+  systemctl restart systemd-journald
 }
 
 item_main "$@"

@@ -17,6 +17,8 @@ DEFAULTS = {
         "permit_root_login": "",
         "sysctl": [],
         "llmnr": "",
+        "x11_forwarding": "",
+        "journal_max_use": "",
     },
     "k8s": {
         "flavour": "microk8s",
@@ -26,6 +28,7 @@ DEFAULTS = {
         "cluster_agent_bind": "",
         "keep_restarting": [],
         "linger_root": False,
+        "block_metadata": False,
     },
     "health": {
         "containers": [],
