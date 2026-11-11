@@ -28,6 +28,8 @@ DEFAULTS = {
         "cluster_agent_bind": "",
         "keep_restarting": [],
         "linger_root": False,
+        "memory_reserved": "",
+        "memory_evict_below": "",
         "block_metadata": False,
     },
     "health": {

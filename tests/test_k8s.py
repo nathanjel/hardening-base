@@ -1,5 +1,6 @@
 """hb-k8s's restart, linger and metadata items, as (namespace) root with systemctl, loginctl and nft
 faked (and nft for real, in a network namespace); the other items not managed."""
+import json
 import os
 import shutil
 import subprocess
@@ -10,6 +11,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
 from tools import REPO  # noqa: E402
+from hbkit import kubelet  # noqa: E402
 
 # systemctl show answers what systemd would have loaded: snapd's defaults, or hb's drop-in once it's there
 FAKE_SYSTEMCTL = """#!/bin/sh
@@ -792,6 +794,231 @@ class MetadataTest(unittest.TestCase):
                      "open: FAIL  metadata_live  a pod reached the instance metadata service (answered HTTP 404",
                      "earlier: todo  metadata_live  not confirmed: 1 pods tried, none dropped by hb's rule (last: (no answer, but hb's rule didn't see it))"):
             self.assertIn(want, out, out + r.stderr)
+
+
+# microk8s's kubectl as the memory items use it: the pods here, the node, and the kubelet's configz
+# as a kubelet started with {d}/running would report it (repeated map flags merged key by key, a
+# flag replacing {d}/config.json's map, the defaults otherwise; keys sorted, as Go does);
+# {d}/down = the kubelet doesn't answer, {d}/api-down = the API doesn't
+MEM_MICROK8S = """#!/usr/bin/env python3
+import json, re, sys
+d = {d!r}
+a = sys.argv[2:]
+with open(d + "/calls.log", "a") as f:
+    f.write(" ".join(a) + "\\n")
+def exists(name):
+    try:
+        open(d + "/" + name).close(); return True
+    except FileNotFoundError:
+        return False
+if a[:2] == ["get", "--raw"]:
+    if exists("down"):
+        sys.exit(1)
+    c = json.load(open(d + "/config.json")) if exists("config.json") else {{}}
+    c.setdefault("evictionHard", {{"memory.available": "100Mi", "nodefs.available": "10%", "nodefs.inodesFree": "5%",
+                                  "imagefs.available": "15%", "imagefs.inodesFree": "5%"}})
+    seen = set()
+    for line in open(d + "/running").read().splitlines():
+        m = re.fullmatch(r"--(system-reserved|kube-reserved|eviction-hard)=(.*)", line)
+        if not m:
+            continue
+        key, sep = {{"system-reserved": ("systemReserved", "="), "kube-reserved": ("kubeReserved", "="),
+                    "eviction-hard": ("evictionHard", "<")}}[m.group(1)]
+        if key not in seen:
+            c[key] = {{}}; seen.add(key)
+        for p in m.group(2).strip('"').split(","):
+            if p.strip():
+                k, v = p.split(sep, 1); c[key][k.strip()] = v.strip()
+    print(json.dumps({{"kubeletconfig": c}}, sort_keys=True))
+elif a[:2] == ["get", "pods"]:
+    if exists("api-down"):
+        sys.exit(1)
+    print(open(d + "/pods.json").read())
+elif a[:2] == ["get", "nodes"]:
+    print("testnode   Ready   <none>   1d   v1.36.2")
+"""
+# snap restart: kubelite starts with the args file as it is now; {d}/break-first = the first restart
+# never comes back (the kubelet doesn't answer), as with a flag it can't take
+MEM_SNAP = """#!/bin/sh
+echo "snap $*" >> {d}/calls.log
+n=$(( $(cat {d}/restarts 2>/dev/null || echo 0) + 1 )); echo $n > {d}/restarts
+if [ -e {d}/break-first ] && [ $n -eq 1 ]; then touch {d}/down; exit 1; fi
+rm -f {d}/down; cp {d}/snapdata/args/kubelet {d}/running
+"""
+KUBELET_ARGS = """--kubeconfig=${SNAP_DATA}/credentials/kubelet.config
+--hostname-override=testnode
+--fail-swap-on=false
+--eviction-hard="memory.available<100Mi,nodefs.available<1Gi,imagefs.available<1Gi"
+"""
+
+
+@unittest.skipUnless(can_fake_root(), "needs unprivileged user namespaces (unshare -r)")
+class MemoryTest(unittest.TestCase):
+    def setUp(self):
+        d = self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        self.args = f"{d}/snapdata/args/kubelet"
+        for sub in ("bin", "snapdata/args", "proc", "cgroup/kubepods", "state"):
+            os.makedirs(f"{d}/{sub}")
+        self.fake("microk8s", MEM_MICROK8S.format(d=d))
+        self.fake("snap", MEM_SNAP.format(d=d))
+        with open(self.args, "w") as f:
+            f.write(KUBELET_ARGS)
+        os.chmod(self.args, 0o660)
+        shutil.copy(self.args, f"{d}/running")
+        with open(f"{d}/proc/meminfo", "w") as f:
+            f.write("MemTotal:        8001176 kB\n")
+        self.pods(["512Mi", "320Mi"] * 4)
+        self.use(4807 * 2**20, 691 * 2**20)
+        self.config('memory_reserved = "2Gi"\nmemory_evict_below = "200Mi"\n')
+
+    def fake(self, name, text):
+        with open(f"{self.d}/bin/{name}", "w") as f:
+            f.write(text)
+        os.chmod(f"{self.d}/bin/{name}", 0o755)
+
+    def pods(self, requests):
+        items = [{"status": {"phase": "Running"}, "spec": {"containers": [{"resources": {"requests": {"memory": r}}}]}}
+                 for r in requests]
+        with open(f"{self.d}/pods.json", "w") as f:
+            json.dump({"items": items}, f)
+
+    def use(self, current, inactive):
+        with open(f"{self.d}/cgroup/kubepods/memory.current", "w") as f:
+            f.write(f"{current}\n")
+        with open(f"{self.d}/cgroup/kubepods/memory.stat", "w") as f:
+            f.write(f"inactive_file {inactive}\n")
+
+    def config(self, text):
+        with open(f"{self.d}/hb.toml", "w") as f:
+            f.write("[k8s]\n" + text)
+
+    def tool(self, *args):
+        env = {**os.environ, "HB_CONFIG": f"{self.d}/hb.toml", "HB_STATE": f"{self.d}/state",
+               "HB_MICROK8S": f"{self.d}/bin/microk8s", "HB_SNAPDATA": f"{self.d}/snapdata", "HB_PROC": f"{self.d}/proc",
+               "HB_CGROUP_ROOT": f"{self.d}/cgroup", "HB_MEM_WAIT": "2", "HB_MEM_POLL": "0.2",
+               "PATH": f"{self.d}/bin" + os.pathsep + os.environ["PATH"]}
+        return subprocess.run(["unshare", "-r", os.path.join(REPO, "tools", "hb-k8s"), *args], env=env,
+                              capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
+                              start_new_session=True)
+
+    def line(self, out, item):
+        return next(l for l in out.splitlines() if l.split()[1:2] == [item])
+
+    def calls(self):
+        with open(f"{self.d}/calls.log") as f:
+            return f.read()
+
+    def test_not_managed_by_default(self):
+        self.config("")
+        r = self.tool("status")
+        self.assertIn("not managed", self.line(r.stdout, "memory"))
+        self.assertIn("not managed", self.line(r.stdout, "memory_live"))
+        self.assertEqual(self.tool("check").returncode, 0)
+        self.assertFalse(os.path.exists(f"{self.d}/calls.log"))
+
+    def test_plan_apply_restart(self):
+        r = self.tool("plan")
+        self.assertIn("would change  memory         system memory kept none → 2Gi; evict below 100Mi → 200Mi (args file): "
+                      "pods may then ask for 5566 MiB (they ask for 3328 MiB and use 4116 MiB", r.stdout)
+        self.assertIn("would change  memory_live    the kubelet runs keeping nothing for the system and evicting below 100Mi",
+                      r.stdout)
+        self.assertIn("get pods -A --field-selector spec.nodeName=testnode -o json", self.calls())
+        r = self.tool("apply", "--yes")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with open(self.args) as f:
+            self.assertEqual(f.read(), KUBELET_ARGS.replace("100Mi", "200Mi") + "--system-reserved=memory=2Gi\n")
+        self.assertEqual(os.stat(self.args).st_mode & 0o777, 0o660)
+        self.assertEqual(self.calls().count("snap restart microk8s.daemon-kubelite"), 1)
+        self.assertIn("get --raw /api/v1/nodes/testnode/proxy/configz", self.calls())
+        r = self.tool("status")
+        self.assertIn("ok    memory         the kubelet's args file keeps 2Gi for the system and evicts pods when less than 200Mi is free",
+                      r.stdout)
+        self.assertIn("ok    memory_live    the kubelet runs keeping 2Gi for the system and evicting below 200Mi", r.stdout)
+        self.assertEqual(self.tool("check").returncode, 0)
+        backups = [os.path.join(p, f) for p, _, fs in os.walk(f"{self.d}/state/backup") for f in fs]
+        self.assertTrue(any(b.endswith("/args/kubelet") for b in backups), backups)
+
+    def test_refused_when_the_pods_here_would_not_fit(self):
+        self.pods(["3Gi", "3Gi"])
+        r = self.tool("apply", "--yes")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("would turn some of them away when it restarts", self.line(self.tool("status").stdout, "memory"))
+        with open(self.args) as f:
+            self.assertEqual(f.read(), KUBELET_ARGS)
+        self.assertNotIn("snap restart", self.calls())
+
+    def test_api_down_before_the_change(self):
+        open(f"{self.d}/api-down", "w").close()
+        open(f"{self.d}/down", "w").close()
+        out = self.tool("status").stdout
+        self.assertIn("can't read what the pods on testnode ask for", self.line(out, "memory"))
+        self.assertIn("todo  memory_live    the kubelet on testnode doesn't answer (configz)", out)
+        self.assertEqual(self.tool("check").returncode, 2)
+        os.unlink(f"{self.d}/api-down")
+        self.assertIn("can't read the kubelet's current settings on testnode (configz), which the change starts from",
+                      self.line(self.tool("status").stdout, "memory"))
+        r = self.tool("apply", "--yes")                   # neither changes: the change starts from configz
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("apply memory first", r.stdout + r.stderr)
+        with open(self.args) as f:
+            self.assertEqual(f.read(), KUBELET_ARGS)
+        self.assertNotIn("snap restart", self.calls())
+
+    def test_kubelet_not_back_with_it_goes_back(self):
+        open(f"{self.d}/break-first", "w").close()
+        r = self.tool("apply", "--yes")
+        self.assertIn("snap restart reported a failure; waiting to see", r.stderr + r.stdout)
+        self.assertIn("didn't come back with the new settings within 2 s: putting back what it ran with", r.stderr + r.stdout)
+        self.assertIn("memory_live: not applied", r.stderr + r.stdout)
+        self.assertEqual(self.calls().count("snap restart microk8s.daemon-kubelite"), 2)
+        # what it ran with, back in the args file: the same maps, an empty one written as an explicit ""
+        self.assertEqual(kubelet.flags(kubelet.read_lines(self.args)),
+                         {**kubelet.flags(KUBELET_ARGS.splitlines()), "system-reserved": {}})
+        self.assertIn('--system-reserved=""', kubelet.read_lines(self.args))
+        r = self.tool("status")
+        self.assertIn("todo  memory ", r.stdout)
+        self.assertIn("todo  memory_live    the kubelet runs keeping nothing for the system and evicting below 100Mi", r.stdout)
+        backups = [os.path.join(p, f) for p, _, fs in os.walk(f"{self.d}/state/backup") for f in fs]
+        with open(next(b for b in backups if b.endswith("/args/kubelet"))) as f:
+            self.assertEqual(f.read(), KUBELET_ARGS)                  # the copy kept is the original
+
+    def test_a_config_files_reservation_counts(self):
+        # Codex round 1: kubeReserved from the kubelet's config file, not the args file: 7814 - 2048 - 2048 - 200
+        with open(f"{self.d}/config.json", "w") as f:
+            json.dump({"kubeReserved": {"memory": "2Gi"}}, f)
+        self.pods(["1Gi"] * 4)
+        r = self.tool("status")
+        self.assertIn("pods may then ask for 3518 MiB (2Gi is kept for Kubernetes too), but those running here already ask for "
+                      "4096 MiB", self.line(r.stdout, "memory"))
+        self.assertEqual(self.tool("check").returncode, 2)
+
+    def test_a_share_written_differently_needs_no_restart(self):
+        # Codex round 2: the file has 5.0%, the kubelet runs 5.0%, hb.toml says 5%: nothing to do
+        text = KUBELET_ARGS.replace("memory.available<100Mi", "memory.available<5.0%") + "--system-reserved=memory=2Gi\n"
+        for f in (self.args, f"{self.d}/running"):
+            with open(f, "w") as fh:
+                fh.write(text)
+        self.config('memory_reserved = "2Gi"\nmemory_evict_below = "5%"\n')
+        r = self.tool("apply", "--yes")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("snap restart", self.calls())
+        self.assertEqual(self.tool("check").returncode, 0)
+
+    def test_spaces_in_hb_toml_are_not_written(self):
+        self.config('memory_reserved = " 2Gi "\nmemory_evict_below = " 200Mi"\n')
+        r = self.tool("apply", "--yes")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with open(self.args) as f:
+            self.assertEqual(f.read(), KUBELET_ARGS.replace("100Mi", "200Mi") + "--system-reserved=memory=2Gi\n")
+
+    def test_bad_value(self):
+        self.config('memory_reserved = "two gigs"\n')
+        self.assertIn("isn't a size", self.line(self.tool("status").stdout, "memory"))
+        self.assertEqual(self.tool("apply", "--yes").returncode, 2)
+        with open(self.args) as f:
+            self.assertEqual(f.read(), KUBELET_ARGS)
+
 
 if __name__ == "__main__":
     unittest.main()

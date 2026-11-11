@@ -5,7 +5,8 @@
 # cluster agent (for joining nodes, unused on one box) on localhost, keep
 # microk8s's daemons retrying after a failure instead of giving up, keep the
 # microk8s and kubectl commands root runs from ending with someone else's session,
-# and keep pods away from the instance metadata service (and the instance role).
+# keep memory back for the system so pods can't starve the cluster itself, and keep
+# pods away from the instance metadata service (and the instance role).
 #
 #   hb k8s status        one line per item
 #   hb k8s plan          what apply would change (changes nothing)
@@ -41,6 +42,25 @@
 #                  where systemd-oomd watches user@.service, as it may end what runs
 #                  there under memory pressure. Never undone here: loginctl
 #                  disable-linger root stops the manager, ending what runs in it.
+#   memory         the kubelet's args file keeps k8s.memory_reserved for the system
+#                  (--system-reserved=memory=...) and evicts pods when less than
+#                  k8s.memory_evict_below is free (memory.available in --eviction-hard). Read as
+#                  the kubelet reads them (repeated lines merge key by key; "" is an explicit empty
+#                  setting); a flag the file doesn't have yet starts from what the kubelet runs now
+#                  (configz), so other resources and signals stay as they are. Without a reservation
+#                  the scheduler offers pods the whole machine, so on a box that also runs the
+#                  cluster itself, pods that grow can starve the API server and its database
+#                  (no OOM kill: the kernel keeps dropping and rereading cached files) until
+#                  kubelite loses its leases and exits. With one, pods may ask for what's left,
+#                  the pods' cgroup is capped there (enforce-node-allocatable=pods), and a pod
+#                  that doesn't fit waits instead. Refused while the pods already here ask for
+#                  (pod-level requests, sidecars, what an in-place resize has allocated) or use
+#                  more than that: the kubelet would turn pods away when it restarts.
+#   memory_live    the kubelet runs with it (its configz) (fix: restart kubelite; API down
+#                  for about a minute, running pods keep running; if the kubelet isn't back
+#                  with the new settings in 4 minutes, it writes the managed flags back as the
+#                  kubelet ran them and restarts kubelite again). Undone by hand: empty the two
+#                  settings, edit the args file, restart kubelite.
 #   metadata       nft table inet hb_metadata drops what pods and containers send to the
 #                  instance metadata service (169.254.169.254, fd00:ec2::254): what the
 #                  host forwards, and what host-network pods send (matched by the cgroup the
@@ -69,7 +89,8 @@
 #                  so it fetches no credentials. (fix: wait for a pod, up to 60 s)
 #
 # Config ([k8s] in hb.toml): nodeport_addresses, token_off_namespaces,
-# freeze_certs, cluster_agent_bind, keep_restarting, linger_root, block_metadata.
+# freeze_certs, cluster_agent_bind, keep_restarting, linger_root, memory_reserved,
+# memory_evict_below, block_metadata.
 set -u
 source "$(dirname "$(readlink -f "$0")")/../lib/hb.sh"
 need_root
@@ -79,7 +100,7 @@ need_config
 MK="${HB_MICROK8S:-/snap/bin/microk8s}"
 command -v "$MK" >/dev/null || { echo "ok: microk8s not installed"; exit 0; }
 
-ITEMS=(nodeport nodeport_live tokens tokens_live certs agent agent_live restart linger metadata metadata_live)
+ITEMS=(nodeport nodeport_live tokens tokens_live certs agent agent_live restart linger memory memory_live metadata metadata_live)
 SNAPDATA="${HB_SNAPDATA:-/var/snap/microk8s/current}"
 ARGS=$SNAPDATA/args/kube-proxy
 AGENT_ARGS=$SNAPDATA/args/cluster-agent
@@ -103,6 +124,12 @@ MD_WAIT="${HB_MD_WAIT:-60}"     # seconds metadata_live's fix waits, at most, fo
 PROC="${HB_PROC:-/proc}"
 RESTART_SEC=10
 WARN_DAYS="$(cfg health.cert_warn_days)"
+KUBELET_ARGS=$SNAPDATA/args/kubelet
+MEM_RESERVED="$(cfg k8s.memory_reserved)"
+MEM_EVICT="$(cfg k8s.memory_evict_below)"
+MEM_WAIT="${HB_MEM_WAIT:-240}"  # seconds memory_live's fix waits for the kubelet to come back with it
+MEM_POLL="${HB_MEM_POLL:-5}"
+KUBELETPY=(python3 -IB "$HB_ROOT/lib/hbkit/kubelet.py")
 
 # --- nodeport -------------------------------------------------------------------
 chk_nodeport() {
@@ -333,6 +360,68 @@ fix_linger() {
     sleep 1
   done
   log "  root's user manager didn't start within 30 s (systemctl status user@0.service)"; return 1
+}
+
+# --- memory ---------------------------------------------------------------------
+memory_managed() { [ -n "$MEM_RESERVED$MEM_EVICT" ]; }
+# this node's name, as the kubelet registers it
+kubelet_node() {
+  local n; n="$(sed -nE 's/^--hostname-override=["'"'"']?([^"'"'"']+).*/\1/p' "$KUBELET_ARGS" 2>/dev/null | tail -1)"
+  echo "${n:-$(uname -n)}" | tr '[:upper:]' '[:lower:]'
+}
+configz() { k get --raw "/api/v1/nodes/$(kubelet_node)/proxy/configz" --request-timeout=10s 2>/dev/null; }
+mem_requests() {
+  local pods
+  pods="$(k get pods -A --field-selector "spec.nodeName=$(kubelet_node)" -o json 2>/dev/null)" \
+    || { echo "can't read what the pods on $(kubelet_node) ask for (is the API up?)"; return 1; }
+  "${KUBELETPY[@]}" requests <<<"$pods"
+}
+chk_memory() {
+  memory_managed || { echo "not managed"; return 0; }
+  [ -f "$KUBELET_ARGS" ] || { echo "no $KUBELET_ARGS"; return 2; }
+  local out rc req z
+  out="$("${KUBELETPY[@]}" check "$KUBELET_ARGS" "$MEM_RESERVED" "$MEM_EVICT" "$PROC/meminfo" "$CGROUP_ROOT" </dev/null)"; rc=$?
+  if [ $rc -eq 3 ]; then
+    # the change starts from what the kubelet runs now (a config file's values, its defaults)
+    req="$(mem_requests)" || { echo "$req"; return 2; }
+    z="$(configz)" || { echo "can't read the kubelet's current settings on $(kubelet_node) (configz), which the change starts from"; return 2; }
+    out="$("${KUBELETPY[@]}" check "$KUBELET_ARGS" "$MEM_RESERVED" "$MEM_EVICT" "$PROC/meminfo" "$CGROUP_ROOT" "$req" <<<"$z")"; rc=$?
+  fi
+  echo "$out"; return $rc
+}
+fix_memory() {
+  local z
+  z="$(configz)" || { log "  can't read the kubelet's current settings (configz)"; return 1; }
+  keep_copy "$KUBELET_ARGS"
+  "${KUBELETPY[@]}" write "$KUBELET_ARGS" "$MEM_RESERVED" "$MEM_EVICT" <<<"$z" || return 1
+  log "  written; the kubelet loads it when kubelite restarts (next item) or at reboot"
+}
+
+chk_memory_live() {
+  memory_managed || { echo "not managed"; return 0; }
+  local z
+  # not answering is pending, not broken: kubelite starting (after a boot, say); health.k8s judges a kubelet that's down
+  z="$(configz)" || { echo "the kubelet on $(kubelet_node) doesn't answer (configz)"; return 1; }
+  "${KUBELETPY[@]}" live "$MEM_RESERVED" "$MEM_EVICT" <<<"$z"
+}
+# Restarts kubelite. If the kubelet isn't back with the new settings in MEM_WAIT seconds, it
+# writes the managed flags back as the kubelet ran them (from its configz before the restart; an
+# empty map as an explicit "") and restarts kubelite again.
+fix_memory_live() {
+  chk_memory >/dev/null || { log "  apply memory first (or fix what it says)"; return 1; }
+  local before end
+  before="$(configz)" || { log "  the kubelet doesn't answer, so there is nothing known-good to go back to: not restarting"; return 1; }
+  log "  restarting kubelite (API down for about a minute; running pods keep running)"
+  # a failed restart (kubelite refusing a flag) is waited out and undone like a slow one
+  snap restart microk8s.daemon-kubelite >/dev/null || log "  snap restart reported a failure; waiting to see"
+  end=$((SECONDS + MEM_WAIT))
+  while [ $SECONDS -lt $end ]; do
+    chk_memory_live >/dev/null 2>&1 && { wait_node_ready; return; }
+    sleep "$MEM_POLL"
+  done
+  log "  the kubelet didn't come back with the new settings within $MEM_WAIT s: putting back what it ran with"
+  "${KUBELETPY[@]}" restore "$KUBELET_ARGS" "$MEM_RESERVED" "$MEM_EVICT" <<<"$before" && snap restart microk8s.daemon-kubelite >/dev/null && wait_node_ready
+  return 1
 }
 
 # --- metadata -------------------------------------------------------------------

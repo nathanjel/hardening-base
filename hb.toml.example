@@ -26,6 +26,11 @@ keep_restarting = []          # e.g. ["kubelite", "k8s-dqlite", "containerd"]: r
 linger_root = false           # true: root's user manager runs from boot, so a root session ending (a
                               # root cron job's, a sudo run by a service) no longer ends the microk8s and
                               # kubectl commands snap ran in it; refused where systemd-oomd watches user@
+memory_reserved = ""          # e.g. "2Gi": the kubelet keeps it for the system (--system-reserved), so
+                              # pods may ask only for the rest and their cgroup is capped there; for a box
+                              # that runs the cluster itself and its workloads. Loads when kubelite restarts
+memory_evict_below = ""       # e.g. "200Mi" (or "5%"): the kubelet evicts pods when less is free (its
+                              # default is 100Mi); the other --eviction-hard signals stay as they are
 block_metadata = false        # true (on a cloud instance): nft drops what pods, containers and host-network
                               # pods send to the instance metadata service, so none of them gets the
                               # instance role; the host's own programs still reach it. containerd and
