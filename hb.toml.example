@@ -13,6 +13,17 @@ llmnr = ""                    # "no" to switch off systemd-resolved's LLMNR resp
 x11_forwarding = ""           # "no" to switch off X11 forwarding over SSH (sshd drop-in, like permit_root_login)
 journal_max_use = ""          # e.g. "2G": the most the journal keeps on disk (journald's SystemMaxUse); a
                               # drop-in read after hb's that sets it too belongs in remove_files
+admins = []                   # e.g. ["alice"]: personal admin logins, made with no password; their sudo
+                              # takes their code (hb totp enrol them; their SSH key goes in ssh.keys)
+admin_group = "hb-admins"     # the admins' group: sudo asks its members for the code, and it has no others
+admin_sudo_minutes = 60       # after a code, sudo asks again once this many minutes pass without one (0: always)
+admin_sudo_shared = true      # true: one code opens sudo for all of the admin's sessions (agents on a shared
+                              # SSH connection ride on it); false: only in the terminal it was typed in
+admin_groups = []             # groups the admins are put in, e.g. ["systemd-journal"] to read the journal
+admin_not_in = []             # groups they must never be in, e.g. ["docker", "microk8s"]: root without sudo
+admin_shell = "/bin/bash"
+nopasswd_allowed = []         # NOPASSWD rules accepted as written (spaces don't count), e.g. a service's one
+                              # helper; only root may be able to change what they run. Any other fails
 
 [k8s]
 flavour = "microk8s"          # the only one supported

@@ -2,6 +2,7 @@
 import base64
 import io
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -10,23 +11,125 @@ sys.path.insert(0, os.path.dirname(__file__))
 from tools import load_tool  # noqa: E402
 
 totp = load_tool("totp")
-RFC_SECRET = base64.b32encode(b"12345678901234567890").decode()
+KEY = b"12345678901234567890"
+# one wrong answer from a process of its own, counting each answer the check evaluates in a file
+PARALLEL_TRY = """import sys
+sys.path.insert(0, sys.argv[1])
+from tools import load_tool
+totp = load_tool("totp")
+totp.DIR, tried = sys.argv[2], sys.argv[3]
+real = totp.answer
+def counted(data, text, now):
+    with open(tried, "a") as f:
+        f.write("x")
+    return real(data, text, now)
+totp.answer, totp.locked = counted, lambda user: None
+totp.verify({"PAM_TYPE": "auth", "PAM_USER": "alice"}, b"000000")
+"""
+RFC_SECRET = base64.b32encode(KEY).decode()
 
 
 class TotpTest(unittest.TestCase):
     def setUp(self):
         d = tempfile.mkdtemp()
-        old = (totp.DIR, totp.announce)
-        self.addCleanup(lambda: setattr(totp, "DIR", old[0]) or setattr(totp, "announce", old[1]))
+        old = (totp.DIR, totp.announce, totp.locked)
+        self.addCleanup(lambda: setattr(totp, "DIR", old[0]) or setattr(totp, "announce", old[1])
+                        or setattr(totp, "locked", old[2]))
         totp.DIR = d
-        self.notes = []
+        self.notes, self.locks = [], []
         totp.announce = lambda user, left: self.notes.append((user, left))
+        totp.locked = self.locks.append
         self.now = 1111111111
         totp.save("alice", {"secret": RFC_SECRET, "codes": [], "last_step": 0})
 
     def pam(self, code, user="alice", now=None, kind="auth"):
         env = {"PAM_TYPE": kind, "PAM_USER": user}
         return totp.verify(env, code.encode() + b"\0", now=self.now if now is None else now)
+
+    def test_admins_count_as_needing_codes(self):
+        # hb harden's admins answer sudo with their code, so a missing enrolment is worth a warning
+        self.addCleanup(setattr, totp, "clock_synced", totp.clock_synced)
+        totp.clock_synced = lambda: True
+        cfg = {"ssh": {"keys": [], "codes": False}, "harden": {"admins": ["bob"]}}
+        self.assertIn("bob not enrolled", totp.verdict(cfg)[1])
+        cfg["harden"]["admins"] = ["alice"]
+        self.assertNotIn("not enrolled", totp.verdict(cfg)[1])
+
+    def test_wrong_codes_lock_the_account_for_a_while(self):
+        # Codex round 1: sudo has no attempt limit of its own, so the check keeps one per account
+        for i in range(totp.FAIL_LIMIT):
+            self.assertEqual(self.pam("000000", now=self.now + i), 1)
+        self.assertEqual(self.locks, ["alice"])
+        self.assertEqual(self.pam("050471", now=self.now + 10), 1)          # the right code too, while locked
+        self.assertEqual(self.pam("000000", now=self.now + 11), 1)
+        self.assertEqual(self.locks, ["alice"])                              # one SMS, not one per try
+        self.assertEqual(len(totp.load("alice")["fails"]), totp.FAIL_LIMIT)  # tries while locked don't count
+        t = self.now + totp.FAIL_WINDOW                                      # the oldest is now that old
+        self.assertEqual(self.pam(totp.hotp(KEY, t // 30), now=t), 0)
+        self.assertEqual(totp.load("alice")["fails"], [])
+
+    def test_parallel_attempts_share_one_budget(self):
+        # Codex round 3: the time was read before the lock, so attempts holding it out of order
+        # dropped each other's failures; now at most FAIL_LIMIT answers are ever checked. Separate
+        # processes, as sshd and sudo are (not forks of this one, which may hold other threads' locks).
+        tried = os.path.join(totp.DIR, "tried")
+        procs = [subprocess.Popen([sys.executable, "-I", "-B", "-c", PARALLEL_TRY, os.path.dirname(__file__), totp.DIR, tried],
+                                  stdin=subprocess.DEVNULL) for _ in range(24)]
+        for p in procs:
+            self.assertEqual(p.wait(timeout=120), 0)
+        with open(tried) as f:
+            self.assertEqual(len(f.read()), totp.FAIL_LIMIT)
+
+    def test_the_clock_is_read_under_the_lock(self):
+        # Codex round 3: read before the lock, attempts could be judged out of order
+        order, real_lock, real_time = [], totp.lock, totp.time
+
+        class Clock:
+            @staticmethod
+            def time():
+                order.append("clock")
+                return real_time.time()
+
+        class Held:
+            def __enter__(self):
+                self.inner = real_lock()
+                self.inner.__enter__()
+                order.append("lock")
+
+            def __exit__(self, *exc):
+                return self.inner.__exit__(*exc)
+        self.addCleanup(setattr, totp, "lock", real_lock)
+        self.addCleanup(setattr, totp, "time", real_time)
+        totp.lock, totp.time = Held, Clock
+        totp.verify({"PAM_TYPE": "auth", "PAM_USER": "alice"}, b"000000")
+        self.assertEqual(order[:2], ["lock", "clock"])
+
+    def test_a_clock_gone_back_keeps_the_count(self):
+        # a failure stamped in the future counts as now, rather than as expired
+        for i in range(totp.FAIL_LIMIT):
+            self.assertEqual(self.pam("000000", now=self.now + 3600 + i), 1)
+        self.assertEqual(self.pam("050471"), 1)                              # an hour earlier: still locked
+        t = self.now + totp.FAIL_WINDOW
+        self.assertEqual(self.pam(totp.hotp(KEY, t // 30), now=t), 0)       # it ends a window after that
+
+    def test_a_right_code_clears_the_count(self):
+        for i in range(totp.FAIL_LIMIT - 1):
+            self.assertEqual(self.pam("000000", now=self.now + i), 1)
+        self.assertEqual(self.pam("050471"), 0)
+        self.assertEqual(totp.load("alice")["fails"], [])
+        for i in range(totp.FAIL_LIMIT - 1):
+            self.assertEqual(self.pam("000000", now=self.now + 30 + i), 1)
+        self.assertEqual(self.pam(totp.hotp(KEY, (self.now + 60) // 30), now=self.now + 60), 0)
+        self.assertEqual(self.locks, [])
+
+    def test_wrong_recovery_codes_count_too(self):
+        codes, hashes = totp.new_codes()
+        totp.save("rescue", {"codes": hashes, "last_step": 0})
+        for i in range(totp.FAIL_LIMIT):
+            self.assertEqual(self.pam("AAAAA-AAAAA", user="rescue", now=self.now + i), 1)
+        self.assertEqual(self.pam(codes[0], user="rescue", now=self.now + 10), 1)
+        self.assertEqual(len(totp.load("rescue")["codes"]), totp.N_CODES)    # none used up while locked
+        self.assertEqual(self.locks, ["rescue"])
 
     def test_rfc6238_vectors(self):
         key = b"12345678901234567890"

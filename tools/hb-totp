@@ -19,7 +19,11 @@ error refuses the login.
 
 Guessing: sshd only shows the prompt after the key is accepted, allows
 MaxAuthTries attempts per connection, and its PerSourcePenalties slow down an
-address that keeps failing.
+address that keeps failing. sudo (hb harden's admins) has no such limits, so the
+check keeps its own per account, shared by both and by parallel attempts: after
+5 wrong answers in 15 minutes every answer is refused, a right one too, until the
+oldest is 15 minutes old, and hb notify sends an SMS (fail) when that starts.
+A right answer clears the count.
 
 Config ([totp] in hb.toml): issuer, the name the authenticator app shows
 (default: this host's short name).
@@ -43,6 +47,10 @@ DIR = "/etc/hb/secrets/totp"
 USER = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"   # Crockford's base32: no I, L, O or U
 N_CODES, LOW_CODES = 10, 3
+# After FAIL_LIMIT wrong answers within FAIL_WINDOW seconds, every answer is refused, a right one
+# too, until the oldest of them is FAIL_WINDOW old: one budget per account, shared by sshd and sudo
+# and every process calling this at once (they take the same lock).
+FAIL_LIMIT, FAIL_WINDOW = 5, 15 * 60
 PATH_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}
 
 # RFC 4226 / 6238 and the scrypt hashes live in lib/hbkit/otp.py, shared with the web shell.
@@ -103,6 +111,27 @@ def usable(data):
 
 # --- PAM --------------------------------------------------------------------------------
 
+def answer(data, text, now):
+    """Whether TEXT is a right code for DATA (which it updates: the step used, a recovery code
+    gone), and how many recovery codes are left when one was used."""
+    if re.fullmatch(r"\d{6}", text):
+        if not data.get("secret"):
+            return False, None
+        step = match_totp(data["secret"], text, int(data.get("last_step", 0)), now)
+        if step is None:
+            return False, None
+        data["last_step"] = step
+        return True, None
+    code = norm_code(text)
+    if code is None:
+        return False, None
+    for i, stored in enumerate(data.get("codes", [])):
+        if code_matches(code, stored):
+            del data["codes"][i]
+            return True, len(data["codes"])
+    return False, None
+
+
 def verify(env, raw, now=None):
     """0 lets the login through; everything else, including any error, is 1."""
     if env.get("PAM_TYPE") != "auth":
@@ -112,29 +141,42 @@ def verify(env, raw, now=None):
         return 1
     text = raw[:512].decode("utf-8", "replace").replace("\0", "").strip()
     with lock():
+        # the time is read under the lock, so attempts are judged in the order they hold it
+        now = time.time() if now is None else now
         data = load(user)
         if not usable(data):
             return 1
-        if re.fullmatch(r"\d{6}", text):
-            if not data.get("secret"):
-                return 1
-            step = match_totp(data["secret"], text, int(data.get("last_step", 0)),
-                              time.time() if now is None else now)
-            if step is None:
-                return 1
-            data["last_step"] = step
-            save(user, data)
-            return 0
-        code = norm_code(text)
-        if code is None:
-            return 1
-        for i, stored in enumerate(data.get("codes", [])):
-            if code_matches(code, stored):
-                del data["codes"][i]
+        # a failure from the future (the clock went back) counts as now, rather than as expired,
+        # and is kept as now, so it ages from here
+        seen = data.get("fails", [])
+        fails = [min(t, now) for t in seen if now - min(t, now) < FAIL_WINDOW]
+        if len(fails) >= FAIL_LIMIT:
+            if any(t > now for t in seen):
+                data["fails"] = fails
                 save(user, data)
-                announce(user, len(data["codes"]))
-                return 0
+            return 1                       # locked: not counted, so it ends FAIL_WINDOW after the oldest
+        ok, left = answer(data, text, now)
+        data["fails"] = [] if ok else fails + [now]
+        save(user, data)
+    if ok:
+        if left is not None:
+            announce(user, left)
+        return 0
+    if len(data["fails"]) == FAIL_LIMIT:
+        locked(user)
     return 1
+
+
+def locked(user):
+    """An SMS (hb notify fail) that someone keeps giving wrong codes; detached."""
+    try:
+        subprocess.Popen([util.HB, "notify", "send", "fail", "totp.locked",
+                          f"{FAIL_LIMIT} wrong codes for {user} in {FAIL_WINDOW // 60} minutes: "
+                          f"codes refused until the oldest is {FAIL_WINDOW // 60} minutes old"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True, env=PATH_ENV)
+    except OSError:
+        pass
 
 
 def announce(user, left):
@@ -263,6 +305,7 @@ def clock_synced():
 def verdict(cfg):
     users = enrolled()
     need = [l.split()[0] for l in cfg["ssh"]["keys"] if l.split()] if cfg["ssh"]["codes"] else []
+    need += cfg["harden"]["admins"]          # their sudo takes the code
     if not users and not need:
         return 0, "ok: not in use"
     problems = [f"{u} not enrolled" for u in dict.fromkeys(need) if not usable(users.get(u))]
