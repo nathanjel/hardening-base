@@ -5,6 +5,7 @@ import os
 import sys
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 from tools import load_tool, temp_state, util  # noqa: E402
@@ -142,6 +143,28 @@ class NotifyTest(unittest.TestCase):
         self.assertEqual([e["level"] for e in util.read_events()], ["warn", "fail"])
         self.assertEqual(len(self.sent_lines()), 1)
         self.assertIn("FAIL mdadm.Fail: Fail on /dev/md2", self.sent_lines()[0])
+
+    def test_every_time_texts_each_one_within_the_daily_cap(self):
+        c = cfg(sms_command=self.sender, sms_per_day=3)
+        with mock.patch.object(notify, "refresh_banner", lambda: None):
+            notify.cmd_send(c, "fail", "health.raid", "degraded")
+            notify.cmd_send(c, "fail", "health.raid", "degraded")         # once per repeat_hours
+            for i in range(3):
+                notify.cmd_send(c, "fail", "breakglass.login", f"rescue logged in ({i})", every_time=True)
+        lines = self.sent_lines()
+        self.assertEqual(len(lines), 3)                                   # the third login meets the cap
+        self.assertEqual(sum("breakglass.login" in line for line in lines), 2)
+        self.assertIn("no SMS for breakglass.login: 3 already sent", util.read_events()[-1]["text"])
+
+    def test_send_takes_every_time_before_the_level(self):
+        seen = []
+        with mock.patch.object(notify.os, "geteuid", return_value=0), \
+                mock.patch.object(notify.config, "load", return_value={"notify": cfg()}), \
+                mock.patch.object(notify, "cmd_send", lambda *a: seen.append(a) or 0):
+            notify.main(["hb-notify", "send", "--every-time", "fail", "breakglass.login", "rescue", "logged", "in"])
+            notify.main(["hb-notify", "send", "fail", "health.raid", "--every-time"])  # later on: just text
+        self.assertEqual(seen, [(cfg(), "fail", "breakglass.login", "rescue logged in", True),
+                                (cfg(), "fail", "health.raid", "--every-time", False)])
 
     def test_events_are_trimmed(self):
         for i in range(notify.KEEP_EVENTS + 20):

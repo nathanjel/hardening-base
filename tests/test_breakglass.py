@@ -207,6 +207,40 @@ class KitTest(unittest.TestCase):
                        "kit_made_ts": time.time() - 300 * 86400})
         self.assertIn("test it again", bg.kit_verdict(c)[1])
 
+    def test_every_login_texts(self):
+        self.assertEqual(bg.do_login(cfg()), 0)
+        alerts = [c for c in self.calls if c[0] == "systemd-run"]
+        self.assertEqual(len(alerts), 1)
+        # past notify.repeat_hours: a login the day after a test texts too
+        self.assertEqual(alerts[0][-6:], ("notify", "send", "--every-time", "fail", "breakglass.login",
+                                          "rescue logged in (unknown session)"))
+        self.assertLess(time.time() - bg.load_state()["last_login"], 60)
+
+    def test_earlier_kits_folders_are_named_until_deleted(self):
+        c = cfg()
+        self.assertEqual(bg.do_kit(c, self.out), 0)
+        self.assertEqual(bg.do_kit(c, self.out + "2"), 0)
+        rc, line = bg.kit_verdict(c)
+        self.assertEqual(rc, 1)
+        self.assertIn(f"kit files still on the server: {self.out}2 ", line)
+        self.assertIn(f"earlier kits' files still on the server: {self.out} ", line)
+        shutil.rmtree(self.out + "2")
+        rc, line = bg.kit_verdict(c)
+        self.assertEqual(rc, 1)
+        self.assertNotIn(self.out + "2", line)
+        self.assertIn(f"earlier kits' files still on the server: {self.out} ", line)
+        shutil.rmtree(self.out)
+        self.assertIn("not used yet", bg.kit_verdict(c)[1])
+        self.assertEqual(bg.do_kit(c, self.out + "3"), 0)               # folders already gone are forgotten
+        self.assertEqual(bg.load_state()["old_kit_dirs"], [])
+
+    def test_a_kit_folder_from_before_old_kit_dirs_is_still_named(self):
+        old = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, old, True)
+        bg.save_state({"kit_made": "2026-11-01", "kit_made_ts": time.time() - 86400, "kit_dir": old})
+        self.assertEqual(bg.do_kit(cfg(), self.out), 0)
+        self.assertIn(f"earlier kits' files still on the server: {old} ", bg.kit_verdict(cfg())[1])
+
     def rotations(self):
         return [c for c in self.calls if c[0] == "chpasswd" or c[:3] == ("restic", "key", "add")
                 or (c[0].endswith("/hb") and c[1:3] == ("totp", "codes"))]

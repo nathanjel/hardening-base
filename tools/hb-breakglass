@@ -14,8 +14,8 @@ Items:
   alert    a drop-in for user@<uid>.service, so a login of that account (ssh
            or console) sends hb notify fail and counts as a kit test. It runs
            when the account's first session starts: a login while another of
-           its sessions is open adds nothing, and hb notify sends the SMS at
-           most once per notify.repeat_hours
+           its sessions is open adds nothing. Every such login texts (hb notify
+           send --every-time: past notify.repeat_hours, within sms_per_day)
 
 The kit (`kit`, again to rotate) is made in root's own folder, then written to
 DIR (default ~/hb-kit-DATE of the person running sudo, mode 700), which must be
@@ -31,8 +31,9 @@ later, the new kit stays in root's folder and the command says where:
                password of a restic key made for the kit (the previous kit's
                restic key is removed)
 Copy DIR off the server, print kit.html, put rescue.key and kit.html on a USB
-stick, delete DIR; `check` reminds you while it is still there, until the kit
-has been used once, and when it hasn't been used for breakglass.test_days.
+stick, delete DIR; `check` reminds you while it, or an earlier kit's folder, is
+still there, until the kit has been used once, and when it hasn't been used for
+breakglass.test_days.
 
 Config ([breakglass] in hb.toml): user, uid, host (the name the kit connects
 to; default probe.host), note (printed at the top of the page: where the
@@ -225,8 +226,10 @@ def do_login(cfg):
     save_state(st)
     # Its own transient unit: the login doesn't wait for the SMS, and a quick
     # logout (which stops user@<uid>.service) doesn't cut it off.
+    # --every-time: each login texts, however soon after the last (a test, say); only
+    # notify.sms_per_day limits it.
     util.run("systemd-run", "--no-block", "--collect", "--quiet", "--description=hb breakglass login alert",
-             util.HB, "notify", "send", "fail", "breakglass.login", f"{user} logged in ({via})")
+             util.HB, "notify", "send", "--every-time", "fail", "breakglass.login", f"{user} logged in ({via})")
     return 0
 
 
@@ -533,6 +536,13 @@ def keep_secrets(staging, k):
         indent=1) + "\n", mode=0o600)
 
 
+def kit_written(st, made, path):
+    """The new kit is in path. The previous kit's folder, if still there, joins the old ones check names:
+    their secrets no longer work, but the folders should go too."""
+    old = [d for d in st.get("old_kit_dirs", []) + [st.get("kit_dir")] if d and d != path and os.path.exists(d)]
+    st.update(kit_made=made, kit_made_ts=time.time(), kit_dir=path, old_kit_dirs=old)
+
+
 def make_kit(cfg, st, user, owner, to, kfd):
     wl = words()
     k = {"host": kit_host(cfg), "user": user, "made": datetime.date.today().isoformat(),
@@ -615,7 +625,7 @@ def make_kit(cfg, st, user, owner, to, kfd):
         fill(kfd, files, (pw.pw_uid, pw.pw_gid) if pw else None)
     except RuntimeError as e:
         # The new kit is whole and live, and the old one is not: keep it where it was made, and say so.
-        st.update(kit_made=k["made"], kit_made_ts=time.time(), kit_dir=staging)
+        kit_written(st, k["made"], staging)
         save_state(st)
         util.notify("warn", "breakglass.kit", f"new break-glass kit made for {user}, but not delivered")
         print(f"couldn't write the kit to {to}: {e}\n"
@@ -624,7 +634,7 @@ def make_kit(cfg, st, user, owner, to, kfd):
               f" then:  sudo rm -r {staging}")
         return 2
     shutil.rmtree(staging, ignore_errors=True)
-    st.update(kit_made=k["made"], kit_made_ts=time.time(), kit_dir=to)
+    kit_written(st, k["made"], to)
     save_state(st)
     util.notify("info", "breakglass.kit", f"new break-glass kit made for {user}")
     print(f"\nThe kit is in {to}: rescue.key, rescue.key.pub, kit.html, kit.txt")
@@ -645,8 +655,14 @@ def kit_verdict(cfg):
                    f"in {rot['staging']}{also} (root's only); run sudo hb breakglass kit again")
     if not st.get("kit_made"):
         return 1, "no kit yet: sudo hb breakglass kit"
+    files = []
     if st.get("kit_dir") and os.path.exists(st["kit_dir"]):
-        return 1, f"kit files still on the server: {st['kit_dir']} (copy them off, then delete)"
+        files.append(f"kit files still on the server: {st['kit_dir']} (copy them off, then delete)")
+    old = [d for d in st.get("old_kit_dirs", []) if os.path.exists(d)]
+    if old:
+        files.append(f"earlier kits' files still on the server: {', '.join(old)} (no longer working; delete)")
+    if files:
+        return 1, "; ".join(files)
     made = st["kit_made"]
     last = st.get("last_login")
     if not last or last < st.get("kit_made_ts", 0):

@@ -75,7 +75,7 @@ sms_command = []              # argv that gets the text on stdin and exits 0 onc
 sms_fallback = []             # tried when sms_command fails: a route that doesn't share its failures, e.g.
                               # ["/opt/hb/hooks/sms-supervoip", "--to", "+48...", "--sender", "<your sender>"]
 sms_per_day = 5               # at most this many SMS in 24 hours
-repeat_hours = 24             # the same alert again only after this long
+repeat_hours = 24             # the same alert again only after this long (break-glass logins: each time)
 retry_minutes = 60            # keep retrying an SMS that can't go out for this long
 
 [alerts]

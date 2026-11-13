@@ -102,8 +102,9 @@ Seal the page and the stick in an envelope and hand it over.
   new ones. A new phone: `sudo hb totp enrol YOU` again.
 - The rescue alert fires when the account's first session starts. A login
   while another rescue session is still open (the console you tested from,
-  say) adds no SMS, and `hb notify` sends `breakglass.login` at most once per
-  `notify.repeat_hours`. Log out of every rescue session when you're done.
+  say) adds no SMS. Every other login texts, however soon after the last
+  (only `notify.sms_per_day` limits it). Log out of every rescue session when
+  you're done.
 - After the kit has been used, or once a year: `sudo hb breakglass kit` makes a
   new one and retires the old (key, password, codes, restic key).
 - Codes depend on the clock; `hb totp check` warns when NTP isn't synchronised.
