@@ -5,11 +5,14 @@ import json
 import os
 import stat
 import pwd
+import select
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 from tools import load_tool, temp_state  # noqa: E402
@@ -41,6 +44,71 @@ class PiecesTest(unittest.TestCase):
                             capture_output=True)
         bad = subprocess.run(["ssh-keygen", "-y", "-P", "", "-f", os.path.join(d, "k")], capture_output=True)
         self.assertEqual((ok.returncode, bad.returncode != 0), (0, True))
+
+    def test_ssh_key_from_a_terminal(self):
+        # found on a box: run from a terminal, ssh-keygen asked the person for the passphrase
+        # (readpassphrase opens /dev/tty first), and the page printed one the key didn't have
+        d = tempfile.mkdtemp()
+        key, child = os.path.join(d, "k"), os.path.join(d, "child.py")
+        with open(child, "w") as f:
+            f.write("import os, sys, importlib.machinery, importlib.util\n"
+                    "os.setsid()\n"
+                    "fd = os.open(sys.argv[1], os.O_RDWR)   # a session leader's first terminal is its own\n"
+                    "for n in (0, 1, 2):\n    os.dup2(fd, n)\n"
+                    "loader = importlib.machinery.SourceFileLoader('bg', sys.argv[2])\n"
+                    "bg = importlib.util.module_from_spec(importlib.util.spec_from_loader('bg', loader))\n"
+                    "loader.exec_module(bg)\n"
+                    "bg.make_ssh_key(sys.argv[3], 'correct-horse-battery', 'c')\n")
+        master, slave = os.openpty()
+        p = subprocess.Popen([sys.executable, "-IB", child, os.ttyname(slave), bg.__file__, key],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        os.close(slave)
+        out, answered, deadline = b"", 0, time.time() + 60
+        try:
+            while p.poll() is None and time.time() < deadline:
+                r, _, _ = select.select([master], [], [], 0.2)
+                if r:
+                    try:
+                        out += os.read(master, 4096)
+                    except OSError:
+                        break
+                for _ in range(out.lower().count(b"passphrase") - answered):    # as the person did: Enter
+                    os.write(master, b"\n")
+                    answered += 1
+            rc = p.wait(timeout=10)
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+            os.close(master)
+        self.assertNotIn(b"passphrase", out.lower())
+        self.assertEqual(rc, 0, out)
+        ok = subprocess.run(["ssh-keygen", "-y", "-P", "correct-horse-battery", "-f", key], capture_output=True)
+        self.assertEqual(ok.returncode, 0)
+
+    def test_ssh_key_asks_no_helper_program(self):
+        # with DISPLAY (sudo keeps it on Amazon Linux) ssh-keygen would ask SSH_ASKPASS instead
+        d = tempfile.mkdtemp()
+        helper = os.path.join(d, "askpass")
+        with open(helper, "w") as f:
+            f.write("#!/bin/sh\necho wrong-answer\n")
+        os.chmod(helper, 0o755)
+        with mock.patch.dict(os.environ, {"DISPLAY": ":0", "SSH_ASKPASS": helper, "SSH_ASKPASS_REQUIRE": "force"}):
+            bg.make_ssh_key(os.path.join(d, "k"), "correct-horse-battery", "c")
+        ok = subprocess.run(["ssh-keygen", "-y", "-P", "correct-horse-battery", "-f", os.path.join(d, "k")],
+                            capture_output=True)
+        self.assertEqual(ok.returncode, 0)
+
+    def test_a_key_without_the_kits_passphrase_makes_no_kit(self):
+        d = tempfile.mkdtemp()
+        fake = os.path.join(d, "ssh-keygen")
+        with open(fake, "w") as f:      # makes keys with no passphrase, whatever it is given
+            f.write(f'#!/bin/sh\ncase " $* " in *" -t "*) exec {shutil.which("ssh-keygen")} -N "" "$@" ;; esac\n'
+                    f'exec {shutil.which("ssh-keygen")} "$@"\n')
+        os.chmod(fake, 0o755)
+        with mock.patch.object(bg, "KEYGEN", fake):
+            with self.assertRaisesRegex(RuntimeError, "didn't lock the key with the kit's passphrase"):
+                bg.make_ssh_key(os.path.join(d, "k"), "correct-horse-battery", "c")
 
     def kit(self, **over):
         k = {"host": "server.example", "user": "rescue", "made": "2026-11-01", "note": "OVH login: <in the safe>",

@@ -275,14 +275,32 @@ def restic_remove_key(cfg, key_id):
     return None if rc == 0 else err.strip()
 
 
+KEYGEN = "ssh-keygen"          # tests point it at a stand-in
+KEYGEN_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
+
+
+def keygen(args, stdin):
+    """ssh-keygen with the passphrase on stdin, never on argv (anyone can read a command line).
+    It reads stdin only when it can't open a terminal: readpassphrase tries /dev/tty first, so
+    from a terminal it would ask the person instead. So it runs in a session of its own, with no
+    terminal, and without DISPLAY or SSH_ASKPASS, with which it would ask a helper program (and
+    take a failed one's answer as an empty passphrase)."""
+    return subprocess.run([KEYGEN, *args], input=stdin, text=True, capture_output=True, timeout=60,
+                          env=KEYGEN_ENV, start_new_session=True)
+
+
 def make_ssh_key(path, phrase, comment):
-    """ssh-keygen reads the passphrase from stdin when stdin isn't a terminal: never on argv."""
-    p = subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-C", comment, "-f", path],
-                       input=f"{phrase}\n{phrase}\n", text=True, capture_output=True, timeout=60)
+    """A new ed25519 key at path, locked with phrase; its public line. Checked both ways before it
+    is used: phrase opens it, an empty passphrase doesn't."""
+    p = keygen(["-q", "-t", "ed25519", "-C", comment, "-f", path], f"{phrase}\n{phrase}\n")
     if p.returncode != 0 or not os.path.exists(path):
         raise RuntimeError(f"ssh-keygen: {p.stderr.strip()}")
     with open(path + ".pub") as f:
-        return f.read().strip()
+        pub = f.read().strip()
+    opened, bare = keygen(["-y", "-f", path], f"{phrase}\n"), keygen(["-y", "-f", path], "\n")
+    if opened.returncode != 0 or opened.stdout.split()[:2] != pub.split()[:2] or bare.returncode == 0:
+        raise RuntimeError("ssh-keygen didn't lock the key with the kit's passphrase; no kit made")
+    return pub
 
 
 def host_fingerprint():
@@ -610,7 +628,7 @@ def make_kit(cfg, st, user, owner, to, kfd):
     save_state(st)
     util.notify("info", "breakglass.kit", f"new break-glass kit made for {user}")
     print(f"\nThe kit is in {to}: rescue.key, rescue.key.pub, kit.html, kit.txt")
-    print("1. Copy it to your PC (over WireGuard, e.g. scp -r), then delete it here:  rm -r " + to)
+    print("1. Copy it to your PC (e.g. scp -r), then delete it here:  rm -r " + to)
     print("2. Print kit.html. Put rescue.key and kit.html on the USB stick.")
     print("3. Test it from a Windows PC with only the stick and the page (it uses one recovery code).")
     return 0
