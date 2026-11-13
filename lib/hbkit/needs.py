@@ -235,6 +235,7 @@ TABLE = [
     Need(["openssl"], "openssl", [Use("k8s", setting("k8s.freeze_certs"), why="the frozen certificate's end date")]),
     Need(["sshd"], "openssh-server", [
         Use("ssh", setting("ssh.keys"), why="checks what sshd would do (sshd -T)"),
+        Use("fail2ban", setting("fail2ban.enabled"), why="the jail's ports, and whether a key comes before the code"),
         Use("harden", setting("harden.permit_root_login", "harden.x11_forwarding"), why="sshd's settings"),
         Use("breakglass", setting("breakglass.user"), why="the rescue login")]),
     Need(["ssh-keygen"], "openssh", [
@@ -262,6 +263,8 @@ TABLE = [
         Use("snapshot", btrfs_root, why="snapshots of / before risky changes"),
         Use("upgrade", both(setting("upgrade.enabled"), btrfs_root), why="a snapshot before each upgrade"),
         Use("health", btrfs_root, OPTIONAL, why="the filesystem's error counters")]),
+    Need(["fail2ban-client"], "fail2ban-server", [Use("fail2ban", setting("fail2ban.enabled"), why="the sshd jail")],
+         installs="hb fail2ban apply"),
     Need(["nft"], "nftables", [Use("k8s", setting("k8s.block_metadata"), why="keeps pods off the metadata service")]),
     Need(["iptables-save"], "iptables-nft", [Use("k8s", setting("k8s.nodeport_addresses"), why="NodePort rules")]),
     Need(["smartctl"], "smartmontools", [

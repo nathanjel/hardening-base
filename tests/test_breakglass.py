@@ -128,6 +128,16 @@ class PiecesTest(unittest.TestCase):
         self.assertNotIn("BACKUP PASSWORD", no_repo)
         self.assertNotIn("restic", no_repo)
 
+    def test_page_says_what_connection_refused_means(self):
+        line = bg.refused_text()
+        self.assertIn("sudo hb fail2ban unban", line)
+        # Fable review: a printed kit outlives [fail2ban] (turned on later, another bantime), so
+        # the line is on every kit and names no length
+        self.assertNotRegex(line, r"\d+ minutes")
+        for text in (bg.kit_txt(self.kit(refused=line)), bg.kit_html(self.kit(refused=line))):
+            self.assertIn("Connection refused", text)
+        self.assertNotIn("Connection refused", bg.kit_txt(self.kit()))
+
     def test_sessions_text(self):
         answers = {("show-user",): "4 7\n",
                    ("show-session", "4"): "Service=sshd\nRemoteHost=203.0.113.7\nTTY=pts/1\n",
@@ -185,6 +195,7 @@ class KitTest(unittest.TestCase):
             page = f.read()
         self.assertIn("CODE9-XXXXX", page)
         self.assertIn("SHA256:hostkey", page)
+        self.assertIn("\"Connection refused\"", page)                   # with hb fail2ban off too
         with open(os.path.join(self.keydir, "rescue")) as f, open(os.path.join(self.out, "rescue.key.pub")) as g:
             self.assertIn(g.read().strip(), f.read())
         chpasswd = [cmd for cmd in self.calls if cmd[0] == "chpasswd"]

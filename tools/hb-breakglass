@@ -311,6 +311,14 @@ def host_fingerprint():
     return out.split()[1] if rc == 0 and len(out.split()) > 1 else "(unknown)"
 
 
+def refused_text():
+    """What "Connection refused" may mean. On every kit, without the ban's length: a printed kit
+    outlives changes to [fail2ban] (turned on later, another bantime)."""
+    return ("\"Connection refused\": after repeated failed logins the server may stop answering your address "
+            "for a while (fail2ban). Wait an hour and try again, or ask the owner to lift it "
+            "(sudo hb fail2ban unban YOUR-ADDRESS).")
+
+
 def kit_host(cfg):
     return cfg["breakglass"]["host"] or cfg["probe"]["host"] or socket.getfqdn()
 
@@ -336,6 +344,7 @@ def kit_sections(k):
               "code and cross it out."),
         ("p", "4. For admin commands type sudo -i and then the ACCOUNT PASSWORD."),
     ]), ("If SSH doesn't work", [
+        *([("p", k["refused"])] if k.get("refused") else []),
         ("p", "Log in to the hosting provider's web panel, open this server's console (IPMI, "
               f"\"Serial over LAN\"), press Enter and log in as {user} with the ACCOUNT PASSWORD."),
     ]), ("Common jobs (after sudo -i)", [
@@ -549,6 +558,7 @@ def make_kit(cfg, st, user, owner, to, kfd):
          "note": cfg["breakglass"]["note"].strip(), "fingerprint": host_fingerprint(),
          "repo": cfg["backup"]["repo"], "phrase": passphrase(wl), "password": passphrase(wl)}
     k["restic_password"] = passphrase(wl) if k["repo"] else ""
+    k["refused"] = refused_text()
     before = st.get("rotation")                      # left by earlier runs that didn't finish
     earlier = ([before["staging"]] + before.get("earlier", [])) if before else []
 

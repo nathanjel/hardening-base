@@ -204,6 +204,18 @@ host = ""                     # the name the kit connects to; default probe.host
 test_days = 180               # hb check reminds you when the kit hasn't been used for longer
 note = ""                     # top of the kit page: where the provider login is kept, who to call
 
+[fail2ban]
+# fail2ban's sshd jail (the other jails stay yours); apply installs fail2ban where it's missing.
+# A banned address gets "Connection refused", and its open SSH sessions are cut.
+enabled = false
+maxretry = 5                  # this many failures within findtime_minutes ban the address
+findtime_minutes = 10
+bantime_minutes = 60
+mode = "aggressive"           # the sshd filter's mode: normal, ddos, extra or aggressive
+known_days = 1                # an address that logged in this recently is never banned (0: off)
+notify_days = 30              # an SMS when the jail bans an address that logged in this recently (0: off)
+ignoreip = []                 # never banned: fixed addresses or networks, e.g. ["203.0.113.0/24"]
+
 [share]
 # Samba on the WireGuard interface only (wg.interface, wg.address), for one user.
 # Open 445/tcp in the WireGuard zone first: add "445/tcp" to fw.zones.<zone>.ports.

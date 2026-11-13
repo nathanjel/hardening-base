@@ -165,6 +165,16 @@ DEFAULTS = {
         "note": "",
         "test_days": 180,
     },
+    "fail2ban": {
+        "enabled": False,
+        "maxretry": 5,
+        "findtime_minutes": 10,
+        "bantime_minutes": 60,
+        "mode": "aggressive",
+        "known_days": 1,
+        "notify_days": 30,
+        "ignoreip": [],
+    },
     "share": {
         "user": "",
         "shares": [],

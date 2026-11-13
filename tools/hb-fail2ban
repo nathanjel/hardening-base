@@ -1,0 +1,829 @@
+#!/usr/bin/python3 -IB
+"""hb-fail2ban — fail2ban's sshd jail, set from hb.toml, and kept from banning you.
+
+  hb fail2ban status          the items, the jails, and whom the sshd jail has banned
+  hb fail2ban plan            what apply would change (changes nothing)
+  hb fail2ban apply [--yes]   make the changes, asking before each item
+  hb fail2ban check           one-line verdict (exit 0 ok, 1 attention, 2 broken)
+  hb fail2ban unban ADDRESS   lift the sshd jail's ban of ADDRESS
+  hb fail2ban known ADDRESS   (fail2ban's ignorecommand) exit 0 when ADDRESS logged in within
+                              fail2ban.known_days, 1 when not, 2 on an error
+  hb fail2ban banned ADDRESS  (fail2ban's ban action) an SMS when ADDRESS logged in within
+                              fail2ban.notify_days
+
+Items:
+  package  fail2ban-server, fail2ban-systemd (the journal backend) and nftables. Not
+           fail2ban-firewalld: the sshd jail bans in fail2ban's own nftables table, which a
+           firewalld reload (hb fw) leaves alone
+  jail     /etc/fail2ban/jail.d/95-hb-sshd.local, read after the other jail.d files so what it
+           sets wins, and the ban action /etc/fail2ban/action.d/hb-notify.conf. New files are
+           tested with fail2ban-client -t first (the old ones come back if that fails), then the
+           jail reloads, keeping its bans
+  service  fail2ban.service enabled and running
+
+The jail: fail2ban.maxretry failures within fail2ban.findtime_minutes ban an address for
+fail2ban.bantime_minutes. A banned address is rejected ("Connection refused"), its open SSH
+sessions too. Three things keep you from being banned:
+- failed codes: where sshd asks every stranger for a key before the code and its PAM stack asks
+  for hb totp's code and nothing that could take a password (hb ssh with ssh.codes), a wrong
+  answer at keyboard-interactive is a wrong code, and doesn't count: hb totp limits those per
+  account. A connection that runs out of tries still counts once ("maximum authentication
+  attempts")
+- recent logins: an address with a successful login ("Accepted ... from" in sshd's journal)
+  within fail2ban.known_days is never banned. fail2ban asks `hb fail2ban known` and keeps each
+  answer, yes or no, for a minute (so a failure in the minute before a login may still count);
+  when hb can't answer, fail2ban bans as it would without it
+- fail2ban.ignoreip: addresses or networks never banned, as are the box itself and localhost
+A ban of an address that logged in within fail2ban.notify_days (but not within known_days)
+texts the owner, with the unban command; one that fail2ban restores after a restart doesn't
+text again. The other jails are left as they are.
+
+The jail's ports are the ones sshd listens on (its listenaddress lines), and sshd is asked about
+strangers on each port, from each address family the box has a route for.
+
+fail2ban runs `hb fail2ban known` and `banned` as root, so the jail item refuses unless hb's whole
+tree, the folders above it and hb.toml are root's alone (the copy in /opt/hb that hb install
+makes); and it checks that the running jail has what the files say, so an apply whose reload
+failed shows as not done. With fail2ban.enabled false, hb's two files are taken out by apply
+(check warns while they are still there).
+
+Config ([fail2ban] in hb.toml): enabled, maxretry, findtime_minutes, bantime_minutes, mode (the
+sshd filter's: normal, ddos, extra or aggressive), known_days, notify_days, ignoreip.
+"""
+import datetime
+import ipaddress
+import json
+import os
+import re
+import stat
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+import hbkit.start  # noqa: E402,F401  (first: Python 3.11+, and a quiet end when the output pipe closes)
+from hbkit import config, util  # noqa: E402
+
+JAIL_FILE = "/etc/fail2ban/jail.d/95-hb-sshd.local"
+ACTION_FILE = "/etc/fail2ban/action.d/hb-notify.conf"
+PACKAGES = ("fail2ban-server", "fail2ban-systemd", "nftables")
+MODES = ("normal", "ddos", "extra", "aggressive")
+SSHD = ["sshd"]                                        # tests point it at a stand-in
+SSHD_UNIT = "sshd.service"
+INTERNET = ("192.0.2.1", "2001:db8::1")                # documentation addresses: sshd's view of strangers
+# A wrong code answer as sshd logs it, once the key was accepted; fail2ban matches it after taking
+# off the line's prefix. An invalid user never gets that far ("for invalid user X from" doesn't
+# match: the user is one word).
+CODE_FAILED = r"^Failed keyboard-interactive/pam for \S+ from \S+"
+PAM_DIR = "/etc/pam.d"
+# sshd's auth lines that ask for no password: hb totp's code check (as hb ssh writes it), and
+# modules that only allow or refuse. Anything else, and failed answers count.
+PAM_CODE = re.compile(r"^-?auth\s+(?:requisite|required|\[success=ok\s+default=die\])\s+pam_exec\.so\s+quiet"
+                      r"\s+expose_authtok\s+\S+/hb-totp\s+verify$")
+PAM_HARMLESS = re.compile(r"^-?auth\s+\S+\s+(?:pam_permit|pam_sepermit|pam_nologin|pam_env|pam_faildelay)\.so(?:\s|$)")
+PAM_INCLUDE = re.compile(r"^-?auth\s+(?:include|substack)\s+([A-Za-z0-9_][A-Za-z0-9_.-]*)$")
+# what libpam takes for an auth line: the type in any case, in brackets or not, and Debian's
+# @include (all types). One that isn't written as above counts as one that may take a password.
+PAM_AUTH = re.compile(r"^(\[-?auth\]|-?auth(\s|\[|$)|@include\b)", re.IGNORECASE)
+ROOT_UIDS = {0}                                         # tests add their own
+ACCEPTED = re.compile(r"^Accepted \S+ for (\S+) from (\S+) port \d+")
+WAIT_PING = 10                                          # seconds for a started fail2ban to answer
+SELINUX_ENFORCE = "/sys/fs/selinux/enforce"
+NO_ROUTE = "no route"
+
+
+def last(text, rc):
+    return (text.strip().splitlines() or [f"exit {rc}"])[-1]
+
+
+def address(text):
+    try:
+        return ipaddress.ip_address(str(text).strip())
+    except ValueError:
+        return None
+
+
+def network(text):
+    try:
+        return ipaddress.ip_network(text, strict=False) if isinstance(text, str) else None
+    except ValueError:
+        return None
+
+
+def problems(cfg):
+    f, out = cfg["fail2ban"], []
+    for key, low in (("maxretry", 1), ("findtime_minutes", 1), ("bantime_minutes", 1),
+                     ("known_days", 0), ("notify_days", 0)):
+        v = f[key]
+        if isinstance(v, bool) or not isinstance(v, int) or v < low:
+            out.append(f"fail2ban.{key} must be a whole number, {low} or more")
+    if f["mode"] not in MODES:
+        out.append(f"fail2ban.mode must be one of {', '.join(MODES)}")
+    if not isinstance(f["ignoreip"], list):
+        out.append("fail2ban.ignoreip must be a list")
+    else:
+        out += [f"fail2ban.ignoreip: {n!r} is no address or network" for n in f["ignoreip"] if not network(n)]
+    return out
+
+
+def unsafe(st, above=False):
+    """Someone other than root could change it. Above the path in question a sticky folder of
+    root's (/tmp) is safe: nobody can replace another's entry in it. Inside hb's tree it isn't:
+    a new lib/json.py would be imported first."""
+    if st.st_uid not in ROOT_UIDS:
+        return True
+    if not st.st_mode & 0o022:
+        return False
+    return not (above and stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_ISVTX)
+
+
+def not_root_owned(path):
+    """The path and each folder above it that someone other than root could change."""
+    bad, p, above = [], os.path.realpath(path), False
+    while True:
+        try:
+            if unsafe(os.stat(p), above):
+                bad.append(p)
+        except OSError:
+            bad.append(p)
+        if p == os.path.dirname(p):
+            return bad
+        p, above = os.path.dirname(p), True
+
+
+def unsafe_path(root=None, cfg_path=None):
+    """The first path that fail2ban's callbacks run or read as root and that someone other than root
+    could change, or None: hb's whole tree (the dispatcher, this tool, hb notify, the libraries)
+    and the folders above it, and hb.toml (it names the SMS command). A link in the tree must
+    lead to a file that is safe the same way."""
+    root = os.path.realpath(root or util.HB_ROOT)
+    bad = not_root_owned(root)
+    if bad:
+        return bad[0]
+    for top, dirs, files in os.walk(root):
+        for name in dirs + files:
+            path = os.path.join(top, name)
+            try:
+                st = os.lstat(path)
+            except OSError:
+                return path
+            if stat.S_ISLNK(st.st_mode):
+                target = os.path.realpath(path)
+                if os.path.isdir(target) or not_root_owned(target):
+                    return path
+            elif unsafe(st):
+                return path
+    cfg_path = cfg_path if cfg_path is not None else config.path()
+    bad = not_root_owned(cfg_path) if cfg_path else []
+    return bad[0] if bad else None
+
+
+def read(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def f2b(*args, timeout=30):
+    return util.run("fail2ban-client", *args, timeout=timeout)
+
+
+def running():
+    return util.run("systemctl", "is-active", "--quiet", "fail2ban")[0] == 0
+
+
+# --- what sshd does ---------------------------------------------------------------------
+
+def pam_auth_lines(name, depth=0):
+    """The auth lines of /etc/pam.d/NAME with include and substack followed, or None when a file
+    can't be read, has a line libpam joins to the next one (it ends in a backslash: hb reads one
+    line at a time), or the nesting is too deep."""
+    if depth >= 6 or name in (".", ".."):
+        return None
+    try:
+        with open(os.path.join(PAM_DIR, name), errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    if any(ln.split("#", 1)[0].rstrip().endswith("\\") for ln in lines):
+        return None
+    out = []
+    for line in lines:
+        line = " ".join(line.split("#", 1)[0].split())   # libpam's comment starts at '#'
+        if not PAM_AUTH.match(line):
+            continue
+        m = PAM_INCLUDE.match(line)
+        if m:
+            sub = pam_auth_lines(m.group(1), depth + 1)
+            if sub is None:
+                return None
+            out += sub
+        else:
+            out.append(line)
+    return out
+
+
+def pam_code_only(service="sshd"):
+    """sshd's PAM stack asks for hb totp's code and nothing that could take a password."""
+    lines = pam_auth_lines(service)
+    return bool(lines) and any(PAM_CODE.match(ln) for ln in lines) and \
+        all(PAM_CODE.match(ln) or PAM_HARMLESS.match(ln) for ln in lines)
+
+
+def sshd_view(spec=None):
+    """({key: [values]}, None) from sshd -T (for a connection like spec), or (None, error)."""
+    rc, out, err = util.run(*SSHD, "-T", *(["-C", spec] if spec else []), timeout=30)
+    if rc != 0:
+        return None, f"sshd -T: {last(err or out, rc)}"
+    view = {}
+    for line in out.splitlines():
+        key, _, value = line.partition(" ")
+        view.setdefault(key, []).append(value.strip())
+    return view, None
+
+
+def listen_ports(view):
+    """The ports sshd listens on. sshd -T prints each listenaddress with its port (0.0.0.0:22,
+    [::]:2200), and still says "port 22" when a ListenAddress names another."""
+    ports = []
+    for a in view.get("listenaddress", []):
+        host, _, port = (a.split() or [""])[0].rpartition(":")
+        if host and port.isdigit() and port not in ports:
+            ports.append(port)
+    return ports or [p for p in dict.fromkeys(view.get("port", [])) if p.isdigit()] or ["22"]
+
+
+def local_addr(peer):
+    """The address this box would answer peer from; NO_ROUTE when it has no route there (no
+    stranger of that family reaches it); None when ip can't tell."""
+    rc, out, err = util.run("ip", "-o", "route", "get", peer)
+    m = re.search(r"\bsrc (\S+)", out) if rc == 0 else None
+    if m:
+        return m.group(1)
+    return NO_ROUTE if "unreachable" in (err or out) else None
+
+
+def sshd_facts():
+    """({"ports", "key_first", "code_only", "skip_codes"}, None), or (None, error). A failed answer
+    at keyboard-interactive is a failed code only when sshd's PAM stack asks for the code and
+    nothing that could take a password; and hb skips it only where, besides, every way in that sshd
+    offers a stranger starts with a key, on every port it listens on. Anywhere else it may be a
+    password guess, and counts."""
+    plain, err = sshd_view()
+    if err:
+        return None, err
+    ports, after_key, asked = listen_ports(plain), True, 0
+    for addr in INTERNET:
+        laddr = local_addr(addr)
+        if laddr == NO_ROUTE:
+            continue
+        for port in ports:
+            # laddr and lport as a real connection has them: a Match LocalPort block makes sshd
+            # refuse a spec without lport, and either may hold a rule of its own
+            view, err = sshd_view(f"user=hb-fail2ban,host=hb-fail2ban,addr={addr}"
+                                  + (f",laddr={laddr}" if laddr else "") + f",lport={port}")
+            if err:
+                return None, err
+            asked += 1
+            lists = " ".join(view.get("authenticationmethods", ["any"])).split()
+            after_key = after_key and lists != ["any"] and all(m.split(",")[0] == "publickey" for m in lists)
+    after_key = after_key and asked > 0                  # no route anywhere: hb can't tell
+    service = (plain.get("pamservicename") or ["sshd"])[0]
+    code_only = pam_code_only(service)
+    return {"ports": ports, "key_first": after_key, "code_only": code_only,
+            "skip_codes": after_key and code_only}, None
+
+
+# --- the files --------------------------------------------------------------------------
+
+def jail_text(cfg, facts):
+    f = cfg["fail2ban"]
+    ignore = ["127.0.0.1/8", "::1"] + [str(network(n)) for n in f["ignoreip"]]
+    actions = ["%(action_)s"] + (["hb-notify"] if f["notify_days"] else [])
+    lines = [
+        "# Managed by hb-fail2ban (hb.toml [fail2ban]): the sshd jail. Read after the other jail.d",
+        "# files, so what it sets wins; the other jails are left as they are.",
+        "[sshd]",
+        "enabled = true",
+        "backend = systemd",
+        f"filter = sshd[mode={f['mode']}]",
+        f"port = {','.join(facts['ports'])}",
+        "protocol = tcp",
+        "usedns = no",
+        f"maxretry = {f['maxretry']}",
+        f"findtime = {f['findtime_minutes']}m",
+        f"bantime = {f['bantime_minutes']}m",
+        "bantime.increment = false",
+        "banaction = nftables[type=multiport]",
+        "action = " + "\n         ".join(actions),
+        "ignoreself = true",
+        "ignoreip = " + " ".join(ignore),
+        "# an address that logged in recently is never banned",
+        "ignorecommand = " + (f"{util.HB} fail2ban known <ip>" if f["known_days"] else ""),
+    ]
+    if f["known_days"]:
+        # fail2ban keeps a "no" too: short, so a login protects the address soon after
+        lines.append('ignorecache = key="<ip>", max-count=1000, max-time=1m')
+    lines += ["# a wrong code answer, after an accepted key: hb totp limits those per account",
+              "ignoreregex = " + (CODE_FAILED if facts["skip_codes"] else "")]
+    return "\n".join(lines) + "\n"
+
+
+def action_text():
+    return ("# Managed by hb-fail2ban: when the sshd jail bans an address that logged in recently,\n"
+            "# hb notify texts the owner (hb fail2ban banned).\n"
+            "[Definition]\n"
+            "# bans fail2ban restores after a restart don't text again\n"
+            "norestored = 1\n"
+            "actionstart =\n"
+            "actionstop =\n"
+            "actioncheck =\n"
+            f"actionban = {util.HB} fail2ban banned <ip>\n"
+            "actionunban =\n")
+
+
+def wanted(cfg, facts):
+    return {JAIL_FILE: jail_text(cfg, facts), ACTION_FILE: action_text()}
+
+
+def live(key):
+    """fail2ban-client get sshd KEY, or None when the running fail2ban has no sshd jail."""
+    rc, out, _ = f2b("get", "sshd", key)
+    return out.strip() if rc == 0 else None
+
+
+def listed(text):
+    """The items of fail2ban-client's lists ("|- x", "`- x"; regexes as "[n]: x")."""
+    items = [ln[3:] for ln in text.splitlines() if ln.startswith(("|- ", "`- "))]
+    return [re.sub(r"^\[\d+\]: ", "", i) for i in items]
+
+
+def effective(cfg, facts):
+    """[(setting, what the running jail has, what hb.toml says)] where they differ."""
+    f = cfg["fail2ban"]
+    want = {"maxretry": str(f["maxretry"]), "findtime": str(f["findtime_minutes"] * 60),
+            "bantime": str(f["bantime_minutes"] * 60),
+            "ignorecommand": f"{util.HB} fail2ban known <ip>" if f["known_days"] else ""}
+    diff = []
+    for key, val in want.items():
+        have = live(key)
+        if key == "ignorecommand" and have == "None":
+            have = ""
+        if have != val:
+            diff.append((key, have, val))
+    regexes = live("ignoreregex")
+    skips = None if regexes is None else CODE_FAILED in listed(regexes)
+    if skips != facts["skip_codes"]:
+        diff.append(("ignoreregex", "the code exception" if skips else "none", "the code exception"
+                     if facts["skip_codes"] else "none"))
+    actions = live("actions")
+    notifies = None if actions is None else "hb-notify" in re.split(r"[\s,]+", actions.splitlines()[-1])
+    if notifies != bool(f["notify_days"]):
+        diff.append(("actions", "hb-notify" if notifies else "no hb-notify", "hb-notify" if f["notify_days"]
+                     else "no hb-notify"))
+    ips = live("ignoreip")
+    have_ips = None if ips is None else {network(i) for i in listed(ips)}
+    want_ips = {network(n) for n in ["127.0.0.1/8", "::1"] + list(f["ignoreip"])}
+    if have_ips != want_ips:
+        diff.append(("ignoreip", " ".join(sorted(map(str, have_ips))) if have_ips is not None else None,
+                     " ".join(sorted(map(str, want_ips)))))
+    return diff
+
+
+# --- items ------------------------------------------------------------------------------
+
+def missing_packages():
+    return [p for p in PACKAGES if util.run("rpm", "-q", "--quiet", p)[0] != 0]
+
+
+def chk_package(cfg):
+    miss = missing_packages()
+    if not miss:
+        return 0, f"{', '.join(PACKAGES)} installed"
+    return 1, f"will install {' '.join(miss)}"
+
+
+def fix_package(cfg):
+    rc, out, err = util.run("dnf", "install", "-y", *missing_packages(), timeout=1200)
+    return None if rc == 0 else f"dnf install: {last(err or out, rc)}"
+
+
+def summary(cfg, facts):
+    f = cfg["fail2ban"]
+    why = ("" if facts["skip_codes"] else " (sshd doesn't ask strangers for a key first)" if not facts["key_first"]
+           else " (sshd's PAM stack may ask for more than hb totp's code)")
+    parts = [f"sshd jail: {f['maxretry']} failures in {f['findtime_minutes']} min ban for {f['bantime_minutes']} min",
+             "failed codes don't count" if facts["skip_codes"] else f"failed codes count{why}"]
+    if f["known_days"]:
+        parts.append(f"addresses with a login in the last {f['known_days']} d never banned")
+    return "; ".join(parts)
+
+
+def chk_jail(cfg):
+    bad = unsafe_path()
+    if bad:
+        return 2, (f"fail2ban would run hb from {util.HB_ROOT} as root, but {bad} isn't root's alone; "
+                   "use the copy in /opt/hb that hb install makes (sudo hb ...)")
+    facts, err = sshd_facts()
+    if err:
+        return 2, err
+    stale = [p for p, text in wanted(cfg, facts).items() if read(p) != text]
+    if stale:
+        return 1, f"will write {' and '.join(stale)} ({summary(cfg, facts)})"
+    if running():
+        if live("maxretry") is None:
+            return 2, "fail2ban runs without the sshd jail: sudo fail2ban-client reload (fail2ban's log says why)"
+        diff = effective(cfg, facts)
+        if diff:
+            return 1, ("fail2ban runs " + ", ".join(f"{k} {h!r}, not {w!r}" for k, h, w in diff)
+                       + ": will reload the jail")
+    return 0, summary(cfg, facts)
+
+
+def fix_jail(cfg):
+    facts, err = sshd_facts()
+    if err:
+        return err
+    want = wanted(cfg, facts)
+    old = {p: read(p) for p in want}
+
+    def put_back():
+        for p, text in old.items():
+            if text is None:
+                try:
+                    os.unlink(p)
+                except FileNotFoundError:
+                    pass
+            else:
+                util.write_atomic(p, text, mode=0o644)
+
+    try:
+        # from the first write to the end of the reload, anything that stops it (a full disk,
+        # Ctrl-C) puts the old files back: new ones never tested or loaded would look done
+        for p, text in want.items():
+            os.makedirs(os.path.dirname(p), mode=0o755, exist_ok=True)
+            util.write_atomic(p, text, mode=0o644)
+        rc, out, err = f2b("-t", timeout=120)
+        if rc != 0:
+            put_back()
+            return f"fail2ban-client -t refused them ({last(err or out, rc)}); the previous files are back"
+        if not running():
+            return None                                  # the service item starts it
+        rc, out, err = reload()
+    except BaseException:
+        put_back()
+        raise
+    if rc != 0:
+        # files that fail2ban doesn't run would look done to the next check: back to the old ones
+        put_back()
+        again = reload()[0]
+        return (f"fail2ban-client reload: {last(err or out, rc)}; the previous files are back"
+                + ("" if again == 0 else ", and reloading them failed too: sudo fail2ban-client status sshd"))
+    diff = effective(cfg, facts)
+    if diff:
+        return ("after the reload the jail runs " + ", ".join(f"{k} {h!r}, not {w!r}" for k, h, w in diff)
+                + f": a jail.d file read after {os.path.basename(JAIL_FILE)} sets them")
+    return None
+
+
+def reload():
+    rc, out, err = f2b("reload", "sshd", timeout=120)
+    if rc != 0:                                          # a jail that wasn't running yet
+        rc, out, err = f2b("reload", timeout=120)
+    return rc, out, err
+
+
+def chk_service(cfg):
+    enabled = util.run("systemctl", "is-enabled", "--quiet", "fail2ban")[0] == 0
+    active = running()
+    if enabled and active:
+        return 0, "fail2ban.service enabled and running"
+    todo = "enable and start" if not (enabled or active) else "start" if enabled else "enable"
+    return 1, f"will {todo} fail2ban.service"
+
+
+def fix_service(cfg):
+    rc, _, err = util.run("systemctl", "enable", "--now", "fail2ban", timeout=120)
+    if rc != 0:
+        return f"systemctl enable --now fail2ban: {last(err, rc)}"
+    deadline = time.monotonic() + WAIT_PING
+    while time.monotonic() < deadline:
+        if f2b("ping")[0] == 0:
+            return None
+        time.sleep(0.5)
+    return f"fail2ban started but didn't answer fail2ban-client ping within {WAIT_PING} s"
+
+
+ITEMS = (("package", chk_package, fix_package), ("jail", chk_jail, fix_jail), ("service", chk_service, fix_service))
+
+
+# --- logins and bans --------------------------------------------------------------------
+
+def logins(days):
+    """{address: (user, when)}: the newest successful SSH login from each address in the last
+    days, from sshd's journal. RuntimeError when the journal can't be read.
+
+    journalctl picks the "Accepted" lines itself (--grep: a 30-day read of a busy sshd's journal
+    is 0.8 s and 235 lines instead of 5 to 25 s and 47 MB), and has less time than fail2ban gives
+    its commands (60 s), so a slow read ends here with an error, not killed."""
+    since = int(time.time() - days * 86400)
+    cmd = ["journalctl", f"_SYSTEMD_UNIT={SSHD_UNIT}", "--since", f"@{since}", "-o", "json",
+           "--output-fields=MESSAGE", "--no-pager", "-q"]
+    rc, out, err = util.run(*cmd, "--grep", "^Accepted ", timeout=30)
+    if rc != 0 and "pattern matching" in err:            # a journalctl built without PCRE2
+        rc, out, err = util.run(*cmd, timeout=30)
+    if rc == 1 and not out.strip() and not err.strip():
+        return {}                                        # --grep found nothing
+    if rc != 0:
+        raise RuntimeError(f"journalctl: {last(err or out, rc)}")
+    found = {}
+    for line in out.splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        msg = entry.get("MESSAGE")
+        m = ACCEPTED.match(msg) if isinstance(msg, str) else None
+        a = address(m.group(2)) if m else None
+        if a is None:
+            continue
+        try:
+            when = int(entry.get("__REALTIME_TIMESTAMP", 0)) / 1e6
+        except ValueError:
+            when = 0
+        if a not in found or found[a][1] < when:
+            found[a] = (m.group(1), when)
+    return found
+
+
+def stamp(when):
+    return f"{datetime.datetime.fromtimestamp(when):%d %b %H:%M}"
+
+
+def banned_now():
+    """The addresses the sshd jail has banned, or None when fail2ban can't say."""
+    rc, out, _ = f2b("status", "sshd")
+    if rc != 0:
+        return None
+    for line in out.splitlines():
+        if "Banned IP list:" in line:
+            return line.split("Banned IP list:", 1)[1].split()
+    return []
+
+
+def do_known(cfg, text):
+    a, days = address(text), cfg["fail2ban"]["known_days"]
+    if a is None:
+        return 2
+    if not days:
+        return 1
+    try:
+        return 0 if a in logins(days) else 1
+    except RuntimeError:
+        return 2
+
+
+def do_banned(cfg, text):
+    f, a = cfg["fail2ban"], address(text)
+    if a is None:
+        return 2
+    if not f["notify_days"]:
+        return 0
+    try:
+        seen = logins(f["notify_days"]).get(a)
+    except RuntimeError:
+        return 2
+    if not seen:
+        return 0                                         # a stranger: that's what the jail is for
+    user, when = seen
+    # the command first: an SMS is cut at 160 characters, and an IPv6 address is long
+    msg = f"sudo hb fail2ban unban {a} lifts a {f['bantime_minutes']} min ban; {user} logged in from it {stamp(when)}"
+    # each ban texts (notify.sms_per_day still holds), in its own transient unit: fail2ban's ban
+    # doesn't wait for the SMS
+    rc, out, err = util.run("systemd-run", "--no-block", "--collect", "--quiet", "--description=hb fail2ban ban alert",
+                            util.HB, "notify", "send", "--every-time", "fail", "fail2ban.ban", msg)
+    if rc != 0:                                          # fail2ban logs a failed action with this
+        print(f"the SMS for {a} wasn't sent: systemd-run: {last(err or out, rc)}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def do_unban(cfg, text):
+    a = address(text)
+    if a is None:
+        print(f"{text!r} is no address", file=sys.stderr)
+        return 2
+    rc, out, err = f2b("set", "sshd", "unbanip", str(a))
+    if rc != 0:
+        print(f"fail2ban-client: {last(err or out, rc)}", file=sys.stderr)
+        return 2
+    print(f"lifted the sshd jail's ban of {a}" if out.strip() not in ("", "0") else f"{a} wasn't banned by the sshd jail")
+    return 0
+
+
+# --- verbs ------------------------------------------------------------------------------
+
+def ours(cfg, banned):
+    """Banned addresses that logged in within notify_days: [(address, user, when)]."""
+    days = cfg["fail2ban"]["notify_days"]
+    if not banned or not days:
+        return []
+    seen = logins(days)
+    return [(b, *seen[address(b)]) for b in banned if address(b) in seen]
+
+
+def left_behind():
+    """hb's files in /etc/fail2ban (what fail2ban.enabled false should leave none of)."""
+    return [p for p in (JAIL_FILE, ACTION_FILE) if os.path.exists(p)]
+
+
+def remove_ours():
+    """Take hb's files out, and reload fail2ban: None, or what went wrong."""
+    old = {p: read(p) for p in left_behind()}
+    for p in old:
+        os.unlink(p)
+    if util.run("rpm", "-q", "--quiet", "fail2ban-server")[0] != 0:
+        return None
+    rc, out, err = f2b("-t", timeout=120)
+    if rc != 0:
+        for p, text in old.items():
+            util.write_atomic(p, text, mode=0o644)
+        return f"fail2ban-client -t refused the files without hb's ({last(err or out, rc)}); hb's are back"
+    if running():
+        rc, out, err = reload()
+        if rc != 0:
+            return (f"fail2ban-client reload: {last(err or out, rc)}; the files are out, but the jail runs "
+                    "hb's values until fail2ban restarts")
+    return None
+
+
+def verdict(cfg):
+    f = cfg["fail2ban"]
+    if not f["enabled"]:
+        left = left_behind()
+        if not left:
+            return 0, "ok: not managed (fail2ban.enabled is false)"
+        bad = unsafe_path()
+        if bad:
+            return 2, (f"fail: fail2ban.enabled is false, but hb's sshd jail is still in place and runs hb from "
+                       f"{util.HB_ROOT} as root, where {bad} isn't root's alone: sudo hb fail2ban apply takes it out")
+        return 1, (f"warn: fail2ban.enabled is false, but {' and '.join(left)} still set the sshd jail: "
+                   "sudo hb fail2ban apply takes them out")
+    probs = problems(cfg)
+    if probs:
+        return 2, "fail: " + "; ".join(probs)
+    worst, parts = 0, []
+    for name, chk, _ in ITEMS:
+        rc, line = chk(cfg)
+        if rc:
+            worst = max(worst, rc)
+            parts.append(f"{name}: {line}")
+    if worst:
+        return worst, f"{'warn' if worst == 1 else 'fail'}: " + "; ".join(parts)
+    banned = banned_now()
+    if banned is None:
+        return 2, "fail: fail2ban-client status sshd doesn't answer"
+    try:
+        mine = ours(cfg, banned)
+    except RuntimeError as e:
+        return 1, f"warn: can't tell whose the {len(banned)} banned addresses are ({e})"
+    if mine:
+        return 1, ("warn: the sshd jail has banned " + ", ".join(f"{a} ({u} logged in from it {stamp(w)})"
+                                                               for a, u, w in mine)
+                   + ": sudo hb fail2ban unban ADDRESS")
+    return 0, (f"ok: sshd jail on, {f['maxretry']} failures in {f['findtime_minutes']} min ban for "
+               f"{f['bantime_minutes']} min; {len(banned)} banned now")
+
+
+def do_status(cfg):
+    if cfg["fail2ban"]["enabled"]:
+        probs = problems(cfg)
+        for p in probs:
+            print(f"FAIL  {p}")
+        if probs:
+            return 2
+        worst = 0
+        for name, chk, _ in ITEMS:
+            rc, line = chk(cfg)
+            worst = max(worst, rc)
+            print(f"{['ok', 'todo', 'FAIL'][rc]:<5} {name:<8} {line}")
+    else:
+        print("not managed (fail2ban.enabled is false); what fail2ban has now:")
+        worst = 0
+        if left_behind():
+            worst = 1
+            print(f"todo  jail     will take out {' and '.join(left_behind())} (hb's, still in force)")
+    rc, out, _ = f2b("status")
+    jails = next((ln.split("Jail list:", 1)[1].strip() for ln in out.splitlines() if "Jail list:" in ln), "") \
+        if rc == 0 else None
+    print(f"      jails: {jails or 'none'}" if jails is not None else "      fail2ban isn't answering")
+    banned = banned_now() if jails else None
+    if banned:
+        try:
+            mine = {a: (u, w) for a, u, w in ours(cfg, banned)}
+        except RuntimeError as e:
+            mine = {}
+            print(f"      (can't read sshd's journal: {e})")
+        print(f"      sshd jail has banned {len(banned)}:")
+        for b in banned:
+            print(f"        {b}" + (f"   {mine[b][0]} logged in from it {stamp(mine[b][1])}" if b in mine else ""))
+    return worst
+
+
+def selinux_enforcing():
+    try:
+        with open(SELINUX_ENFORCE) as f:
+            return f.read().strip() == "1"
+    except OSError:
+        return False
+
+
+def do_plan(cfg, apply=False, yes=False):
+    worst, todo, fixed = 0, 0, 0
+    for name, chk, fix in ITEMS:
+        rc, line = chk(cfg)
+        if rc == 0:
+            continue
+        todo += 1
+        print(f"{name}: {line}")
+        if rc == 2 or not apply:
+            worst = max(worst, rc)
+            if rc == 2:
+                break                                    # the later items build on this one
+            continue
+        if not yes and not util.ask(f"  apply {name}?"):
+            worst = max(worst, 1)
+            break
+        err = fix(cfg)
+        rc, line = chk(cfg)
+        print(f"  now: {line}" if not err else f"  failed: {err}")
+        worst = max(worst, rc if not err else 2)
+        if err:
+            break
+        fixed += 1
+    if fixed and worst == 0:
+        # the jail item may have run before fail2ban did (the service item started it): what runs now
+        for name, chk, _ in ITEMS:
+            rc, line = chk(cfg)
+            if rc:
+                print(f"after apply, {name}: {line}")
+                worst = max(worst, rc)
+    if not todo:
+        print("nothing to change")
+    elif selinux_enforcing():
+        print("note: SELinux is enforcing, and fail2ban runs confined (fail2ban_t): if it may not run hb, "
+              "recent logins get banned and no SMS goes out. After the first ban: sudo ausearch -m avc -ts today")
+    return worst
+
+
+def do_remove(apply=False, yes=False):
+    """plan and apply with fail2ban.enabled false: hb's files, if still there, come out."""
+    left = left_behind()
+    if not left:
+        print("not managed (fail2ban.enabled is false)")
+        return 0
+    print(f"jail: fail2ban.enabled is false: will take out {' and '.join(left)} and reload fail2ban")
+    if not apply or (not yes and not util.ask("  apply jail?")):
+        return 1
+    err = remove_ours()
+    print(f"  failed: {err}" if err else "  now: hb's files are out; the sshd jail is as fail2ban's other files set it")
+    return 2 if err else 0
+
+
+def main(argv):
+    verb = argv[1] if len(argv) > 1 else "status"
+    if verb in ("help", "-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if os.geteuid() != 0:
+        print("error: run with sudo", file=sys.stderr)
+        return 2
+    cfg = config.load()
+    if verb == "check":
+        rc, line = verdict(cfg)
+        print(line)
+        return rc
+    if verb == "status":
+        return do_status(cfg)
+    if verb in ("known", "banned", "unban"):
+        if len(argv) != 3:
+            print(f"usage: hb fail2ban {verb} ADDRESS", file=sys.stderr)
+            return 2
+        return {"known": do_known, "banned": do_banned, "unban": do_unban}[verb](cfg, argv[2])
+    if verb not in ("plan", "apply"):
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    if not cfg["fail2ban"]["enabled"]:
+        with util.Lock(os.path.join(util.state_dir("fail2ban"), "lock")):
+            return do_remove(verb == "apply", "--yes" in argv[2:])
+    probs = problems(cfg)
+    if probs:
+        print("\n".join(probs))
+        return 2
+    with util.Lock(os.path.join(util.state_dir("fail2ban"), "lock")):
+        return do_plan(cfg, apply=verb == "apply", yes="--yes" in argv[2:])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

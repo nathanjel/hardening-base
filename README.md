@@ -48,6 +48,7 @@ runs and the dnf package it comes in, sorted into three kinds:
 | `hb-digest` | the morning summary: last night's upgrade, backup and cleanup, what changed on the box, warnings, dated reminders; one line in the banner |
 | `hb-share` | Windows drive letters over WireGuard: Samba on the tunnel interface only, SMB 3.1.1 with signing, one user |
 | `hb-breakglass` | a rescue account and a printable kit for one trusted person: passphrase-protected key, recovery codes, console password, its own restic key; logging in to it sends an SMS |
+| `hb-fail2ban` | fail2ban's sshd jail from `hb.toml`, kept from banning you: failed codes don't count, an address that logged in within a day is never banned, an SMS when one that logged in within a month is; `hb fail2ban unban ADDRESS` |
 | `hb-snapshot` | read-only btrfs snapshots of `/` before risky changes |
 | `hb-health` | reboot pending, RAID, NVMe wear, btrfs, disk, mounts, containers, k8s, sites and certificates, registry, SIP trunk |
 | `hb-status` | runs every check every 15 minutes, writes the login banner, passes changes to hb-notify |
