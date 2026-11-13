@@ -1,4 +1,5 @@
 """lib/hbkit/needs.py: what hb runs, the package each comes in, and what this box needs."""
+import ast
 import os
 import re
 import subprocess
@@ -334,9 +335,14 @@ WRAPPERS = {
 START = re.compile(r"(?:^|[|;&(`{!]|\$\(|\b(?:then|do|else|elif|if|while|until)\b)")
 WORD = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_.+-]*)")
 VALUE = re.compile(r"\+?=(?:\(\S*\)|\$\([^)]*\)|\S*)")
-ARRAY = re.compile(r"(\b[A-Za-z_][A-Za-z0-9_]*(?:\[[^]]*\])?\+?=)\([^()]*\)")    # X=(a b c): data
-RUN_CALL = re.compile(r"(?<![\w])((?:\w+\.)?)(run|run_read|sh|Popen|check_output|check_call|run_in)\(")
-PY_ASSIGN = re.compile(r"^\s*([A-Za-z_]\w*)\s*=\s*[\[(]\s*\"([a-z][a-z0-9_.+-]*)\"", re.M)   # X = ["prog", ...]
+ARRAY = re.compile(r"(\b[A-Za-z_][A-Za-z0-9_]*(?:\[[^]]*\])?\+?=)\(([^()]*)\)")   # X=(a b c), on one line or more: data
+ARRAY_HEAD = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)=\(\s*([^\s()\"'$]+)")          # X=(prog ...): the program
+ARRAY_WORDS = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\[[@*]\]\}")                 # ${X[@]}: X's words
+ARRAY_RUN = re.compile(r"\s*\"?\s*@([A-Za-z_][A-Za-z0-9_]*)\b")                       # code_only's mark for it
+# Python calls that run a program, and what a program's name looks like.
+HELPERS = {"run", "run_read", "sh", "stream", "Popen", "call", "check_call", "check_output", "run_in",
+           "execv", "execvp", "execvpe"}
+PROGRAM = re.compile(r"[a-z][a-z0-9_.+-]*|/(?:usr/)?s?bin/[a-z][a-z0-9_.+-]*|/snap/bin/[a-z0-9]+")
 PY_PATH = re.compile(r"\"(/(?:usr/)?s?bin/[a-z][a-z0-9_.+-]*|/snap/bin/[a-z0-9]+)\"")
 
 
@@ -352,6 +358,11 @@ def on_path():
 
 def blank(text):
     return re.sub(r"[^\n]", " ", text)
+
+
+def array_mark(m):
+    """${X[@]} as " @X" and spaces, as long: no "{" to read as a group, blanks where its text was."""
+    return (" @" + m.group(1)).ljust(len(m.group()))
 
 
 def code_only(text):
@@ -376,12 +387,16 @@ def code_only(text):
                 stack.pop(); out.append('"')
             elif text.startswith("$(", i):
                 stack.append(["code", 0]); out.append("$("); i += 2; continue
+            elif ARRAY_WORDS.match(text, i):         # "${X[@]}": X's words, maybe a command
+                out.append(array_mark(ARRAY_WORDS.match(text, i))); i += len(out[-1]); continue
             else:
                 out.append(blank(c))
             i += 1
             continue
         if c == "\\":
             out.append(text[i:i + 2]); i += 2; continue
+        if ARRAY_WORDS.match(text, i):
+            out.append(array_mark(ARRAY_WORDS.match(text, i))); i += len(out[-1]); continue
         if c == "#" and (i == 0 or text[i - 1] in " \t\n;") and not text.startswith("#!", i) or \
                 (c == "#" and text.startswith("#!", i) and i == 0):
             j = text.find("\n", i)
@@ -409,15 +424,28 @@ def code_only(text):
 
 
 def shell_code(text):
-    """Code lines, with case labels and array values (X=(a b c)) taken out."""
-    return [ARRAY.sub(r"\1()", re.sub(r"^\s*[^\s()]+\)(?=\s|$)", "", line)) for line in code_only(text).split("\n")]
+    """Code lines, with case labels and array values (X=(a b c), on one line or several) taken out."""
+    code = ARRAY.sub(lambda m: m.group(1) + "(" + re.sub(r"[^\n]", "", m.group(2)) + ")", code_only(text))
+    return [re.sub(r"^\s*[^\s()]+\)(?=\s|$)", "", line) for line in code.split("\n")]
 
 
-def shell_commands(line):
+def shell_arrays(text):
+    """{array: the programs it starts with}, for an array run as "${X[@]}"."""
+    arrays = {}
+    for m in ARRAY_HEAD.finditer(code_only(text)):
+        arrays.setdefault(m.group(1), set()).add(os.path.basename(m.group(2)))
+    return arrays
+
+
+def shell_commands(line, arrays=None):
     found = []
     for m in START.finditer(line):
         i = m.end()
         while True:
+            a = ARRAY_RUN.match(line, i)
+            if a:                                    # "${X[@]}" runs the program X starts with
+                found.extend(sorted((arrays or {}).get(a.group(1), ())))
+                break
             w = WORD.match(line, i)
             if not w:
                 break
@@ -436,32 +464,57 @@ def shell_commands(line):
     return found
 
 
-def call_args(text, start):
-    """The text of a call's arguments, from just after its "(" to the matching ")"."""
-    depth, i = 1, start
-    while i < len(text) and depth:
-        depth += {"(": 1, ")": -1}.get(text[i], 0)
-        i += 1
-    return text[start:i - 1]
-
-
 def python_programs(text):
+    """The programs a Python file runs: in a call of a run helper (not restic's, whose words are its
+    own subcommands), the first argument that is a string or a list, or *X, X or X[0] for one
+    assigned to X. run_in(repo, uid, "make") skips the two before; run(*cfg["x"]) is hb.toml's."""
+    tree = ast.parse(text)
+    assigned = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for tg in node.targets:
+                if isinstance(tg, ast.Name):
+                    assigned.setdefault(tg.id, []).append(node.value)
+
+    def heads(node, depth=0):
+        """The programs node names as a command's first word: None when it isn't a string or list."""
+        if depth > 5:
+            return None
+        if isinstance(node, ast.Constant):
+            return {node.value} if isinstance(node.value, str) else None
+        if isinstance(node, (ast.List, ast.Tuple)):
+            return heads(node.elts[0], depth + 1) if node.elts else None
+        if isinstance(node, ast.Starred):
+            return heads(node.value, depth + 1)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return heads(node.left, depth + 1)
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            return heads(node.value, depth + 1)
+        if isinstance(node, ast.Name) and node.id in assigned:
+            found = [heads(v, depth + 1) for v in assigned[node.id]]
+            found = [f for f in found if f is not None]
+            return set().union(*found) if found else None
+        return None
+
     names = set()
-    for m in RUN_CALL.finditer(text):
-        args = call_args(text, m.end()).lstrip()
-        # restic.run("ls") is restic's ls; run(*KUBECTL, "get") runs what KUBECTL names
-        if m.group(1) in ("", "util.", "subprocess.") and not args.startswith("*"):
-            first = re.search(r"\"([a-z][a-z0-9_.+-]*)\"", args)
-            if first:
-                names.add(first.group(1))
-    # a list or tuple that starts with a program counts when something runs it: *X in a call (not
-    # restic's, whose arguments are its own subcommands), or X itself handed to a run helper
-    for m in PY_ASSIGN.finditer(text):
-        name, head = m.groups()
-        for u in re.finditer(rf"(?:([\w.]+)\(\s*)?\*{name}\b|\b(?:run|run_read|sh|Popen|check_output|execvp?)\(\s*{name}\b",
-                             text):
-            if not (u.group(1) or "").startswith("restic."):
-                names.add(head)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        if isinstance(f, ast.Name):
+            helper = f.id
+        elif isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id != "restic":
+            helper = f.attr                          # restic.run("ls") is restic's ls
+        else:
+            continue
+        if helper not in HELPERS:
+            continue
+        for arg in node.args:
+            found = heads(arg)
+            if found is not None:
+                names |= {os.path.basename(n) for n in found if PROGRAM.fullmatch(n)}
+                break
+            if isinstance(arg, ast.Starred):         # run(*cfg["command"]): whatever hb.toml says
                 break
     names |= {os.path.basename(p) for p in PY_PATH.findall(text)}
     return names
@@ -487,7 +540,8 @@ def scan():
             names = python_programs(text)
         else:
             funcs = shared | set(re.findall(r"^\s*([a-z_][a-z0-9_]*)\(\)", text, re.M))
-            names = {w for line in shell_code(text) for w in shell_commands(line)} - funcs - SHELL
+            arrays = shell_arrays(text)
+            names = {w for line in shell_code(text) for w in shell_commands(line, arrays)} - funcs - SHELL
         for n in names - NOT_PROGRAMS:
             found.setdefault(n, set()).add(os.path.relpath(path, REPO))
     return found
@@ -532,6 +586,13 @@ class EveryProgramIsListedTest(unittest.TestCase):
             self.assertIn(w, found)
         for w in ("host", "links", "check", "status", "curl", "install", "kubectl", "write", "needs", "code", "b"):
             self.assertNotIn(w, found)
+        # Codex follow-ups review: an array runs what it starts with; one over several lines is data
+        text = ('CURL=(curl -fsS)\nPY=(/usr/bin/python3 -IB "$X")\nLIST=(\n  code\n  info\n)\n'
+                'out="$("${CURL[@]}" https://example.test)"; timeout 5 "${PY[@]}" sub\n'
+                'for x in "${LIST[@]}"; do :; done\n')
+        arrays = shell_arrays(text)
+        found = {w for ln in shell_code(text) for w in shell_commands(ln, arrays)} - SHELL
+        self.assertEqual(sorted(found), ["curl", "python3", "timeout"])
 
     def test_the_scan_takes_python_apart(self):
         # Codex review 2: a list of words is no command until something runs it
@@ -541,6 +602,12 @@ class EveryProgramIsListedTest(unittest.TestCase):
         self.assertEqual(python_programs('T = ("tmux", "new")\nos.execvp(T[0], T)\n'), {"tmux"})
         self.assertEqual(python_programs('K = ["/snap/bin/microk8s", "kubectl"]\nrun(*K, "get")\n'), {"microk8s"})
         self.assertEqual(python_programs('run_in(repo, uid, "make", "clean")\n'), {"make"})
+        # Codex follow-ups review: unpacking data runs nothing; every run helper counts
+        self.assertEqual(python_programs('LEVELS = ("info", "warn")\nprint(*LEVELS)\nx = {*LEVELS}\n'), set())
+        self.assertEqual(python_programs('cmd = ["curl", "-f"]\nsubprocess.check_call(cmd)\n'), {"curl"})
+        self.assertEqual(python_programs('KEYGEN = "ssh-keygen"\nsubprocess.run([KEYGEN, *args])\n'), {"ssh-keygen"})
+        self.assertEqual(python_programs('subprocess.Popen([util.HB, "notify", "send"])\n'), set())
+        self.assertEqual(python_programs('util.run(*cfg["sms_command"], "x")\n'), set())
 
 
 if __name__ == "__main__":
