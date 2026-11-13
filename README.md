@@ -24,12 +24,18 @@ Phases 1 to 8 are written and applied on the first box (runbooks:
 ([docs/PHASE9.md](docs/PHASE9.md)) hardens them after an outside review. Start from `hb.toml.example`, which lists every
 key, as `hb.toml` in the checkout. `sudo ./hb install apply` then copies the code
 to `/opt/hb` (root's, so nothing running as your user can change what root's
-timers run) and the config to `/etc/hb/hb.toml`.
+timers run) and the config to `/etc/hb/hb.toml`. Before that, it lists every program hb
+runs and the dnf package it comes in, sorted into three kinds:
+- **mandatory:** hb itself needs it.
+- **needed:** a tool your `hb.toml` sets up needs it.
+- **needed later / optional:** nothing here needs it yet, or it only adds something.
+
+`sudo hb install needs` shows the same list later; `hb install status` gives it as one line.
 
 | Tool | Job |
 |---|---|
 | `hb-config` | read and validate `hb.toml` (bash tools call `hb config get KEY`) |
-| `hb-install` | root-owned copy in `/opt/hb`, `/etc/hb/hb.toml`, systemd units and timers |
+| `hb-install` | the programs hb needs here (`hb install needs`), root-owned copy in `/opt/hb`, `/etc/hb/hb.toml`, systemd units and timers |
 | `hb-harden` | unwanted accounts, stray files and folders, root login over SSH, NOPASSWD audit, kernel settings, LLMNR |
 | `hb-k8s` | microk8s: NodePorts on localhost only, no service-account tokens in app pods, no certificate reissue that restarts every container, cluster agent on localhost, daemons that keep retrying after a failure |
 | `hb-wg` | WireGuard endpoint for your PCs: config from `hb.toml`, each PC keeps its own private key |

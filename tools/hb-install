@@ -6,8 +6,13 @@
 #   hb install plan          what apply would change (changes nothing)
 #   hb install apply [--yes] make the changes, asking before each item
 #   hb install check         one-line verdict (exit 0 ok, 1 pending, 2 broken)
+#   hb install needs         every program hb runs, and the package it comes in: mandatory (hb
+#                            itself), needed (by what hb.toml sets up here), needed later, optional
 #
 # Items:
+#   needs   every program hb needs here is there (lib/hbkit/needs.py): hb's own, and each tool's
+#           once hb.toml sets that tool up. It says what to install; it never installs anything.
+#           plan and apply say it first: the whole list when hb isn't installed yet, else one line
 #   code    /opt/hb holds the checkout's files (git-tracked and new, never ignored
 #           ones such as hb.toml or local/)
 #   link    /usr/local/bin/hb points at /opt/hb/hb
@@ -32,10 +37,9 @@
 set -u
 source "$(dirname "$(readlink -f "$0")")/../lib/hb.sh"
 need_root
-need_config
 
-ITEMS=(code link config restic units timers)
-PREFIX=/opt/hb
+ITEMS=(needs code link config restic units timers)
+PREFIX="${HB_PREFIX:-/opt/hb}"      # tests point it elsewhere
 ETC=/etc/hb
 UNITDIR=/etc/systemd/system
 RESTIC_BIN=/usr/local/bin/restic
@@ -66,6 +70,24 @@ stage() {
   printf '%s\n' "$SRC" > "$1/.source"
   chmod -R u=rwX,go=rX "$1"
 }
+
+# --- needs ----------------------------------------------------------------------
+# needs check|list — with the settings apply installs (the checkout's hb.toml, when run from a
+# checkout that has one), and whether the code comes from a git checkout (then git is needed).
+needs() {
+  local env=()
+  if [ -z "${HB_CONFIG:-}" ] && [ "$HB_ROOT" != "$PREFIX" ] && [ -n "$SRC" ] && [ -f "$SRC/hb.toml" ]; then
+    env+=("HB_CONFIG=$SRC/hb.toml")
+  fi
+  [ -n "$SRC" ] && [ -d "$SRC/.git" ] && env+=(HB_NEEDS_GIT=1)
+  command -v python3 >/dev/null || { echo "missing: python3 (mandatory). Install: dnf install -y python3"; return 2; }
+  local rc=0
+  env "${env[@]}" python3 -IB "$HB_ROOT/lib/hbkit/needs.py" "$1" || rc=$?
+  # 0 and 2 are its answers; anything else (a crash) is no answer, never "todo"
+  case $rc in 0|2) return $rc ;; *) echo "needs.py ended with exit $rc"; return 2 ;; esac
+}
+chk_needs() { needs check; }
+fix_needs() { return 1; }     # chk_needs is never "todo": what to install is the admin's call
 
 # --- code -----------------------------------------------------------------------
 chk_code() {
@@ -230,4 +252,12 @@ fix_timers() {
   return 0
 }
 
+# The needs come before hb's config is read: they have to show on a box where it can't be yet
+# (no Python 3.11, a broken hb.toml), and hb config's error would end the run first.
+case "${1:-status}" in
+  needs) needs list; exit $? ;;
+  plan|apply)   # first: what this box lacks, all of it on a first install
+    if [ -d "$PREFIX" ]; then printf 'needs: %s\n\n' "$(needs check)"; else needs list; echo; fi ;;
+esac
+need_config
 item_main "$@"

@@ -254,5 +254,112 @@ class ResticTest(unittest.TestCase):
             self.assertEqual(f.read(), "someone's file\n")
 
 
+class NeedsItemTest(unittest.TestCase):
+    """The needs item reads the hb.toml apply is about to install, and knows a git checkout needs git."""
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        self.src, self.prefix, self.fake, self.empty = f"{d}/checkout", f"{d}/opt-hb", f"{d}/fake", f"{d}/empty"
+        write(f"{self.src}/hb.toml", '[wg]\naddress = "10.0.0.1/24"\n')
+        os.makedirs(self.empty)
+        # a python3 that says what it was given
+        write(f"{self.fake}/python3", '#!/bin/sh\necho "config=${HB_CONFIG:-} git=${HB_NEEDS_GIT:-} $3"\n')
+        os.chmod(f"{self.fake}/python3", 0o755)
+
+    def run_fn(self, fn, hb_root, path=None, **env):
+        e = {k: v for k, v in os.environ.items() if not k.startswith("HB_")}
+        e.update(HB_NEEDS_PATH=self.empty, PATH=path or os.environ["PATH"], **env)
+        p = subprocess.run(["bash", "-c", f'source "$1"; PREFIX="$2"; SRC="$3"; HB_ROOT="$4"; {fn}', "_", harness(),
+                            self.prefix, self.src, hb_root], env=e, capture_output=True, text=True, timeout=60)
+        return p.returncode, p.stdout.strip()
+
+    def test_from_a_checkout_its_hb_toml(self):
+        rc, out = self.run_fn("chk_needs", REPO, path=f"{self.fake}:{os.environ['PATH']}")
+        self.assertEqual(out, f"config={self.src}/hb.toml git= check")
+        os.makedirs(f"{self.src}/.git")
+        rc, out = self.run_fn("chk_needs", REPO, path=f"{self.fake}:{os.environ['PATH']}")
+        self.assertEqual(out, f"config={self.src}/hb.toml git=1 check")
+
+    def test_the_installed_copy_reads_its_own(self):
+        self.prefix = REPO
+        rc, out = self.run_fn("chk_needs", REPO, path=f"{self.fake}:{os.environ['PATH']}")
+        self.assertEqual(out, "config= git= check")
+        rc, out = self.run_fn("chk_needs", REPO, path=f"{self.fake}:{os.environ['PATH']}", HB_CONFIG="/x/hb.toml")
+        self.assertEqual(out, "config=/x/hb.toml git= check")
+
+    def test_it_reports_through_needs_py(self):
+        rc, out = self.run_fn("chk_needs", REPO)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("hb installs when applied: wg wg-quick (hb wg apply)", out)
+        rc, out = self.run_fn("needs list", REPO)
+        self.assertIn("  MISSING  wireguard-tools   wg wg-quick", out)
+
+    def test_a_crash_is_no_todo(self):
+        # Fable review 9: exit 1 would read as "apply would change something", and apply would offer it
+        write(f"{self.fake}/python3", "#!/bin/sh\necho boom; exit 1\n")
+        rc, out = self.run_fn("chk_needs", REPO, path=f"{self.fake}:{os.environ['PATH']}")
+        self.assertEqual((rc, out), (2, "boom\nneeds.py ended with exit 1"))
+
+    def test_without_python3_at_all(self):
+        bash = shutil.which("bash")
+        os.symlink(bash, f"{self.empty}/bash")
+        rc, out = self.run_fn("chk_needs", REPO, path=self.empty)
+        self.assertEqual((rc, out), (2, "missing: python3 (mandatory). Install: dnf install -y python3"))
+
+
+class VerbsTest(unittest.TestCase):
+    """hb install itself (not root's check): the needs verb, and plan/apply saying the needs first."""
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        self.prefix, self.cfg, self.empty = f"{d}/opt-hb", f"{d}/hb.toml", f"{d}/empty"
+        write(self.cfg, "[install]\ntimers = []\n")
+        os.makedirs(self.empty)
+        with open(os.path.join(REPO, "tools", "hb-install")) as f:
+            text = f.read()
+        self.assertEqual(text.count("\nneed_root\n"), 1)
+        text = text.replace("\nneed_root\n", "\n").replace(
+            'source "$(dirname "$(readlink -f "$0")")/../lib/hb.sh"', f'source "{REPO}/lib/hb.sh"')
+        self.script = f"{d}/hb-install"
+        write(self.script, text)
+
+    def run_install(self, *args):
+        e = {k: v for k, v in os.environ.items() if not k.startswith("HB_")}
+        e.update(HB_PREFIX=self.prefix, HB_CONFIG=self.cfg, HB_NEEDS_PATH=self.empty)
+        p = subprocess.run(["bash", self.script, *args], env=e, capture_output=True, text=True, timeout=300)
+        return p.returncode, p.stdout, p.stderr
+
+    def test_needs_lists_everything(self):
+        rc, out, _ = self.run_install("needs")
+        self.assertEqual(rc, 2)                          # nothing on the (empty) PATH
+        self.assertTrue(out.startswith("What hb runs on "), out[:200])
+        self.assertIn("missing, needed here: dnf install -y ", out)
+
+    def test_a_first_plan_starts_with_the_whole_list(self):
+        rc, out, _ = self.run_install("plan")
+        self.assertTrue(out.startswith("What hb runs on "), out[:200])
+        self.assertLess(out.index("missing, needed here:"), out.index("would change  code"))
+
+    def test_a_later_plan_starts_with_one_line(self):
+        os.makedirs(self.prefix)
+        rc, out, _ = self.run_install("plan")
+        self.assertTrue(out.startswith("needs: missing: "), out[:200])
+        self.assertNotIn("What hb runs on", out)
+
+    def test_status_has_needs_first(self):
+        rc, out, _ = self.run_install("status")
+        self.assertTrue(out.startswith("FAIL  needs          missing: "), out[:200])
+
+    def test_the_list_comes_even_when_hb_toml_is_broken(self):
+        # Fable review 1: hb config's check used to end the run before the list could say anything
+        write(self.cfg, "[install\n")
+        rc, out, err = self.run_install("plan")
+        self.assertEqual(rc, 2)
+        self.assertIn("Settings: hb.toml unread (TOMLDecodeError", out)
+        self.assertIn("cannot read config", err)
+        rc, out, err = self.run_install("needs")
+        self.assertIn("missing, needed here:", out)
+
+
 if __name__ == "__main__":
     unittest.main()
