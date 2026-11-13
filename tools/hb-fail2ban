@@ -18,7 +18,8 @@ Items:
   jail     /etc/fail2ban/jail.d/95-hb-sshd.local, read after the other jail.d files so what it
            sets wins, and the ban action /etc/fail2ban/action.d/hb-notify.conf. New files are
            tested with fail2ban-client -t first (the old ones come back if that fails), then the
-           jail reloads, keeping its bans
+           jail reloads, keeping its bans; it restarts instead when the files add an action, which
+           a reload drops up to fail2ban 1.1.1 (the bans come back from fail2ban's database)
   service  fail2ban.service enabled and running
 
 The jail: fail2ban.maxretry failures within fail2ban.findtime_minutes ban an address for
@@ -65,10 +66,10 @@ from hbkit import config, util  # noqa: E402
 
 JAIL_FILE = "/etc/fail2ban/jail.d/95-hb-sshd.local"
 ACTION_FILE = "/etc/fail2ban/action.d/hb-notify.conf"
-PACKAGES = ("fail2ban-server", "fail2ban-systemd", "nftables")
+PACKAGES = ("fail2ban-server", "fail2ban-systemd", "nftables")   # Fedora's and Amazon Linux's names
 MODES = ("normal", "ddos", "extra", "aggressive")
 SSHD = ["sshd"]                                        # tests point it at a stand-in
-SSHD_UNIT = "sshd.service"
+SSHD_UNITS = ("sshd.service", "ssh.service")          # Debian and Ubuntu name it ssh
 INTERNET = ("192.0.2.1", "2001:db8::1")                # documentation addresses: sshd's view of strangers
 # A wrong code answer as sshd logs it, once the key was accepted; fail2ban matches it after taking
 # off the line's prefix. An invalid user never gets that far ("for invalid user X from" doesn't
@@ -353,6 +354,31 @@ def live(key):
     return out.strip() if rc == 0 else None
 
 
+def notifies():
+    """Whether the running sshd jail has the hb-notify action; None when there is no such jail."""
+    actions = live("actions")
+    return None if actions is None else "hb-notify" in re.split(r"[\s,]+", actions.splitlines()[-1])
+
+
+def restart_needed(cfg):
+    """The files add hb-notify to a running jail without it. fail2ban up to 1.1.1 (Amazon Linux
+    and Fedora have 1.1.0) drops an action a reload adds: the reload's end removes the actions it
+    didn't touch, and it doesn't count a new one as touched (fixed upstream after 1.1.1, in no
+    release yet). Only a restart of the jail loads it; the jail's bans come back from fail2ban's
+    database, without a text (norestored), after a moment without them."""
+    return bool(cfg["fail2ban"]["notify_days"]) and notifies() is False
+
+
+def read_after():
+    """The jail.d files fail2ban reads after hb's: it reads jail.conf, jail.d/*.conf, jail.local,
+    then jail.d/*.local, each folder in name order."""
+    folder, name = os.path.split(JAIL_FILE)
+    try:
+        return sorted(n for n in os.listdir(folder) if n.endswith(".local") and n > name)
+    except OSError:
+        return []
+
+
 def listed(text):
     """The items of fail2ban-client's lists ("|- x", "`- x"; regexes as "[n]: x")."""
     items = [ln[3:] for ln in text.splitlines() if ln.startswith(("|- ", "`- "))]
@@ -377,10 +403,9 @@ def effective(cfg, facts):
     if skips != facts["skip_codes"]:
         diff.append(("ignoreregex", "the code exception" if skips else "none", "the code exception"
                      if facts["skip_codes"] else "none"))
-    actions = live("actions")
-    notifies = None if actions is None else "hb-notify" in re.split(r"[\s,]+", actions.splitlines()[-1])
-    if notifies != bool(f["notify_days"]):
-        diff.append(("actions", "hb-notify" if notifies else "no hb-notify", "hb-notify" if f["notify_days"]
+    has = notifies()
+    if has != bool(f["notify_days"]):
+        diff.append(("actions", "hb-notify" if has else "no hb-notify", "hb-notify" if f["notify_days"]
                      else "no hb-notify"))
     ips = live("ignoreip")
     have_ips = None if ips is None else {network(i) for i in listed(ips)}
@@ -393,8 +418,12 @@ def effective(cfg, facts):
 
 # --- items ------------------------------------------------------------------------------
 
+def installed(package):
+    return util.run("rpm", "-q", "--quiet", package)[0] == 0
+
+
 def missing_packages():
-    return [p for p in PACKAGES if util.run("rpm", "-q", "--quiet", p)[0] != 0]
+    return [p for p in PACKAGES if not installed(p)]
 
 
 def chk_package(cfg):
@@ -437,7 +466,8 @@ def chk_jail(cfg):
         diff = effective(cfg, facts)
         if diff:
             return 1, ("fail2ban runs " + ", ".join(f"{k} {h!r}, not {w!r}" for k, h, w in diff)
-                       + ": will reload the jail")
+                       + (": will restart the jail (a new action loads only then; its bans are kept)"
+                          if restart_needed(cfg) else ": will reload the jail"))
     return 0, summary(cfg, facts)
 
 
@@ -470,20 +500,24 @@ def fix_jail(cfg):
             return f"fail2ban-client -t refused them ({last(err or out, rc)}); the previous files are back"
         if not running():
             return None                                  # the service item starts it
-        rc, out, err = reload()
+        how = "restart" if restart_needed(cfg) else "reload"
+        rc, out, err = f2b("restart", "sshd", timeout=120) if how == "restart" else reload()
     except BaseException:
         put_back()
         raise
     if rc != 0:
         # files that fail2ban doesn't run would look done to the next check: back to the old ones
+        # (a whole reload also starts a jail the restart left stopped)
         put_back()
         again = reload()[0]
-        return (f"fail2ban-client reload: {last(err or out, rc)}; the previous files are back"
+        return (f"fail2ban-client {how}: {last(err or out, rc)}; the previous files are back"
                 + ("" if again == 0 else ", and reloading them failed too: sudo fail2ban-client status sshd"))
     diff = effective(cfg, facts)
     if diff:
-        return ("after the reload the jail runs " + ", ".join(f"{k} {h!r}, not {w!r}" for k, h, w in diff)
-                + f": a jail.d file read after {os.path.basename(JAIL_FILE)} sets them")
+        after = read_after()
+        return (f"after the {how} the jail runs " + ", ".join(f"{k} {h!r}, not {w!r}" for k, h, w in diff)
+                + (f": {', '.join(after)} in jail.d, read after {os.path.basename(JAIL_FILE)}, may set them"
+                   if after else ": fail2ban's log may say why"))
     return None
 
 
@@ -528,7 +562,7 @@ def logins(days):
     is 0.8 s and 235 lines instead of 5 to 25 s and 47 MB), and has less time than fail2ban gives
     its commands (60 s), so a slow read ends here with an error, not killed."""
     since = int(time.time() - days * 86400)
-    cmd = ["journalctl", f"_SYSTEMD_UNIT={SSHD_UNIT}", "--since", f"@{since}", "-o", "json",
+    cmd = ["journalctl", *(f"_SYSTEMD_UNIT={u}" for u in SSHD_UNITS), "--since", f"@{since}", "-o", "json",
            "--output-fields=MESSAGE", "--no-pager", "-q"]
     rc, out, err = util.run(*cmd, "--grep", "^Accepted ", timeout=30)
     if rc != 0 and "pattern matching" in err:            # a journalctl built without PCRE2
@@ -643,7 +677,7 @@ def remove_ours():
     old = {p: read(p) for p in left_behind()}
     for p in old:
         os.unlink(p)
-    if util.run("rpm", "-q", "--quiet", "fail2ban-server")[0] != 0:
+    if not installed("fail2ban-server"):
         return None
     rc, out, err = f2b("-t", timeout=120)
     if rc != 0:
