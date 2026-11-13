@@ -70,6 +70,15 @@ class SudoPamTest(unittest.TestCase):
             text = STOCK.replace("#%PAM-1.0\n", "#%PAM-1.0\n" + early + "\n")
             self.assertIn("an auth line comes before", sudopam.want(text, "hb-admins", VERIFIER)[1] or "", early)
         self.assertIsNone(sudopam.want(STOCK.replace("#%PAM-1.0\n", "#%PAM-1.0\n# a comment\n"), "hb-admins", VERIFIER)[1])
+        # Codex round 6: libpam joins a line ending in a backslash to the next, so "auth\" then
+        # "sufficient pam_permit.so" is an auth line; its comments never go on
+        for early in ("auth\\\nsufficient pam_permit.so", "auth \\   \n  sufficient pam_permit.so",
+                      "session optional pam_keyinit.so \\\nrevoke"):
+            text = STOCK.replace("#%PAM-1.0\n", "#%PAM-1.0\n" + early + "\n")
+            self.assertIn("goes on in the next one", sudopam.want(text, "hb-admins", VERIFIER)[1] or "", early)
+        for note in ("# a note \\", "session optional pam_keyinit.so revoke # a note \\"):
+            text = STOCK.replace("#%PAM-1.0\n", "#%PAM-1.0\n" + note + "\n")
+            self.assertIsNone(sudopam.want(text, "hb-admins", VERIFIER)[1], note)
         self.assertIn("isn't a group name", sudopam.want(STOCK, "Bad Group", VERIFIER)[1])
         self.assertIn("full path", sudopam.want(STOCK, "hb-admins", "hb-totp")[1])
 
@@ -79,7 +88,9 @@ class SudoPamTest(unittest.TestCase):
         for text, rc in (("auth include sudo\naccount include sudo\n", 0), ("AUTH substack sudo\n", 0),
                          ("auth include system-auth\n", 2), ("[auth] sufficient pam_permit.so\nauth include sudo\n", 2),
                          ("auth sufficient pam_unix.so\nauth include sudo\n", 2), ("account include sudo\n", 2),
-                         ("[auth]sufficient pam_permit.so\nauth include sudo\n", 2)):
+                         ("[auth]sufficient pam_permit.so\nauth include sudo\n", 2),
+                         ("auth\\\nsufficient pam_permit.so\nauth include sudo\n", 2),      # Codex round 6
+                         ("# a note \\\nauth include sudo\n", 0)):
             with self.subTest(text):
                 with open(f"{d}/sudo-i", "w") as f:
                     f.write(text)
@@ -176,6 +187,15 @@ class SudoPamStackTest(unittest.TestCase):
         broken = sudopam.want(STOCK, self.MINE, "/x/hb-totp")[0].replace("/x/hb-totp", "VERIFIER").replace(
             f"user ingroup {self.MINE}", f"user frobnicate {self.MINE}")
         self.assertNotEqual(self.run_stack(self.MINE, self.ANYONE, code_ok=False, text=broken)[0], 0)
+
+    def test_libpam_joins_a_line_ending_in_a_backslash(self):
+        # why hb refuses those files (Codex round 6): with "auth\" then "sufficient pam_permit.so"
+        # ahead of hb's lines, libpam lets a wrong code in. A comment ending in one doesn't go on:
+        # the permit line after it is read (and lets the wrong code in too)
+        hb = "\n".join(sudopam.hb_lines(self.MINE, "VERIFIER")) + "\nauth include system-auth\n"
+        for early in ("auth\\\nsufficient pam_permit.so", "# a note \\\nauth sufficient pam_permit.so"):
+            self.assertEqual(self.run_stack(self.MINE, self.ANYONE, False, text=early + "\n" + hb)[0], 0, early)
+        self.assertNotEqual(self.run_stack(self.MINE, self.ANYONE, False, text=hb)[0], 0)
 
     def test_everyone_else_goes_on_to_the_password_step(self):
         self.assertEqual(self.run_stack(self.NOT_MINE, self.ANYONE, code_ok=False), (0, 0))

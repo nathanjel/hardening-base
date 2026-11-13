@@ -14,7 +14,9 @@ error, say) fails the stack: it never downgrades a member to the password. sudo'
 the stack again: pam_succeed_if answers "ignore" there for everyone, which also skips the code line,
 so setcred is system-auth's, exactly as without these lines (on Fedora and AL2023 its pam_unix
 lets it succeed). No other auth line (in any case: PAM reads AUTH as auth) or @include may come
-before hb's: one could decide first (a "sufficient" password step, a jump).
+before hb's: one could decide first (a "sufficient" password step, a jump). A file with a line that
+PAM joins to the next one (its text before any '#' ends in a backslash) is refused: hb reads one
+line at a time, and "auth\\" then "sufficient pam_permit.so" is an auth line it wouldn't see.
 
   sudopam.py check FILE GROUP VERIFIER   exit 0: in place; 1: would change; 2: refused (layout)
   sudopam.py write FILE GROUP VERIFIER   put the lines in (in place, same owner and mode)
@@ -40,6 +42,15 @@ CODE_LINE_RE = re.compile(r"^auth\s+\[success=done\s+default=die\]\s+pam_exec\.s
 GROUP_NAME = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 
 
+def continued(lines):
+    """The first line PAM goes on reading in the next (libpam cuts a comment at '#' first, so a
+    comment never goes on), or None."""
+    for line in lines:
+        if line.split("#", 1)[0].rstrip().endswith("\\"):
+            return line.strip()
+    return None
+
+
 def hb_lines(group, verifier):
     return [NOTE.format(group=group),
             f"auth       [success=ignore auth_err=1 ignore=1 default=die] pam_succeed_if.so quiet user ingroup {group}",
@@ -53,6 +64,8 @@ def want(text, group, verifier):
     if not os.path.isabs(verifier) or not verifier.endswith("/hb-totp"):
         return None, f"{verifier!r} isn't hb-totp's full path"
     lines = text.splitlines()
+    if continued(lines):
+        return None, f"a line goes on in the next one (it ends in a backslash), which hb doesn't read: {continued(lines)!r}"
     kept = []
     for line in lines:
         s = line.strip()
@@ -82,6 +95,8 @@ def check_login(path):
             lines = [line.strip() for line in f.read().splitlines()]
     except OSError as e:
         return 2, f"can't read {path}, which sudo -i uses: {e}"
+    if continued(lines):
+        return 2, f"{path} (what sudo -i asks with) has a line that goes on in the next one, which hb doesn't read: {continued(lines)!r}"
     auth = [line for line in lines if AUTH_RE.match(line)]
     if len(auth) == 1 and LOGIN_INCLUDE_RE.match(auth[0]):
         return 0, f"{path}: sudo -i goes through sudo's gate"

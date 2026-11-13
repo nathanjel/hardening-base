@@ -202,14 +202,25 @@ primary_group() { getent group "$(getent passwd "$1" | cut -d: -f4)" 2>/dev/null
 # Defaults that change how long sudo stays open, whether it asks, whose password it asks for, or
 # which PAM stack asks (sudoers(5)): set anywhere but hb's own rule, they could undo the gate
 RISKY_DEFAULTS='timestamp_timeout|timestamp_type|tty_tickets|timestampowner|timestampdir|authenticate|exempt_group|rootpw|targetpw|runaspw|pam_service|pam_login_service|pam_askpass_service'
+# sudoers_lines FILE — FILE's rules and settings as sudo reads them, as N:TEXT (continued lines
+# joined, comments cut; a '#' before digits is a uid, not a comment); exit 2, saying why, when
+# FILE has sudo read rules from elsewhere (only the main file's includedir /etc/sudoers.d may)
+sudoers_lines() {
+  local inc=()
+  [ "$1" = "$SUDOERS" ] && inc=(--includedir /etc/sudoers.d)
+  "${SUDOCHECK[@]}" lines "${inc[@]}" "$1"
+}
+# in_file FILE — N:TEXT lines on stdin as FILE:N:TEXT
+in_file() { local l; while IFS= read -r l; do printf '%s:%s\n' "$1" "$l"; done; }
 # risky_defaults — Defaults lines outside hb's rule that set one of them, as FILE:LINE:TEXT (files
-# sudo reads: names without a dot or a trailing ~)
+# sudo reads: names without a dot or a trailing ~), and includes hb doesn't follow
 risky_defaults() {
-  local f
+  local f text
   for f in "$SUDOERS" "$SUDOERS_DIR"/*; do
     [ -f "$f" ] && [ "$f" != "$ADMIN_RULE" ] || continue
     case "${f##*/}" in *.*|*~) [ "$f" = "$SUDOERS" ] || continue ;; esac
-    grep -HnE "^[[:space:]]*Defaults[^#]*\b($RISKY_DEFAULTS)\b" "$f"
+    text="$(sudoers_lines "$f")" || { echo "$text"; continue; }
+    grep -E "^[0-9]+:Defaults.*\b($RISKY_DEFAULTS)\b" <<< "$text" | in_file "$f"
   done
 }
 # risky_grants — lines outside hb's rule that name the admins' group or one of admin_groups (as
@@ -226,11 +237,12 @@ risky_grants() {
     tokens+=("$u" "%:?$u")
     id="$(getent passwd "$u" | cut -d: -f3)" && [ -n "$id" ] && tokens+=("#$id")
   done
-  local any; any="$(IFS='|'; echo "${tokens[*]}")"
+  local any text; any="$(IFS='|'; echo "${tokens[*]}")"
   for f in "$SUDOERS" "$SUDOERS_DIR"/*; do
     [ -f "$f" ] && [ "$f" != "$ADMIN_RULE" ] || continue
     case "${f##*/}" in *.*|*~) [ "$f" = "$SUDOERS" ] || continue ;; esac
-    grep -HnE "^[^#]*(^|[^A-Za-z0-9_.#%:-])($any)([^A-Za-z0-9_.-]|\$)" "$f"
+    text="$(sudoers_lines "$f")" || { echo "$text"; continue; }
+    grep -E "^[0-9]+:(.*[^A-Za-z0-9_.#%:-])?($any)([^A-Za-z0-9_.-]|\$)" <<< "$text" | in_file "$f"
   done
 }
 # effective_problems USER — what sudo itself says applies to USER (sudo -l -U: the user's Defaults,
@@ -448,23 +460,25 @@ gate_and_rule() {
 # --- nopasswd: sudo rules without a password -------------------------------------
 # Any line that lets sudo skip the password (a NOPASSWD tag, a Defaults with !authenticate, or an
 # exempt_group)
-# passes only as written in harden.nopasswd_allowed (spaces don't count), only in the form
+# passes only as written in harden.nopasswd_allowed (spaces don't count; sudo's comments and
+# continued lines are read as sudo reads them), only in the form
 # lib/hbkit/sudocheck.py can read (USER HOST=(RUNAS) NOPASSWD: /full/path [args], ...: no
 # aliases, ALL, other tags or wildcards), and only while root alone can change each program it
 # runs, walked as written (links one hop at a time, ACLs refused).
 squash() { tr -s ' \t' '  ' <<< "$1" | sed -E 's/^ //; s/ $//'; }
 chk_nopasswd() {
-  local f line n a ok hits=() allowed=0 bad=() out
+  local f n a ok hits=() allowed=0 bad=() out text
   for f in "$SUDOERS" "$SUDOERS_DIR"/*; do
     [ -f "$f" ] || continue
     listed "$f" "${REMOVE_FILES[@]}" && continue
-    while IFS= read -r line; do
-      n="$(squash "$line")"; ok=0
+    text="$(sudoers_lines "$f")" || { bad+=("$text"); continue; }
+    while IFS= read -r n; do
+      n="${n#*:}"; ok=0
       for a in "${NOPASSWD_ALLOWED[@]}"; do [ "$n" = "$(squash "$a")" ] && ok=1; done
       if [ $ok = 0 ]; then hits+=("$f: $n"); continue; fi
       allowed=$((allowed + 1))
       out="$("${SUDOCHECK[@]}" allowed --top "$ROOT_ONLY_TOP" "$n")" || bad+=("$(tr '\n' ';' <<< "$out" | sed 's/;$//; s/;/; /g')")
-    done < <(grep -E '^[^#]*(NOPASSWD|!\s*authenticate|exempt_group)' "$f")
+    done < <(grep -E '^[0-9]+:.*(NOPASSWD|!\s*authenticate|exempt_group)' <<< "$text")
   done
   [ ${#bad[@]} -gt 0 ] && { out="$(printf '%s; ' "${bad[@]}")"; echo "${out%; }"; return 2; }
   if [ ${#hits[@]} -eq 0 ]; then

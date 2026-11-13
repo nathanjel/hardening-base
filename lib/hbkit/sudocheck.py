@@ -11,10 +11,19 @@ allowed_rule(RULE) takes the one form hb can check, USER HOST=(RUNAS) NOPASSWD: 
 [, /full/path [args]]..., and returns the programs it runs and the files their arguments name;
 aliases, ALL, other tags, negations, wildcards, folders (a trailing /), interpreters (a shell, env,
 python...: they run whatever they are given) and any ':', '=' or '\\' among the commands
-(another grant can start there) are refused, since what they allow can't be read from the rule.
+(another grant can start there) and '#' (sudo's comment starts there, so it would run less than
+the rule says) are refused, since what they allow can't be read from the rule.
+
+sudoers_lines(TEXT) reads a sudoers file as sudo does, for hb-harden's scans of it: a line whose
+text ends in a backslash goes on in the next, and '#' starts a comment unless a digit follows it
+(#1000 is a uid, %#1000 a gid) or it opens an include directive. A comment never goes on, and a
+'#' after a quote or a backslash is kept, so nothing sudo might read is cut away.
 
   sudocheck.py root-only [--top DIR] PATH...   exit 0: only root can change them; 1: who else can
   sudocheck.py allowed [--top DIR] RULE        exit 0: the rule's form and its programs pass; 2: not
+  sudocheck.py lines [--includedir DIR] FILE   FILE's rules and settings as sudo reads them, N:TEXT
+                                               (N: the line each starts on); exit 2 when FILE has
+                                               sudo read others (only includedir DIR may)
 
 --top stops the walk at DIR (the tests' stand-in for /, as a user namespace shows folders above
 it as nobody's). Python 3.9 (AL2023's python3), stdlib only.
@@ -33,6 +42,8 @@ RULE = re.compile(r"^(?P<user>%?[A-Za-z0-9_][A-Za-z0-9_.-]*)\s+(?P<host>[A-Za-z0
                   r"(\((?P<runas>[A-Za-z0-9_.%,: -]*)\)\s*)?NOPASSWD:\s*(?P<cmds>.+)$")
 COMMAND = re.compile(r"^(?P<path>/[^\s,]+)(\s+[^,]*)?$")
 CLAUSE = re.compile(r"[:=\\]")      # a second host clause (:), a binding (=) or an escape (\) in the commands
+INCLUDE = re.compile(r"^[@#]include(dir)?\s+(.*?)\s*$")
+NOT_COMMENT = re.compile(r"-?[0-9]")    # after '#': a uid or gid, not a comment
 WILDCARD = re.compile(r"[*?\[\]]")
 # programs that run whatever they are given (a script, a command line, another program): an
 # allowed rule should name the helper itself
@@ -122,6 +133,9 @@ def allowed_rule(rule):
     if not m:
         return None, ("hb checks allowed rules of one form only: USER HOST=(RUNAS) NOPASSWD: /full/path [args], ... "
                       f"(not {rule.strip()!r})")
+    if "#" in m.group("cmds"):
+        return None, (f"{m.group('cmds').strip()!r} in an allowed rule holds '#', where sudo starts a comment "
+                      "(it would run less than the rule says); hb takes plain arguments only")
     if CLAUSE.search(m.group("cmds")):
         return None, (f"{m.group('cmds').strip()!r} in an allowed rule holds ':', '=' or '\\', which can start another "
                       "grant or hide one; hb takes plain arguments only")
@@ -143,11 +157,74 @@ def allowed_rule(rule):
     return paths, None
 
 
+def cut_comment(line):
+    """(LINE without its comment, whether one was cut): '#' starts one unless a digit follows. A
+    quote or a backslash before it keeps the rest (sudo may read the '#' in a string, or escaped)."""
+    for i, ch in enumerate(line):
+        if ch in "\"\\":
+            return line, False
+        if ch == "#" and not NOT_COMMENT.match(line, i + 1):
+            return line[:i], True
+    return line, False
+
+
+def sudoers_lines(text):
+    """[(the line it starts on, text)]: each rule, setting or include of a sudoers file as sudo
+    reads it, its continuations joined (a backslash ends the line before), its comment cut, spaces
+    squeezed."""
+    out, cur, start = [], "", 0
+    for n, raw in enumerate(text.splitlines(), 1):
+        if not cur:
+            start = n
+            if INCLUDE.match(raw.strip()):
+                out.append((n, " ".join(raw.split())))
+                continue
+        body, cut = cut_comment(raw)
+        body = body.rstrip()
+        if body.endswith("\\") and not cut:
+            cur += body[:-1] + " "
+            continue
+        cur += body
+        if cur.strip():
+            out.append((start, " ".join(cur.split())))
+        cur = ""
+    if cur.strip():
+        out.append((start, " ".join(cur.split())))
+    return out
+
+
+def foreign_include(path, lines, includedir=None):
+    """Why sudo reads rules from where hb doesn't look (an include other than includedir DIR), or None."""
+    for n, text in lines:
+        m = INCLUDE.match(text)
+        if m and not (includedir and m.group(1) and m.group(2) == includedir):
+            return f"{path}:{n}: {text} has sudo read rules hb doesn't check: review by hand"
+    return None
+
+
 def main(argv):
     args, top = argv[2:], "/"
     if args[:1] == ["--top"] and len(args) >= 2:
         top, args = args[1], args[2:]
     cmd = argv[1] if len(argv) > 1 else ""
+    if cmd == "lines":
+        includedir, args = None, argv[2:]
+        if args[:1] == ["--includedir"] and len(args) >= 2:
+            includedir, args = args[1], args[2:]
+        if len(args) == 1:
+            try:
+                with open(args[0], errors="replace") as f:
+                    lines = sudoers_lines(f.read())
+            except OSError as e:
+                print(f"{args[0]}: {e.strerror}")
+                return 2
+            why = foreign_include(args[0], lines, includedir)
+            if why:
+                print(why)
+                return 2
+            for n, text in lines:
+                print(f"{n}:{text}")
+            return 0
     if cmd == "root-only" and args:
         problems = [p for a in args for p in root_only(a, top)]
         for p in problems:
@@ -162,7 +239,7 @@ def main(argv):
         for p in problems:
             print(f"{p}, and an allowed rule runs it")
         return 2 if problems else 0
-    print(__doc__.strip().split("\n\n")[3], file=sys.stderr)
+    print(__doc__.strip().split("\n\n")[4], file=sys.stderr)
     return 2
 
 

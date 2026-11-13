@@ -71,6 +71,9 @@ class HardenTest(unittest.TestCase):
             with open(f"{self.bin}/{name}", "w") as f:
                 f.write(text.format(log=self.log, d=d, sshd=self.sshd, journald=self.journald))
             os.chmod(f"{self.bin}/{name}", 0o755)
+        os.makedirs(f"{d}/sudoers.d")                 # the host's /etc/sudoers is root's alone (0440)
+        with open(f"{d}/sudoers", "w") as f:
+            f.write("root ALL=(ALL) ALL\n#includedir /etc/sudoers.d\n")
         self.toml = f"{d}/hb.toml"
         self.dropin = f"{self.sshd}/10-hb-harden.conf"
         self.ours = f"{self.journald}/90-hb.conf"
@@ -81,7 +84,8 @@ class HardenTest(unittest.TestCase):
 
     def tool(self, *args):
         env = {**os.environ, "HB_CONFIG": self.toml, "HB_SSHD_DIR": self.sshd, "HB_JOURNALD_DIR": self.journald,
-               "HB_STATE": f"{self.d}/state", "PATH": self.bin + os.pathsep + os.environ["PATH"]}
+               "HB_STATE": f"{self.d}/state", "HB_SUDOERS": f"{self.d}/sudoers", "HB_SUDOERS_DIR": f"{self.d}/sudoers.d",
+               "PATH": self.bin + os.pathsep + os.environ["PATH"]}
         return subprocess.run(["unshare", "-r", os.path.join(REPO, "tools", "hb-harden"), *args], env=env,
                               capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
                               start_new_session=True)
@@ -560,6 +564,25 @@ class AdminsTest(Accounts):
         self.write(f"{self.sudoers_d}/20-local", "%hb-adminsX ALL=(ALL) ALL\nmalice ALL=(ALL) ALL\n")   # other names
         self.assertNotIn("sudo rules outside hb's", self.line("admins"))
 
+    def test_sudoers_is_read_as_sudo_reads_it(self):
+        # Codex round 6: a '#' before digits is a uid, not a comment, and a line ending in a
+        # backslash goes on in the next: the one-line greps missed what came after either
+        for text, kind, found in (
+                ("#1002, alice ALL=(ALL) NOPASSWD: ALL", "rules", "1:#1002, alice ALL=(ALL) NOPASSWD: ALL"),
+                ("Defaults:#1002 timestamp_timeout=-1", "settings", "1:Defaults:#1002 timestamp_timeout=-1"),
+                ("Defaults:%hb-admins \\\n  timestamp_timeout=-1", "settings", "1:Defaults:%hb-admins timestamp_timeout=-1"),
+                ("@include /etc/sudoers.local", "settings",
+                 "1: @include /etc/sudoers.local has sudo read rules hb doesn't check: review by hand")):
+            with self.subTest(text):
+                self.write(f"{self.sudoers_d}/20-local", text + "\n")
+                r = self.tool("apply", "--yes")
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn(f"sudo {kind} outside hb's", self.line("admins"))
+                self.assertIn(f"{self.sudoers_d}/20-local:{found}", self.line("admins"))
+                self.assertNotIn("alice", self.read_db()["users"])
+        self.write(f"{self.sudoers_d}/20-local", "# alice may \\\nmalice ALL=(ALL) ALL\n")     # a comment never goes on
+        self.assertNotIn("outside hb's", self.line("admins"))
+
     def test_a_failure_after_joining_takes_the_memberships_back(self):
         # Codex round 3: taking hb's rule out isn't enough when membership brings other rules
         self.write(f"{self.d}/sudo-l-alice.txt",
@@ -853,6 +876,46 @@ class NopasswdTest(Accounts):
         self.assertIn(f"{self.sudoers_d}/20-quiet: Defaults:svc !authenticate", self.line("nopasswd"))
         self.allow(f"svc ALL=(root) NOPASSWD: {self.helper}", "Defaults:svc !authenticate")
         self.assertIn("hb checks allowed rules of one form only", self.line("nopasswd"))
+
+    def test_sudoers_is_read_as_sudo_reads_it(self):
+        # Codex round 6: "#1000" is a uid (not a comment), a backslash goes on in the next line,
+        # a comment never does; the one-line grep missed the first three
+        os.unlink(f"{self.sudoers_d}/90-cloud-init-users")
+        self.allow(f"svc ALL=(root) NOPASSWD: {self.helper}")
+        for text, found in (("#1000 ALL=(ALL) NOPASSWD: ALL", "#1000 ALL=(ALL) NOPASSWD: ALL"),
+                            ("bob ALL=(#0) NOPASSWD: ALL", "bob ALL=(#0) NOPASSWD: ALL"),
+                            ("Defaults:bob !\\\n   authenticate", "Defaults:bob ! authenticate"),
+                            ("# bob may \\\nbob ALL=(ALL) NOPASSWD: ALL", "bob ALL=(ALL) NOPASSWD: ALL")):
+            with self.subTest(text):
+                self.write(f"{self.sudoers_d}/20-local", text + "\n")
+                self.assertIn(f"rules that skip the password: {self.sudoers_d}/20-local: {found}", self.line("nopasswd"))
+        self.write(f"{self.sudoers_d}/20-local", "@include /etc/sudoers.local\n")
+        self.assertIn(f"{self.sudoers_d}/20-local:1: @include /etc/sudoers.local has sudo read rules hb doesn't check",
+                      self.line("nopasswd"))
+        os.unlink(f"{self.sudoers_d}/20-local")
+        # the allowed rule, continued and with a comment: as sudo reads it, it's the one written out
+        self.write(f"{self.sudoers_d}/svc", f"svc ALL=(root) \\\n    NOPASSWD: {self.helper}   # the net helper\n")
+        self.assertTrue(self.line("nopasswd").startswith("ok "), self.line("nopasswd"))
+
+    def test_a_sudoers_hb_cant_read_fails(self):
+        # it passed as "ok", with grep's "Permission denied" in the line
+        if not os.path.exists("/etc/shadow") or os.access("/etc/shadow", os.R_OK):
+            self.skipTest("needs a file only the real root can read")
+        out = self.tool("status", env={"HB_SUDOERS": "/etc/shadow"}).stdout
+        line = next(l for l in out.splitlines() if l.split()[1:2] == ["nopasswd"])
+        self.assertTrue(line.startswith("FAIL") and "/etc/shadow: Permission denied" in line, line)
+
+    def test_the_program_sudo_runs_is_the_one_checked(self):
+        # Codex round 6: sudo runs net-helper for "net-helper#x" ('#' starts its comment), and hb
+        # checked the file net-helper#x, which can be root's while net-helper isn't
+        self.write(f"{self.helper}#x", "#!/bin/sh\n")
+        os.chmod(f"{self.helper}#x", 0o755)
+        os.chmod(self.helper, 0o777)
+        rule = f"svc ALL=(root) NOPASSWD: {self.helper}#x"
+        self.assertIn(f"rules that skip the password: {self.sudoers_d}/svc: svc ALL=(root) NOPASSWD: {self.helper}",
+                      self.only_svc(rule))
+        self.assertIn(f"{self.helper} can be written by anyone, and an allowed rule runs it",
+                      self.only_svc(rule, allowed=f"svc ALL=(root) NOPASSWD: {self.helper}"))
 
     def test_an_acl_counts(self):
         # Codex round 1: the group bits of a file with an ACL are its mask, so they hide named writers
