@@ -385,6 +385,12 @@ while time.time() < end:
         if os.stat(to).st_uid == os.getuid():
             break
         os.symlink(target, to + "/planted")
+        # in: still root's means early. Handed over between the two looks, it was theirs already
+        if os.stat(to).st_uid != os.getuid():
+            print("early")
+            break
+        os.unlink(to + "/planted")
+        break
     except PermissionError:
         refused += 1
     except FileNotFoundError:
@@ -403,8 +409,9 @@ def case_kit():
                                user=ME, group=GID, extra_groups=[], cwd="/")
     time.sleep(0.2)
     rc = bg.do_kit(cfg, to)
-    planter.communicate(timeout=40)
+    out = planter.communicate(timeout=40)[0]
     assert rc == 0, rc
+    assert "early" not in out, "the user got a link into the kit's folder before it was theirs"
     assert not os.path.lexists(f"{to}/planted"), "the user got a link into the kit's folder before it was theirs"
     assert_untouched(target)
     st = os.stat(to)
