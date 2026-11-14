@@ -19,7 +19,8 @@ Items:
            sets wins, and the ban action /etc/fail2ban/action.d/hb-notify.conf. New files are
            tested with fail2ban-client -t first (the old ones come back if that fails), then the
            jail reloads, keeping its bans; it restarts instead when the files add an action, which
-           a reload drops up to fail2ban 1.1.1 (the bans come back from fail2ban's database)
+           a reload drops up to fail2ban 1.1.1 (the bans come back from fail2ban's database; plan
+           says how many a restart lifts when fail2ban keeps none)
   service  fail2ban.service enabled and running
 
 The jail: fail2ban.maxretry failures within fail2ban.findtime_minutes ban an address for
@@ -365,8 +366,21 @@ def restart_needed(cfg):
     and Fedora have 1.1.0) drops an action a reload adds: the reload's end removes the actions it
     didn't touch, and it doesn't count a new one as touched (fixed upstream after 1.1.1, in no
     release yet). Only a restart of the jail loads it; the jail's bans come back from fail2ban's
-    database, without a text (norestored), after a moment without them."""
+    database, without a text (norestored), after a moment without them (see restart_note)."""
     return bool(cfg["fail2ban"]["notify_days"]) and notifies() is False
+
+
+def restart_note():
+    """What a restart of the jail does to its bans: they come back from fail2ban's database, where
+    it keeps one (dbfile, on by default); without one, the restart lifts them."""
+    rc, out, _ = f2b("get", "dbfile")
+    if rc == 0 and out.strip().startswith("Current database file"):
+        return "its bans come back from fail2ban's database"
+    banned = banned_now()
+    if banned == []:
+        return "it has no bans to lose"
+    lifted = f"its {len(banned)} bans are" if banned else "any bans it has are"
+    return f"{lifted} lifted: fail2ban keeps no database (dbfile in fail2ban.conf)"
 
 
 def read_after():
@@ -459,14 +473,16 @@ def chk_jail(cfg):
         return 2, err
     stale = [p for p, text in wanted(cfg, facts).items() if read(p) != text]
     if stale:
-        return 1, f"will write {' and '.join(stale)} ({summary(cfg, facts)})"
+        then = (f"; the jail then restarts (a new action loads only then; {restart_note()})"
+                if running() and restart_needed(cfg) else "")
+        return 1, f"will write {' and '.join(stale)} ({summary(cfg, facts)}){then}"
     if running():
         if live("maxretry") is None:
             return 2, "fail2ban runs without the sshd jail: sudo fail2ban-client reload (fail2ban's log says why)"
         diff = effective(cfg, facts)
         if diff:
             return 1, ("fail2ban runs " + ", ".join(f"{k} {h!r}, not {w!r}" for k, h, w in diff)
-                       + (": will restart the jail (a new action loads only then; its bans are kept)"
+                       + (f": will restart the jail (a new action loads only then; {restart_note()})"
                           if restart_needed(cfg) else ": will reload the jail"))
     return 0, summary(cfg, facts)
 
@@ -488,6 +504,7 @@ def fix_jail(cfg):
             else:
                 util.write_atomic(p, text, mode=0o644)
 
+    started = False
     try:
         # from the first write to the end of the reload, anything that stops it (a full disk,
         # Ctrl-C) puts the old files back: new ones never tested or loaded would look done
@@ -501,9 +518,15 @@ def fix_jail(cfg):
         if not running():
             return None                                  # the service item starts it
         how = "restart" if restart_needed(cfg) else "reload"
+        started = True
         rc, out, err = f2b("restart", "sshd", timeout=120) if how == "restart" else reload()
     except BaseException:
         put_back()
+        if started:
+            try:
+                reload()             # the old files, and a jail an interrupted restart stopped starts again
+            except BaseException:
+                pass                 # a second Ctrl-C: the first one still ends hb
         raise
     if rc != 0:
         # files that fail2ban doesn't run would look done to the next check: back to the old ones

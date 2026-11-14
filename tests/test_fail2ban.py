@@ -81,6 +81,7 @@ class Box:
         self.journal_raw, self.grep = [], True          # lines that aren't JSON; journalctl has --grep
         self.on_reload = None                            # a function run at a reload (to raise in it)
         self.reload_adds_actions, self.restart_rc = False, 0   # fail2ban up to 1.1.1: a reload drops a new action
+        self.db, self.on_restart = True, None            # fail2ban's database (dbfile); a function run at a restart
         self.unit = "sshd.service"                       # the unit sshd's journal lines come from
         # the running sshd jail, as hb.toml (cfg()) wants it
         self.live = {"maxretry": "5", "findtime": "600", "bantime": "3600", "ignorecommand": KNOWN,
@@ -137,6 +138,8 @@ class Box:
             if a == ("-t",):
                 return self.test_rc, "OK: configuration test is successful\n" if not self.test_rc else "", \
                     "" if not self.test_rc else "ERROR  Failed during configuration: No section: 'Definition'"
+            if not self.active and a[:1] in (("get",), ("status",), ("set",), ("reload",), ("restart",)):
+                return 255, "", "Failed to access socket path: /var/run/fail2ban/fail2ban.sock. Is fail2ban running?\n"
             if a == ("ping",):
                 if self.pings_unanswered:
                     self.pings_unanswered -= 1
@@ -156,6 +159,8 @@ class Box:
                 self.jail_running = True
                 return 0, "OK\n", ""
             if a == ("restart", "sshd"):
+                if self.on_restart:
+                    self.on_restart()
                 if not self.jail_running:
                     return 255, "", "Sorry but the jail 'sshd' does not exist\n"
                 if self.restart_rc:
@@ -163,7 +168,12 @@ class Box:
                     return self.restart_rc, "", "ERROR  Failed to start jail 'sshd' action 'hb-notify'"
                 if self.after_reload is not None:
                     self.live.update(self.after_reload)
+                if not self.db:
+                    self.banned = []                         # nothing to restore them from
                 return 0, "OK\n", ""
+            if a == ("get", "dbfile"):
+                return 0, ("Current database file is:\n`- /var/lib/fail2ban/fail2ban.sqlite3\n" if self.db
+                           else "Database currently disabled\n"), ""
             if a[:2] == ("get", "sshd"):
                 if not self.jail_running:
                     return 255, "", "Sorry but the jail 'sshd' does not exist\n"
@@ -520,7 +530,10 @@ class ItemsTest(FakeBoxTest):
         # 13 Nov, on the box: fail2ban 1.1.0's reload dropped hb-notify, which only a restart loads
         self.box.live["actions"] = ["nftables"]
         self.box.after_reload = {"actions": ["nftables", "hb-notify"]}
-        self.assertIn("will write", fb.chk_jail(cfg())[1])                  # the first apply
+        line = fb.chk_jail(cfg())[1]                                         # the first apply
+        self.assertIn("will write", line)
+        self.assertIn("; the jail then restarts (a new action loads only then; its bans come back from "
+                      "fail2ban's database)", line)
         self.assertEqual(fb.do_plan(cfg(), apply=True, yes=True), 0)
         self.assertEqual(self.box.did("fail2ban-client", "restart"), [("fail2ban-client", "restart", "sshd")])
         self.assertEqual(self.box.did("fail2ban-client", "reload"), [])
@@ -529,7 +542,7 @@ class ItemsTest(FakeBoxTest):
         rc, line = fb.chk_jail(cfg())
         self.assertEqual(rc, 1)
         self.assertIn("actions 'no hb-notify', not 'hb-notify': will restart the jail (a new action loads "
-                      "only then; its bans are kept)", line)
+                      "only then; its bans come back from fail2ban's database)", line)
         self.assertEqual(fb.do_plan(cfg(), apply=True, yes=True), 0)
         self.assertEqual(self.box.did("fail2ban-client", "restart"), [("fail2ban-client", "restart", "sshd")])
         self.assertEqual(self.box.did("fail2ban-client", "reload"), [])
@@ -547,6 +560,64 @@ class ItemsTest(FakeBoxTest):
         self.box.reload_adds_actions = True                                  # fail2ban after 1.1.1
         self.assertEqual(fb.reload()[0], 0)
         self.assertEqual(self.box.live["actions"], ["nftables", "hb-notify"])
+
+    def test_what_a_restart_does_to_the_bans_is_said(self):
+        # Codex review (round 3): without fail2ban's database a restart lifts the jail's bans
+        self.box.live["actions"], self.box.banned = ["nftables"], ["203.0.113.5", "203.0.113.6"]
+        self.box.after_reload = {"actions": ["nftables", "hb-notify"]}
+        self.box.db = False
+        self.assertIn("(dbfile in fail2ban.conf))", fb.chk_jail(cfg())[1])  # said at the first apply too
+        self.box.db = True
+        self.written()
+        self.assertIn("will restart the jail (a new action loads only then; its bans come back from "
+                      "fail2ban's database)", fb.chk_jail(cfg())[1])
+        self.box.db = False
+        rc, line = fb.chk_jail(cfg())
+        self.assertEqual(rc, 1)
+        self.assertIn("will restart the jail (a new action loads only then; its 2 bans are lifted: fail2ban "
+                      "keeps no database (dbfile in fail2ban.conf))", line)
+        with mock.patch.object(fb, "banned_now", lambda: None):          # fail2ban can't say
+            self.assertIn("any bans it has are lifted: fail2ban keeps no database", fb.chk_jail(cfg())[1])
+        # apply asks first; a yes restarts it, and the bans are gone
+        self.assertEqual(fb.do_plan(cfg(), apply=True, yes=True), 0)
+        self.assertEqual(self.box.did("fail2ban-client", "restart"), [("fail2ban-client", "restart", "sshd")])
+        self.assertEqual(self.box.banned, [])
+        self.box.live["actions"] = ["nftables"]
+        self.assertIn("it has no bans to lose)", fb.chk_jail(cfg())[1])
+
+    def test_an_interrupted_restart_starts_the_jail_again(self):
+        # Codex review (round 3): Ctrl-C after the restart stopped the jail left it stopped
+        self.written()
+        old = {p: fb.read(p) for p in (fb.JAIL_FILE, fb.ACTION_FILE)}
+        self.box.live["actions"] = ["nftables"]
+        self.box.after_reload = {"actions": ["nftables", "hb-notify"]}
+
+        def interrupt():
+            self.box.jail_running = False                 # stopped, not started again yet
+            raise KeyboardInterrupt
+        self.box.on_restart = interrupt
+        with self.assertRaises(KeyboardInterrupt):
+            fb.fix_jail(cfg())
+        self.assertEqual({p: fb.read(p) for p in old}, old)
+        self.assertEqual(self.box.did("fail2ban-client", "reload"), [("fail2ban-client", "reload", "sshd"),
+                                                                    ("fail2ban-client", "reload")])
+        self.assertTrue(self.box.jail_running)
+        self.assertNotEqual(fb.chk_jail(cfg())[0], 2)
+        # interrupted before the restart began (a write that fails): nothing to start again
+        self.box.calls, self.box.on_restart = [], None
+        real, writes = fb.util.write_atomic, []
+
+        def full_once(p, *a, **k):                         # the first write fails, putting back works
+            writes.append(p)
+            if len(writes) == 1:
+                raise OSError(28, "No space left on device")
+            return real(p, *a, **k)
+        with mock.patch.object(fb.util, "write_atomic", full_once):
+            with self.assertRaises(OSError):
+                fb.fix_jail(cfg())
+        self.assertEqual(len(writes), 3)                    # the failed one, then both put back
+        self.assertEqual({p: fb.read(p) for p in old}, old)
+        self.assertEqual(self.box.did("fail2ban-client"), [])   # neither -t nor a reload: nothing to start again
 
     def test_a_failed_restart_puts_the_old_files_back(self):
         self.box.live["actions"] = ["nftables"]
@@ -569,6 +640,7 @@ class ItemsTest(FakeBoxTest):
         rc, line = fb.chk_jail(cfg(notify_days=0))
         self.assertEqual(rc, 1)
         self.assertIn("will write", line)
+        self.assertNotIn("restarts", line)
         self.written(cfg(notify_days=0))
         rc, line = fb.chk_jail(cfg(notify_days=0))
         self.assertIn("actions 'hb-notify', not 'no hb-notify': will reload the jail", line)
