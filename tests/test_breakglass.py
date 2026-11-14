@@ -358,5 +358,55 @@ class KitTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.out))
 
 
+
+class AlertTest(unittest.TestCase):
+    """The drop-in runs hb as root at every login of the account: hb's tree and hb.toml must be root's
+    alone, whether the drop-in is still to be written or already there (Codex review of hb fail2ban:
+    the dispatcher alone was looked at, and only before the drop-in was written)."""
+
+    def setUp(self):
+        self.enterContext(contextlib.redirect_stdout(io.StringIO()))
+        self.enterContext(mock.patch.object(bg, "DROPIN_DIR", os.path.join(tempfile.mkdtemp(), "user@{uid}.service.d")))
+        self.calls = []
+        self.enterContext(mock.patch.object(bg.util, "run", lambda *a, **k: (self.calls.append(a), (0, "", ""))[1]))
+        # ITEMS holds the functions themselves; the account is stood in for (the host running the
+        # tests may have a real one, made by hb breakglass, or none)
+        self.enterContext(mock.patch.object(bg, "ITEMS", (("account", lambda c: (0, "rescue, in wheel"), None),
+                                                          ("alert", bg.chk_alert, bg.fix_alert))))
+        self.bad = None
+        self.enterContext(mock.patch.object(bg, "unsafe_tree", lambda: self.bad))
+
+    def test_written_then_checked(self):
+        self.assertEqual(bg.chk_alert(cfg()), (1, f"will write {bg.dropin_path(4700)}"))
+        self.bad = "/home/you is you's"
+        self.assertEqual(bg.chk_alert(cfg()), (2, f"the alert would run {bg.util.HB} as root, but /home/you is "
+                                                  "you's: use the copy in /opt/hb that hb install makes (sudo hb ...)"))
+        self.assertEqual(bg.do_plan(cfg(), apply=True, yes=True), 2)
+        self.assertFalse(os.path.exists(bg.dropin_path(4700)))            # refused: nothing written
+        self.bad = None
+        self.assertEqual(bg.do_plan(cfg(), apply=True, yes=True), 0)
+        self.assertEqual(bg.chk_alert(cfg()), (0, f"logins alert via {bg.dropin_path(4700)}"))
+        self.assertIn(("systemctl", "daemon-reload"), self.calls)
+        self.bad = "/opt/hb/tools/hb-notify can be written by anyone"   # once it's in place too
+        rc, line = bg.chk_alert(cfg())
+        self.assertEqual(rc, 2)
+        self.assertTrue(line.startswith(f"the alert runs {bg.util.HB} as root, but /opt/hb/tools/hb-notify"), line)
+        rc, line = bg.verdict(cfg())
+        self.assertEqual(rc, 2)
+        self.assertIn("fail: alert: the alert runs", line)
+
+
+
+class TreeTest(unittest.TestCase):
+    def test_its_own_tree_and_host_file(self):
+        # Codex review: the hooks run without HB_CONFIG, so the file it names isn't the one to judge
+        with mock.patch.object(bg.sudocheck, "hb_problems", return_value=["a", "b"]) as hb, \
+             mock.patch.dict(os.environ, HB_CONFIG="/srv/safe.toml"):
+            self.assertEqual(bg.unsafe_tree(), "a")
+        hb.assert_called_once_with(bg.util.HB_ROOT, ["/etc/hb/hb.toml"])
+        with mock.patch.object(bg.sudocheck, "hb_problems", return_value=[]):
+            self.assertIsNone(bg.unsafe_tree())
+
+
 if __name__ == "__main__":
     unittest.main()

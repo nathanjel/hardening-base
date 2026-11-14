@@ -2,13 +2,16 @@
 
 The host file is the first that exists of: $HB_CONFIG, /etc/hb/hb.toml,
 <repo>/hb.toml. Defaults are chosen so that a missing key never changes
-anything on the system: empty lists, and "" for "not managed".
+anything on the system: empty lists, and "" for "not managed". What root runs
+from a hook (sshd's and sudo's PAM files, fail2ban, systemd) has no HB_CONFIG:
+it reads SYSTEM_FILE, else its own tree's hb.toml.
 """
 import copy
 import os
 import tomllib
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+SYSTEM_FILE = "/etc/hb/hb.toml"
 
 DEFAULTS = {
     "harden": {
@@ -217,7 +220,7 @@ DEFAULTS = {
 
 def candidates():
     env = os.environ.get("HB_CONFIG")
-    return [env] if env else ["/etc/hb/hb.toml", os.path.join(REPO, "hb.toml")]
+    return [env] if env else [SYSTEM_FILE, os.path.join(REPO, "hb.toml")]
 
 
 def path():

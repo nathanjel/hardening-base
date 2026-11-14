@@ -35,6 +35,11 @@ come back unless `hb ssh confirm` runs first. Sessions already open stay open
 either way. apply refuses when the person running it has no key in ssh.keys,
 or, with ssh.codes, when someone listed isn't enrolled in hb totp.
 
+With ssh.codes sshd runs hb-totp as root, which runs hb's libraries, the
+dispatcher and hb notify (hb.toml names its SMS command): plan, apply and check
+fail unless hb's whole tree, the folders above it and hb.toml are root's alone
+(the copy in /opt/hb that hb install makes).
+
 Config ([ssh] in hb.toml): keys ("USER TYPE KEY [COMMENT]"), codes,
 key_only_from, revert_minutes.
 """
@@ -53,7 +58,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
 import hbkit.start  # noqa: E402,F401  (first: Python 3.11+, and a quiet end when the output pipe closes)
-from hbkit import config, guard, util  # noqa: E402
+from hbkit import config, guard, sudocheck, util  # noqa: E402
 
 KEYDIR = "/etc/ssh/authorized_keys"
 SSHD_CONFIG = "/etc/ssh/sshd_config"
@@ -233,19 +238,13 @@ def describe_dropin(codes, key_only_from):
     return out
 
 
-def not_root_owned(path):
-    """Path components that someone other than root could change."""
-    bad, p = [], os.path.realpath(path)
-    while True:
-        try:
-            st = os.stat(p)
-            if st.st_uid != 0 or st.st_mode & 0o022:
-                bad.append(p)
-        except OSError:
-            bad.append(p)
-        if p == os.path.dirname(p):
-            return bad
-        p = os.path.dirname(p)
+def unsafe_tree():
+    """The first thing that lets someone other than root change what the code check runs or reads
+    as root, or None: hb's whole tree (hb-totp, the libraries it imports, the dispatcher and hb
+    notify it calls), the folders above it, and hb.toml (it names the SMS command)."""
+    # The hooks run without HB_CONFIG: they read the system file, else the tree's own (walked).
+    bad = sudocheck.hb_problems(util.HB_ROOT, [config.SYSTEM_FILE])
+    return bad[0] if bad else None
 
 
 # --- what sshd itself would do ------------------------------------------------------
@@ -331,7 +330,7 @@ def sshd_mismatches(cfg, sv):
     if err:
         return [f"sshd -T: {err}"]
     lport = (plain.get("port") or ["22"])[0]
-    diffs = {}                                         # (key, have, want) -> ["nathan from ..."]
+    diffs = {}                                         # (key, have, want) -> ["alice from ..."]
     checked, no_route = 0, []
     for where, peer, key_only in clients(sv):
         laddr, why = local_addr(peer)
@@ -442,6 +441,12 @@ def survey(cfg):
             ch = ["the code check takes the place of Fedora's password step" if s["codes"]
                   else "Fedora's password step comes back in place of the code check"]
             out["files"].append((PAM, pam_have, pam_new, 0o644, ch))
+    if s["codes"]:
+        bad = unsafe_tree()
+        if bad:
+            live = pam_have is not None and pam_hb_lines()[1] in pam_have.splitlines()
+            out["errors"].append(f"sshd {'runs' if live else 'would run'} {totp_path()} as root, but {bad}: "
+                                 "use the copy in /opt/hb that hb install makes (sudo hb ...)")
 
     members = set(keys) | ({rescue} if rescue and user_exists(rescue) else set())
     out["group"] = (group_members(), members)
@@ -482,10 +487,6 @@ def preflight(cfg, sv):
         missing = totp_missing(sv["users"])
         if missing:
             why.append(f"not enrolled in hb totp: {missing}; run sudo hb totp enrol USER first")
-        bad = not_root_owned(totp_path())
-        if bad:
-            why.append(f"sshd would run {totp_path()} as root, but {bad[0]} isn't root's alone; "
-                       "run it from the installed copy (sudo hb ...)")
     return why
 
 

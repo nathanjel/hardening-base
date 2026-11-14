@@ -17,7 +17,8 @@
 # answer for 15 minutes after 5 wrong ones. The code gate goes in before the rule (a
 # member can never sudo with a password), and the rule is put back if the whole set
 # then fails visudo. Refused, before any change: a code checker someone other than
-# root could change (apply with the installed hb, not from a checkout), another auth
+# root could change, or the tree it runs hb from (its libraries, the dispatcher, hb
+# notify) or hb.toml (apply with the installed hb, not from a checkout), another auth
 # line before the gate, a primary group hb can't take away, and Defaults or rules in
 # other files that change what hb's say (checked with sudo -l -U). Accounts are never
 # deleted here (harden.remove_accounts does that).
@@ -59,6 +60,7 @@ SUDOERS="${HB_SUDOERS:-/etc/sudoers}"
 SUDOERS_DIR="${HB_SUDOERS_DIR:-/etc/sudoers.d}"
 mapfile -t NOPASSWD_ALLOWED < <(cfg harden.nopasswd_allowed)
 ROOT_ONLY_TOP="${HB_ROOT_ONLY_TOP:-/}"      # tests: where sudocheck's walk starts judging
+HOST_FILE="${HB_HOST_FILE:-/etc/hb/hb.toml}"   # the one hb-totp's hb notify reads (it runs without HB_CONFIG)
 mapfile -t ADMINS < <(cfg harden.admins)
 ADMIN_GROUP="$(cfg harden.admin_group)"
 ADMIN_MINUTES="$(cfg harden.admin_sudo_minutes)"
@@ -293,7 +295,7 @@ admin_rule_text() {
 }
 chk_admins() {
   [ ${#ADMINS[@]} -eq 0 ] && { echo "not managed"; return 0; }
-  local u g x todo=() waiting=() pam prc out
+  local u g x todo=() waiting=() pam prc out tree
   [[ $ADMIN_GROUP =~ $NAME_RE ]] || { echo "harden.admin_group: '$ADMIN_GROUP' isn't a group name"; return 2; }
   [[ $ADMIN_MINUTES =~ ^[0-9]+$ ]] || { echo "harden.admin_sudo_minutes must be a whole number"; return 2; }
   case "$ADMIN_SHARED" in true|false) ;; *) echo "harden.admin_sudo_shared must be true or false"; return 2 ;; esac
@@ -309,9 +311,16 @@ chk_admins() {
     listed "$g" "${ADMIN_NOT_IN[@]}" && { echo "$g is in both harden.admin_groups and harden.admin_not_in"; return 2; }
   done
   listed "$ADMIN_GROUP" "${ADMIN_NOT_IN[@]}" && { echo "harden.admin_not_in names $ADMIN_GROUP itself"; return 2; }
-  # the code checker runs as root from sudo's PAM file: only root may be able to change it
+  # the code checker runs as root from sudo's PAM file: only root may be able to change it, or
+  # what it runs from its tree (hb's libraries, the dispatcher, hb notify) or the hb.toml that
+  # hb notify reads there, made or not
   if ! out="$("${SUDOCHECK[@]}" root-only --top "$ROOT_ONLY_TOP" "$TOTP")"; then
     echo "the code checker $TOTP can be changed by others ($(tr '\n' ';' <<< "$out" | sed 's/;$//; s/;/; /g')): apply with the installed hb (sudo hb harden apply), not from a checkout"
+    return 2
+  fi
+  tree="$(readlink -f "$TOTP")"; tree="${tree%/*/*}"
+  if ! out="$("${SUDOCHECK[@]}" tree --top "$ROOT_ONLY_TOP" "$tree" "$HOST_FILE")"; then
+    echo "the code checker $TOTP runs hb from $tree, which others can change ($(head -3 <<< "$out" | tr '\n' ';' | sed 's/;$//; s/;/; /g')): apply with the installed hb (sudo hb harden apply), not from a checkout"
     return 2
   fi
   for u in "${ADMINS[@]}"; do

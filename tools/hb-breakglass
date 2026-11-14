@@ -15,7 +15,10 @@ Items:
            or console) sends hb notify fail and counts as a kit test. It runs
            when the account's first session starts: a login while another of
            its sessions is open adds nothing. Every such login texts (hb notify
-           send --every-time: past notify.repeat_hours, within sms_per_day)
+           send --every-time: past notify.repeat_hours, within sms_per_day).
+           It runs hb as root, so it fails unless hb's whole tree, the
+           folders above it and hb.toml are root's alone (the copy in /opt/hb
+           that hb install makes)
 
 The kit (`kit`, again to rotate) is made in root's own folder, then written to
 DIR (default ~/hb-kit-DATE of the person running sudo, mode 700), which must be
@@ -58,7 +61,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
 import hbkit.start  # noqa: E402,F401  (first: Python 3.11+, and a quiet end when the output pipe closes)
-from hbkit import config, util  # noqa: E402
+from hbkit import config, sudocheck, util  # noqa: E402
 
 KEYDIR = "/etc/ssh/authorized_keys"
 WORDLIST = os.path.join(util.HB_ROOT, "lib", "eff_large_wordlist.txt")
@@ -159,18 +162,13 @@ def dropin_text():
             f"ExecStartPre=-+{util.HB} breakglass login\n")
 
 
-def not_root_owned(path):
-    bad, p = [], os.path.realpath(path)
-    while True:
-        try:
-            st = os.stat(p)
-            if st.st_uid != 0 or st.st_mode & 0o022:
-                bad.append(p)
-        except OSError:
-            bad.append(p)
-        if p == os.path.dirname(p):
-            return bad
-        p = os.path.dirname(p)
+def unsafe_tree():
+    """The first thing that lets someone other than root change what the alert runs or reads as
+    root, or None: hb's whole tree (the dispatcher, this tool, hb notify, the libraries), the
+    folders above it, and hb.toml (it names the SMS command)."""
+    # The hooks run without HB_CONFIG: they read the system file, else the tree's own (walked).
+    bad = sudocheck.hb_problems(util.HB_ROOT, [config.SYSTEM_FILE])
+    return bad[0] if bad else None
 
 
 def chk_alert(cfg):
@@ -181,11 +179,12 @@ def chk_alert(cfg):
             have = f.read()
     except FileNotFoundError:
         have = None
+    bad = unsafe_tree()
+    if bad:
+        return 2, (f"the alert {'runs' if have == dropin_text() else 'would run'} {util.HB} as root, but {bad}: "
+                   "use the copy in /opt/hb that hb install makes (sudo hb ...)")
     if have == dropin_text():
         return 0, f"logins alert via {path}"
-    bad = not_root_owned(util.HB)
-    if bad:
-        return 2, f"the alert would run {util.HB} as root, but {bad[0]} isn't root's alone; use sudo hb ..."
     return 1, f"will write {path}"
 
 

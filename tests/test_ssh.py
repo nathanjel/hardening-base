@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 from tools import load_tool, temp_state  # noqa: E402
@@ -321,6 +322,17 @@ class SshdTest(unittest.TestCase):
         self.assertEqual(eff["kbdinteractiveauthentication"], "no")
 
 
+class TreeTest(unittest.TestCase):
+    def test_its_own_tree_and_host_file(self):
+        # Codex review: the hooks run without HB_CONFIG, so the file it names isn't the one to judge
+        with mock.patch.object(ssh.sudocheck, "hb_problems", return_value=["a", "b"]) as hb, \
+             mock.patch.dict(os.environ, HB_CONFIG="/srv/safe.toml"):
+            self.assertEqual(ssh.unsafe_tree(), "a")
+        hb.assert_called_once_with(ssh.util.HB_ROOT, ["/etc/hb/hb.toml"])
+        with mock.patch.object(ssh.sudocheck, "hb_problems", return_value=[]):
+            self.assertIsNone(ssh.unsafe_tree())
+
+
 class ApplyTest(unittest.TestCase):
     """apply → revert → apply → confirm, with systemd, sshd and the group tools faked."""
 
@@ -344,7 +356,7 @@ class ApplyTest(unittest.TestCase):
         self.pam = os.path.join(root, "pam-sshd")
         with open(self.pam, "w") as f:
             f.write(FEDORA_PAM)
-        saved = {n: getattr(ssh, n) for n in ("KEYDIR", "DROPIN", "PAM", "totp_missing", "not_root_owned",
+        saved = {n: getattr(ssh, n) for n in ("KEYDIR", "DROPIN", "PAM", "totp_missing", "unsafe_tree",
                                                "group_members", "sshd_mismatches")}
         self.addCleanup(lambda: [setattr(ssh, n, v) for n, v in saved.items()])
         self.addCleanup(setattr, ssh.util, "notify", ssh.util.notify)
@@ -358,7 +370,7 @@ class ApplyTest(unittest.TestCase):
                                            os.path.join(root, "sshd_config.d", "10-hb-ssh.conf"), self.pam)
         self.missing = ""
         ssh.totp_missing = lambda users: self.missing
-        ssh.not_root_owned = lambda path: []
+        ssh.unsafe_tree = lambda: None
         self.pub = make_key(root, "desk")
         self.cfg = {"ssh": {"keys": [f"{ME} {self.pub}"], "codes": True, "key_only_from": ["10.77.0.0/24"],
                             "revert_minutes": 5},
@@ -413,7 +425,7 @@ class ApplyTest(unittest.TestCase):
         os.environ["SUDO_USER"] = ME
         self.missing = ME
         self.assertEqual(ssh.do_apply(self.cfg, yes=True), 2)
-        ssh.not_root_owned = lambda path: ["/home/x"]
+        ssh.unsafe_tree = lambda: "/home/x is x's"
         self.missing = ""
         self.assertEqual(ssh.do_apply(self.cfg, yes=True), 2)
         self.assertFalse(os.path.exists(self.log))                       # nothing ran at all
@@ -488,6 +500,25 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertTrue(line.startswith("fail: sshd: allowgroups"), line)
         self.assertIn("1 more", line)
+
+    def test_the_code_check_runs_from_a_tree_of_roots(self):
+        # Codex review of hb fail2ban: the code check runs hb-totp, its libraries, the dispatcher and
+        # hb notify as root, and hb.toml names the SMS command; apply alone used to look, at hb-totp
+        ssh.unsafe_tree = lambda: "/home/x is x's"
+        want = (f"fail: sshd would run {ssh.totp_path()} as root, but /home/x is x's: "
+                "use the copy in /opt/hb that hb install makes (sudo hb ...)")
+        self.assertEqual(ssh.verdict(self.cfg), (2, want))
+        self.assertEqual(ssh.do_plan(self.cfg), 2)
+        self.assertEqual(ssh.do_apply(self.cfg, yes=True), 2)
+        self.assertFalse(os.path.exists(self.log))                       # nothing ran at all
+        ssh.unsafe_tree = lambda: None
+        self.settled()
+        ssh.unsafe_tree = lambda: "/opt/hb/lib/hbkit/util.py can be written by anyone"
+        self.assertEqual(ssh.verdict(self.cfg), (2, f"fail: sshd runs {ssh.totp_path()} as root, but "
+                                                    "/opt/hb/lib/hbkit/util.py can be written by anyone: "
+                                                    "use the copy in /opt/hb that hb install makes (sudo hb ...)"))
+        self.cfg["ssh"]["codes"] = False                                  # without codes it runs nothing
+        self.assertEqual(ssh.verdict(self.cfg)[0], 1)                     # (the PAM file is to go back)
 
     def test_stray_key_file_goes(self):
         os.makedirs(ssh.KEYDIR)

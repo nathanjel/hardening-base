@@ -57,13 +57,12 @@ import ipaddress
 import json
 import os
 import re
-import stat
 import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
 import hbkit.start  # noqa: E402,F401  (first: Python 3.11+, and a quiet end when the output pipe closes)
-from hbkit import config, util  # noqa: E402
+from hbkit import config, sudocheck, util  # noqa: E402
 
 JAIL_FILE = "/etc/fail2ban/jail.d/95-hb-sshd.local"
 ACTION_FILE = "/etc/fail2ban/action.d/hb-notify.conf"
@@ -86,7 +85,6 @@ PAM_INCLUDE = re.compile(r"^-?auth\s+(?:include|substack)\s+([A-Za-z0-9_][A-Za-z
 # what libpam takes for an auth line: the type in any case, in brackets or not, and Debian's
 # @include (all types). One that isn't written as above counts as one that may take a password.
 PAM_AUTH = re.compile(r"^(\[-?auth\]|-?auth(\s|\[|$)|@include\b)", re.IGNORECASE)
-ROOT_UIDS = {0}                                         # tests add their own
 ACCEPTED = re.compile(r"^Accepted \S+ for (\S+) from (\S+) port \d+")
 WAIT_PING = 10                                          # seconds for a started fail2ban to answer
 SELINUX_ENFORCE = "/sys/fs/selinux/enforce"
@@ -127,55 +125,12 @@ def problems(cfg):
     return out
 
 
-def unsafe(st, above=False):
-    """Someone other than root could change it. Above the path in question a sticky folder of
-    root's (/tmp) is safe: nobody can replace another's entry in it. Inside hb's tree it isn't:
-    a new lib/json.py would be imported first."""
-    if st.st_uid not in ROOT_UIDS:
-        return True
-    if not st.st_mode & 0o022:
-        return False
-    return not (above and stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_ISVTX)
-
-
-def not_root_owned(path):
-    """The path and each folder above it that someone other than root could change."""
-    bad, p, above = [], os.path.realpath(path), False
-    while True:
-        try:
-            if unsafe(os.stat(p), above):
-                bad.append(p)
-        except OSError:
-            bad.append(p)
-        if p == os.path.dirname(p):
-            return bad
-        p, above = os.path.dirname(p), True
-
-
-def unsafe_path(root=None, cfg_path=None):
-    """The first path that fail2ban's callbacks run or read as root and that someone other than root
-    could change, or None: hb's whole tree (the dispatcher, this tool, hb notify, the libraries)
-    and the folders above it, and hb.toml (it names the SMS command). A link in the tree must
-    lead to a file that is safe the same way."""
-    root = os.path.realpath(root or util.HB_ROOT)
-    bad = not_root_owned(root)
-    if bad:
-        return bad[0]
-    for top, dirs, files in os.walk(root):
-        for name in dirs + files:
-            path = os.path.join(top, name)
-            try:
-                st = os.lstat(path)
-            except OSError:
-                return path
-            if stat.S_ISLNK(st.st_mode):
-                target = os.path.realpath(path)
-                if os.path.isdir(target) or not_root_owned(target):
-                    return path
-            elif unsafe(st):
-                return path
-    cfg_path = cfg_path if cfg_path is not None else config.path()
-    bad = not_root_owned(cfg_path) if cfg_path else []
+def unsafe_tree():
+    """The first thing that lets someone other than root change what fail2ban's callbacks run or
+    read as root, or None: hb's whole tree (the dispatcher, this tool, hb notify, the libraries),
+    the folders above it, and hb.toml (it names the SMS command)."""
+    # The hooks run without HB_CONFIG: they read the system file, else the tree's own (walked).
+    bad = sudocheck.hb_problems(util.HB_ROOT, [config.SYSTEM_FILE])
     return bad[0] if bad else None
 
 
@@ -464,9 +419,9 @@ def summary(cfg, facts):
 
 
 def chk_jail(cfg):
-    bad = unsafe_path()
+    bad = unsafe_tree()
     if bad:
-        return 2, (f"fail2ban would run hb from {util.HB_ROOT} as root, but {bad} isn't root's alone; "
+        return 2, (f"fail2ban would run hb from {util.HB_ROOT} as root, but {bad}: "
                    "use the copy in /opt/hb that hb install makes (sudo hb ...)")
     facts, err = sshd_facts()
     if err:
@@ -721,10 +676,10 @@ def verdict(cfg):
         left = left_behind()
         if not left:
             return 0, "ok: not managed (fail2ban.enabled is false)"
-        bad = unsafe_path()
+        bad = unsafe_tree()
         if bad:
             return 2, (f"fail: fail2ban.enabled is false, but hb's sshd jail is still in place and runs hb from "
-                       f"{util.HB_ROOT} as root, where {bad} isn't root's alone: sudo hb fail2ban apply takes it out")
+                       f"{util.HB_ROOT} as root, and {bad}: sudo hb fail2ban apply takes it out")
         return 1, (f"warn: fail2ban.enabled is false, but {' and '.join(left)} still set the sshd jail: "
                    "sudo hb fail2ban apply takes them out")
     probs = problems(cfg)

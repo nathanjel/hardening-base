@@ -30,6 +30,16 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(config.get(cfg, "k8s.nodeport_addresses"), ["127.0.0.0/8"])
         self.assertEqual(config.get(cfg, "k8s.flavour"), "microk8s")
 
+    def test_where_the_host_file_is_looked_for(self):
+        # the hooks (PAM, fail2ban, systemd) run without HB_CONFIG: hb's tree check judges SYSTEM_FILE
+        saved = os.environ.pop("HB_CONFIG", None)
+        self.addCleanup(lambda: saved is None or os.environ.__setitem__("HB_CONFIG", saved))
+        self.assertEqual(config.SYSTEM_FILE, "/etc/hb/hb.toml")
+        self.assertEqual(config.candidates(), [config.SYSTEM_FILE, os.path.join(config.REPO, "hb.toml")])
+        os.environ["HB_CONFIG"] = "/srv/x.toml"
+        self.addCleanup(os.environ.pop, "HB_CONFIG", None)
+        self.assertEqual(config.candidates(), ["/srv/x.toml"])
+
     def test_unknown_key_raises(self):
         with self.assertRaises(KeyError):
             config.get(self.load_text(""), "k8s.nope")

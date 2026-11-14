@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 import tools  # noqa: E402,F401  (puts lib/ on the path)
@@ -79,6 +80,190 @@ class RootOnlyTest(unittest.TestCase):
     def test_the_real_root(self):
         self.assertEqual(sudocheck.root_only("/bin/sh"), [])                  # /bin -> usr/bin, root's all the way
         self.assertIn(f"{self.d} is {ME}'s", sudocheck.root_only(f"{self.d}/real/prog"))
+
+
+class HbProblemsTest(unittest.TestCase):
+    """What root runs from hb's tree (a PAM code check, fail2ban's actions, the break-glass alert)
+    must be root's alone: the folders above the tree, everything in it and hb.toml (Codex reviews of
+    hb fail2ban: the dispatcher alone was checked, not the tool and the libraries it runs). The
+    test's own uid stands in for root's."""
+
+    def setUp(self):
+        saved = sudocheck.ROOT_UIDS
+        sudocheck.ROOT_UIDS = frozenset({0, os.getuid()})
+        self.addCleanup(setattr, sudocheck, "ROOT_UIDS", saved)
+        d = self.d = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        os.chmod(d, 0o755)
+        self.root = f"{d}/opt/hb"
+        for rel, mode in (("hb", 0o755), ("tools/hb-totp", 0o755), ("tools/hb-notify", 0o755),
+                          ("lib/hbkit/util.py", 0o644)):
+            path = os.path.join(self.root, rel)
+            os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+            with open(path, "w") as f:
+                f.write("x\n")
+            os.chmod(path, mode)
+        for folder in (f"{d}/opt", self.root, f"{self.root}/tools", f"{self.root}/lib", f"{self.root}/lib/hbkit"):
+            os.chmod(folder, 0o755)
+        os.makedirs(f"{d}/etc/hb", mode=0o700)
+        os.chmod(f"{d}/etc", 0o755)
+        self.cfg = f"{d}/etc/hb/hb.toml"
+        with open(self.cfg, "w") as f:
+            f.write("")
+        os.chmod(self.cfg, 0o600)
+
+    def problems(self, *host_files):
+        return sudocheck.hb_problems(self.root, list(host_files or [self.cfg]), top=self.d)
+
+    def test_a_tree_of_roots_is_safe(self):
+        self.assertEqual(self.problems(), [])
+        self.assertEqual(sudocheck.hb_problems(self.root, [], top=self.d), [])
+
+    def test_anything_others_can_change_is_named(self):
+        gname = sudocheck.name_of(gid=os.getgid())
+        cases = (("lib/hbkit/util.py", 0o664, f"can be written by group {gname}"),
+                 ("tools/hb-notify", 0o757, "can be written by anyone"),
+                 ("lib", 0o775, f"can be written by group {gname}"),
+                 ("lib/hbkit", 0o1757, "can be written by anyone"),          # sticky inside the tree: a new module
+                 ("tools", 0o1757, "can be written by anyone"),              # a new tool, which hb check runs
+                 ("", 0o1757, "can be written by anyone"),                   # the tree itself: a new hb.toml
+                 ("", 0o757, "can be written by anyone"))
+        for rel, mode, why in cases:
+            p = os.path.join(self.root, rel).rstrip("/")
+            before = os.stat(p).st_mode & 0o7777
+            os.chmod(p, mode)
+            self.assertEqual(self.problems(), [f"{p} {why}"], (rel, oct(mode)))
+            os.chmod(p, before)
+        self.assertEqual(self.problems(), [])
+
+    def test_the_folders_above_and_the_host_file(self):
+        os.chmod(f"{self.d}/opt", 0o757)
+        self.assertEqual(self.problems(), [f"{self.d}/opt can be written by anyone"])
+        os.chmod(f"{self.d}/opt", 0o1757)                                    # above it, a sticky folder is safe
+        self.assertEqual(self.problems(), [])
+        os.chmod(f"{self.d}/opt", 0o755)
+        os.chmod(self.cfg, 0o606)
+        self.assertEqual(self.problems(), [f"{self.cfg} can be written by anyone"])
+        os.chmod(self.cfg, 0o600)
+        os.chmod(f"{self.d}/etc/hb", 0o707)
+        self.assertEqual(self.problems(), [f"{self.d}/etc/hb can be written by anyone"])
+        os.chmod(f"{self.d}/etc/hb", 0o700)
+
+    def test_links_on_the_way_to_the_tree(self):
+        # Codex round 3: links above ROOT, or naming ROOT, are followed as the kernel would; the
+        # tree is walked where it really is
+        os.symlink("opt", f"{self.d}/opt-link")
+        os.symlink("opt/hb", f"{self.d}/hb-link")
+        for root in (f"{self.d}/opt-link/hb", f"{self.d}/hb-link"):
+            self.assertEqual(sudocheck.hb_problems(root, [self.cfg], top=self.d), [], root)
+        os.chmod(f"{self.root}/tools/hb-notify", 0o757)
+        self.assertEqual(sudocheck.hb_problems(f"{self.d}/hb-link", [], top=self.d),
+                         [f"{self.root}/tools/hb-notify can be written by anyone"])
+        os.chmod(f"{self.root}/tools/hb-notify", 0o755)
+        os.chmod(f"{self.d}/opt", 0o757)                                   # where the link leads is judged
+        self.assertEqual(sudocheck.hb_problems(f"{self.d}/hb-link", [], top=self.d),
+                         [f"{self.d}/opt can be written by anyone"])
+
+    def test_a_host_file_reached_by_a_link(self):
+        link = f"{self.d}/etc/hb/link.toml"
+        os.symlink("hb.toml", link)                                         # judged where it leads, the link too
+        self.assertEqual(self.problems(link), [])
+        os.chmod(self.cfg, 0o606)
+        self.assertEqual(self.problems(link), [f"{self.cfg} can be written by anyone"])
+        os.chmod(self.cfg, 0o600)
+        os.unlink(link)
+        os.symlink("gone.toml", link)                                       # there, but leading nowhere
+        self.assertEqual(self.problems(link), [f"{self.d}/etc/hb/gone.toml: no such file or directory"])
+
+    def test_a_host_file_not_made_yet(self):
+        # Codex review: /etc/hb/hb.toml comes before the tree's own; an open /etc/hb let others make it
+        missing = f"{self.d}/etc/hb/other.toml"
+        self.assertEqual(self.problems(missing), [])
+        for mode in (0o707, 0o1707):                                         # a sticky bit doesn't stop a new file
+            os.chmod(f"{self.d}/etc/hb", mode)
+            self.assertEqual(self.problems(missing), [f"{self.d}/etc/hb can be written by anyone"], oct(mode))
+        os.chmod(f"{self.d}/etc/hb", 0o700)
+        deeper = f"{self.d}/etc/nohb/hb.toml"                                # its folder isn't there either
+        self.assertEqual(self.problems(deeper), [])
+        os.chmod(f"{self.d}/etc", 0o1757)
+        self.assertEqual(self.problems(deeper), [f"{self.d}/etc can be written by anyone"])
+        self.assertEqual(self.problems(self.cfg), [])                        # one that is there: as root_only judges it
+        os.makedirs(f"{self.d}/etc/a", mode=0o755)                          # the folders above the one there
+        os.chmod(f"{self.d}/etc", 0o757)
+        self.assertEqual(self.problems(f"{self.d}/etc/a/b/hb.toml"), [f"{self.d}/etc can be written by anyone"])
+        os.chmod(f"{self.d}/etc", 0o755)
+        os.chmod(f"{self.d}", 0o757)
+        self.assertEqual(self.problems(deeper)[0], f"{self.d} can be written by anyone")
+
+    def test_someone_elses_files(self):
+        sudocheck.ROOT_UIDS = frozenset({0})
+        # the tree isn't walked once a folder on the way to it fails; the host file is still judged
+        self.assertEqual(self.problems(), [f"{p} is {ME}'s" for p in (self.d, f"{self.d}/opt", self.root,
+                                                                      f"{self.d}/etc", f"{self.d}/etc/hb", self.cfg)])
+        inside = f"{self.root}/hb.toml"                                    # each problem once
+        with open(inside, "w") as f:
+            f.write("")
+        os.chmod(inside, 0o606)
+        sudocheck.ROOT_UIDS = frozenset({0, os.getuid()})
+        self.assertEqual(self.problems(inside), [f"{inside} can be written by anyone"])
+        os.unlink(inside)
+        sudocheck.ROOT_UIDS = frozenset({0, os.getuid()})
+        os.chmod(f"{self.root}/lib", 0o775)
+        with mock.patch.object(sudocheck.os, "lstat", side_effect=fake_owner(f"{self.root}/tools/hb-notify")):
+            self.assertEqual(self.problems(), [f"{self.root}/lib can be written by group "
+                                               f"{sudocheck.name_of(gid=os.getgid())}",
+                                               f"{self.root}/tools/hb-notify is nobody's"])
+
+    def test_no_links_in_the_tree(self):
+        # Codex reviews: a tool imports the libraries beside its real path, so a link moves them,
+        # out of the tree (to a protected tool elsewhere) or up a level inside it (tools/x -> ../x
+        # imports from the folder above the tree)
+        os.makedirs(f"{self.d}/other/tools", mode=0o755)
+        with open(f"{self.d}/other/tools/hb-totp", "w") as f:
+            f.write("x\n")
+        with open(f"{self.root}/hb-notify", "w") as f:
+            f.write("x\n")
+        tool = f"{self.root}/tools/hb-totp"
+        os.unlink(tool)
+        why = "is a link (hb's tree has none: a tool imports from beside where it really is)"
+        for target in (f"{self.d}/other/tools/hb-totp", "../hb-notify", "hb-notify", "..", "missing", "/etc/passwd"):
+            os.symlink(target, tool)
+            self.assertEqual(self.problems(), [f"{tool} {why}"], target)
+            os.unlink(tool)
+        self.assertEqual(self.problems(), [])
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a folder of mode 000")
+    def test_a_folder_it_cant_read(self):
+        os.chmod(f"{self.root}/lib/hbkit", 0o000)
+        self.addCleanup(os.chmod, f"{self.root}/lib/hbkit", 0o755)
+        self.assertEqual(self.problems(), [f"{self.root}/lib/hbkit: permission denied"])
+
+    def test_the_command(self):
+        tool = [sys.executable, "-IB", os.path.join(tools.REPO, "lib", "hbkit", "sudocheck.py"), "tree", "--top", self.d]
+        os.makedirs(f"{self.d}/srv", mode=0o755)
+        r = subprocess.run(tool + [self.root, self.cfg, f"{self.d}/srv/hb.toml"], capture_output=True, text=True)
+        self.assertEqual((r.returncode, r.stdout.splitlines()[0]), (1, f"{self.d} is {ME}'s"))  # its own ROOT_UIDS
+        self.assertEqual(r.stdout.splitlines()[-2:], [f"{self.cfg} is {ME}'s", f"{self.d}/srv is {ME}'s"])  # both files
+        # Codex round 2: a missing host file given as a relative path looped forever
+        r = subprocess.run(tool + [self.root, "missing.toml", "no/such/hb.toml"], capture_output=True, text=True,
+                           timeout=10, cwd=self.d)
+        self.assertEqual(r.stdout.splitlines()[-2:], ["missing.toml isn't a full path", "no/such/hb.toml isn't a full path"])
+        self.assertEqual(sudocheck.hb_problems(self.root, ["hb.toml"], top=self.d), ["hb.toml isn't a full path"])
+        r = subprocess.run(tool, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("sudocheck.py tree [--top DIR] ROOT [FILE...]", r.stderr)
+
+
+def fake_owner(path):
+    """os.lstat, with PATH someone else's (uid 65534)."""
+    real = os.lstat
+
+    def lstat(p, *a, **k):
+        st = real(p, *a, **k)
+        if p != path:
+            return st
+        return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 65534) + tuple(st)[5:])
+    return lstat
 
 
 class AllowedRuleTest(unittest.TestCase):

@@ -30,7 +30,7 @@ def _remove_run_tmp():
             if os.path.isdir(path) and not os.path.islink(path):
                 os.chmod(path, 0o700)
             func(path)
-        except OSError:
+        except (OSError, TypeError):    # Python 3.14 may pass os.open, which needs flags: the next pass
             pass
     handler = {"onexc": unblock} if sys.version_info >= (3, 12) else {"onerror": unblock}
     shutil.rmtree(RUN_TMP, **handler)

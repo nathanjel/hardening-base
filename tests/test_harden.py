@@ -388,6 +388,12 @@ class Accounts(unittest.TestCase):
         os.chmod(f"{self.bin}/accounts", 0o755)
         for name in ("getent", "id", "useradd", "userdel", "groupadd", "usermod", "gpasswd", "visudo", "sudo", "hb-totp"):
             os.symlink("accounts", f"{self.bin}/{name}")
+        self.tree = f"{d}/opt/hb"                     # stands in for /opt/hb: hb-totp is a file there, not a link
+        os.makedirs(f"{self.tree}/tools")
+        for p in (f"{d}/opt", self.tree, f"{self.tree}/tools"):
+            os.chmod(p, 0o755)
+        self.totp = f"{self.tree}/tools/hb-totp"
+        shutil.copy(f"{self.bin}/accounts", self.totp)
         self.db({"mallory": {"shell": "/bin/bash"}}, {"systemd-journal": [], "docker": [], "microk8s": ["mallory"]})
         with open(f"{d}/sudoers", "w") as f:
             f.write("root ALL=(ALL) ALL\n#includedir /etc/sudoers.d\n")
@@ -413,17 +419,17 @@ class Accounts(unittest.TestCase):
             f.write("[harden]\n" + "".join(f"{line}\n" for line in lines) + extra)
 
     def tool(self, *args, env=None):
-        env = {**os.environ, "HB_CONFIG": self.toml, "HB_STATE": f"{self.d}/state", "HB_SUDOERS": f"{self.d}/sudoers",
-               "HB_SUDOERS_DIR": self.sudoers_d, "HB_PAM_SUDO": self.pam, "HB_PAM_SUDO_I": self.pam_i,
-               "HB_TOTP": f"{self.bin}/hb-totp",
+        env = {**os.environ, "HB_CONFIG": self.toml, "HB_HOST_FILE": self.toml, "HB_STATE": f"{self.d}/state",
+               "HB_SUDOERS": f"{self.d}/sudoers", "HB_SUDOERS_DIR": self.sudoers_d, "HB_PAM_SUDO": self.pam, "HB_PAM_SUDO_I": self.pam_i,
+               "HB_TOTP": self.totp,
                "HB_ROOT_ONLY_TOP": self.d, "HB_HOME_BASE": f"{self.d}/home", "PATH": self.bin + os.pathsep + os.environ["PATH"],
                **(env or {})}
         return subprocess.run(["unshare", "-r", os.path.join(REPO, "tools", "hb-harden"), *args], env=env,
                               capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
                               start_new_session=True)
 
-    def line(self, item):
-        return next(l for l in self.tool("status").stdout.splitlines() if l.split()[1:2] == [item])
+    def line(self, item, env=None):
+        return next(l for l in self.tool("status", env=env).stdout.splitlines() if l.split()[1:2] == [item])
 
     def rule(self):
         with open(f"{self.sudoers_d}/10-hb-admins") as f:
@@ -465,7 +471,7 @@ class AdminsTest(Accounts):
             "%hb-admins ALL=(ALL) ALL\n"))
         self.assertEqual(os.stat(f"{self.sudoers_d}/10-hb-admins").st_mode & 0o777, 0o440)
         self.assertEqual([f for f in os.listdir(self.sudoers_d)], ["10-hb-admins"])        # no temp file left
-        self.assertIn(f"pam_exec.so quiet expose_authtok {self.bin}/hb-totp verify\nauth       include      system-auth",
+        self.assertIn(f"pam_exec.so quiet expose_authtok {self.totp} verify\nauth       include      system-auth",
                       self.pam_text())
         self.assertIn("[success=ignore auth_err=1 ignore=1 default=die] pam_succeed_if.so quiet user ingroup hb-admins",
                       self.pam_text())
@@ -749,12 +755,45 @@ class AdminsTest(Accounts):
     def test_the_code_checker_has_to_be_roots_alone(self):
         # Codex round 1: applied from a checkout, sudo's PAM file would run a user's program as root
         os.chmod(f"{self.bin}/accounts", 0o777)
-        r = self.tool("apply", "--yes")
+        env = {"HB_TOTP": f"{self.bin}/hb-totp"}                          # a link to it
+        r = self.tool("apply", "--yes", env=env)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn(f"the code checker {self.bin}/hb-totp can be changed by others ({self.bin}/accounts can be written "
-                      "by anyone): apply with the installed hb", self.line("admins"))
+                      "by anyone): apply with the installed hb", self.line("admins", env))
         self.assertEqual(self.pam_text(), PAM_SUDO)
         self.assertNotIn("alice", self.read_db()["users"])
+
+    def test_what_the_code_checker_runs_has_to_be_roots_alone_too(self):
+        # Codex review of hb fail2ban: hb-totp runs hb's libraries, the dispatcher and hb notify from
+        # its tree, and hb notify reads hb.toml; only hb-totp's own path was looked at
+        tree, env = self.tree, {}                                          # hb.toml is outside the tree
+        os.makedirs(f"{tree}/lib", mode=0o755)
+
+        def admins():
+            return self.line("admins", env)
+        self.assertNotIn("others can change", admins())
+        os.chmod(f"{tree}/lib", 0o757)
+        r = self.tool("apply", "--yes", env=env)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn(f"the code checker {tree}/tools/hb-totp runs hb from {tree}, which others can change "
+                      f"({tree}/lib can be written by anyone): apply with the installed hb", admins())
+        self.assertEqual(self.pam_text(), PAM_SUDO)
+        self.assertNotIn("alice", self.read_db()["users"])
+        os.chmod(f"{tree}/lib", 0o755)
+        os.chmod(self.toml, 0o646)
+        self.assertIn(f"which others can change ({self.toml} can be written by anyone)", admins())
+        os.chmod(self.toml, 0o644)
+        self.assertNotIn("others can change", admins())
+        # Codex review: hb-totp's hb notify reads the system file (no HB_CONFIG there), made or not
+        os.makedirs(f"{self.d}/etc-hb")
+        os.chmod(f"{self.d}/etc-hb", 0o1757)
+        env["HB_HOST_FILE"] = f"{self.d}/etc-hb/hb.toml"
+        self.assertIn(f"which others can change ({self.d}/etc-hb can be written by anyone)", admins())
+        os.chmod(f"{self.d}/etc-hb", 0o755)
+        self.assertNotIn("others can change", admins())
+        # Codex round 2: a link in the tree moves what the tool imports; hb's tree has none
+        os.symlink("../lib", f"{tree}/tools/lib")
+        self.assertIn(f"which others can change ({tree}/tools/lib is a link", admins())
 
     def test_a_failed_pam_write_installs_no_rule(self):
         # Codex round 1: the rule goes in only after the code check, so a password never gets a chance

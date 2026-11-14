@@ -1,4 +1,6 @@
-"""Whether only root can change what sudo runs, for hb-harden's nopasswd and admins items.
+"""Whether only root can change what root runs: what sudo runs, for hb-harden's nopasswd and admins
+items, and hb's own tree, for every hook that runs hb as root (the code check in sudo's and sshd's
+PAM files, fail2ban's actions, the break-glass login alert).
 
 root_only(PATH) walks PATH as the kernel resolves it, one component at a time, never resolving
 it first: every folder on the way and the file itself must be root's, writable by no other group
@@ -6,6 +8,15 @@ or user (a world-writable folder passes only with its sticky bit, which keeps ot
 replacing root's entries in it; a file never does), and have no access ACL (whose mask hides
 named writers in the group bits). A symbolic link must be root's too (in a sticky folder its
 owner could replace it); its target is spliced into the walk where the link was.
+
+hb_problems(ROOT, HOST_FILES) judges the folders above hb's tree ROOT and ROOT itself as root_only
+does, then every entry below it, then each host file (hb.toml names the commands hb notify runs).
+Below ROOT a folder others can write to fails even with its sticky bit: a new file there would be
+run (hb check runs every tools/hb-*) or imported before hb's own, and that includes ROOT's own
+hb.toml. A link there fails: hb has none, and a tool imports the libraries beside its real path,
+which a link can move anywhere, out of ROOT or up a level in it. A host file must be a full path;
+one that doesn't exist must be one only root could make: the nearest folder on its way that
+exists must pass root_only and let nobody else add an entry, sticky bit or not.
 
 allowed_rule(RULE) takes the one form hb can check, USER HOST=(RUNAS) NOPASSWD: /full/path [args]
 [, /full/path [args]]..., and returns the programs it runs and the files their arguments name;
@@ -20,6 +31,7 @@ text ends in a backslash goes on in the next, and '#' starts a comment unless a 
 '#' after a quote or a backslash is kept, so nothing sudo might read is cut away.
 
   sudocheck.py root-only [--top DIR] PATH...   exit 0: only root can change them; 1: who else can
+  sudocheck.py tree [--top DIR] ROOT [FILE...] the same for hb's tree ROOT and its host files
   sudocheck.py allowed [--top DIR] RULE        exit 0: the rule's form and its programs pass; 2: not
   sudocheck.py lines [--includedir DIR] FILE   FILE's rules and settings as sudo reads them, N:TEXT
                                                (N: the line each starts on); exit 2 when FILE has
@@ -36,6 +48,7 @@ import stat
 import sys
 
 MAX_LINKS = 40
+ROOT_UIDS = frozenset({0})          # tests add their own
 # every field held to its own characters, so none can swallow another grant (a host of
 # "ALL=(root)NOPASSWD:/x:ALL" would): a user or %group, a host, a run-as list, then the commands
 RULE = re.compile(r"^(?P<user>%?[A-Za-z0-9_][A-Za-z0-9_.-]*)\s+(?P<host>[A-Za-z0-9_][A-Za-z0-9_.-]*)\s*=\s*"
@@ -66,11 +79,11 @@ def has_access_acl(path):
         return False
 
 
-def node_problems(path, st):
+def node_problems(path, st, sticky_ok=True):
     out = []
-    if st.st_uid != 0:
+    if st.st_uid not in ROOT_UIDS:
         out.append(f"{path} is {name_of(uid=st.st_uid)}'s")
-    if st.st_mode & 0o002 and not (stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_ISVTX):
+    if st.st_mode & 0o002 and not (sticky_ok and stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_ISVTX):
         out.append(f"{path} can be written by anyone")
     if st.st_mode & 0o020 and st.st_gid != 0:
         out.append(f"{path} can be written by group {name_of(gid=st.st_gid)}")
@@ -114,7 +127,7 @@ def root_only(path, top="/"):
                 return out + [f"{path}: too many symbolic links"]
             # a link is as safe as its folder, and as its owner: in a sticky folder the owner of an
             # entry may replace it
-            if inside(nxt) and st.st_uid != 0:
+            if inside(nxt) and st.st_uid not in ROOT_UIDS:
                 out.append(f"{nxt} (a link) is {name_of(uid=st.st_uid)}'s")
             target = os.readlink(nxt)
             if target.startswith("/"):
@@ -125,6 +138,49 @@ def root_only(path, top="/"):
             out += node_problems(nxt, st)
         cur = nxt
     return out
+
+
+def unmade_problems(path, top="/"):
+    """[] when only root could make PATH, which doesn't exist, else what lets someone else."""
+    if not path.startswith("/"):
+        return [f"{path} isn't a full path"]
+    folder = os.path.dirname(path)
+    while not os.path.lexists(folder) and folder != "/":
+        folder = os.path.dirname(folder)
+    out = root_only(folder, top)
+    if not out:
+        real = os.path.realpath(folder)
+        out = node_problems(real, os.lstat(real), sticky_ok=False)
+    return out
+
+
+def hb_problems(root, host_files=(), top="/"):
+    """[] when only root can change what root runs from hb's tree ROOT, and the host files it
+    would read, made or not, else what lets someone else."""
+    out = root_only(root, top)
+    if not out:
+        real = os.path.realpath(root)
+        out = node_problems(real, os.lstat(real), sticky_ok=False)
+
+        def failed(e):
+            out.append(f"{e.filename}: {(e.strerror or str(e)).lower()}")
+        for folder, dirs, files in os.walk(real, onerror=failed):
+            dirs.sort()
+            for name in dirs + sorted(files):
+                path = os.path.join(folder, name)
+                try:
+                    st = os.lstat(path)
+                except OSError as e:
+                    out.append(f"{path}: {(e.strerror or str(e)).lower()}")
+                    continue
+                if stat.S_ISLNK(st.st_mode):
+                    out.append(f"{path} is a link (hb's tree has none: a tool imports from beside "
+                               "where it really is)")
+                else:
+                    out += node_problems(path, st, sticky_ok=False)
+    for f in host_files:
+        out += root_only(f, top) if os.path.lexists(f) else unmade_problems(f, top)
+    return list(dict.fromkeys(out))   # once each: a host file may be in ROOT
 
 
 def allowed_rule(rule):
@@ -230,6 +286,11 @@ def main(argv):
         for p in problems:
             print(p)
         return 1 if problems else 0
+    if cmd == "tree" and args:
+        problems = hb_problems(args[0], args[1:], top)
+        for p in problems:
+            print(p)
+        return 1 if problems else 0
     if cmd == "allowed" and len(args) == 1:
         paths, why = allowed_rule(args[0])
         if why:
@@ -239,7 +300,7 @@ def main(argv):
         for p in problems:
             print(f"{p}, and an allowed rule runs it")
         return 2 if problems else 0
-    print(__doc__.strip().split("\n\n")[4], file=sys.stderr)
+    print(next(p for p in __doc__.split("\n\n") if p.startswith("  sudocheck.py")), file=sys.stderr)
     return 2
 
 

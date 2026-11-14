@@ -216,7 +216,7 @@ class FakeBoxTest(unittest.TestCase):
         temp_state(self)
         self.box = Box()
         d = tempfile.mkdtemp()
-        saved = {n: getattr(fb, n) for n in ("JAIL_FILE", "ACTION_FILE", "PAM_DIR", "unsafe_path")}
+        saved = {n: getattr(fb, n) for n in ("JAIL_FILE", "ACTION_FILE", "PAM_DIR", "unsafe_tree")}
         self.addCleanup(lambda: [setattr(fb, n, v) for n, v in saved.items()])
         fb.JAIL_FILE = os.path.join(d, "jail.d", "95-hb-sshd.local")
         fb.ACTION_FILE = os.path.join(d, "action.d", "hb-notify.conf")
@@ -224,7 +224,7 @@ class FakeBoxTest(unittest.TestCase):
         write(os.path.join(fb.PAM_DIR, "sshd"), PAM_SSHD)
         write(os.path.join(fb.PAM_DIR, "postlogin"), PAM_POSTLOGIN)
         write(os.path.join(fb.PAM_DIR, "password-auth"), PAM_PASSWORD_AUTH)
-        fb.unsafe_path = lambda: None
+        fb.unsafe_tree = lambda: None
         self.enterContext(mock.patch.object(fb.util, "run", self.box.run))
         self.enterContext(contextlib.redirect_stdout(io.StringIO()))
 
@@ -665,11 +665,11 @@ class ItemsTest(FakeBoxTest):
         self.assertEqual(self.box.did("fail2ban-client", "reload"), [])
 
     def test_hb_run_from_a_checkout_is_refused(self):
-        fb.unsafe_path = lambda: "/home/you/hardening-base/tools/hb-fail2ban"
+        fb.unsafe_tree = lambda: "/home/you is you's"
         self.box.installed, self.box.active, self.box.enabled = set(), False, False
         rc, line = fb.chk_jail(cfg())
         self.assertEqual(rc, 2)
-        self.assertIn("but /home/you/hardening-base/tools/hb-fail2ban isn't root's alone", line)
+        self.assertIn(f"fail2ban would run hb from {fb.util.HB_ROOT} as root, but /home/you is you's: use the copy", line)
         self.assertEqual(fb.do_plan(cfg(), apply=True, yes=True), 2)
         self.assertEqual(self.box.did("systemctl", "enable"), [])         # nothing after the refusal
 
@@ -688,56 +688,17 @@ class ItemsTest(FakeBoxTest):
 
 
 class TreeTest(unittest.TestCase):
-    """What fail2ban runs as root must be root's alone (Codex review: the dispatcher was checked,
-    not the tool and the libraries it runs). The test's own uid stands in for root's."""
+    """What fail2ban runs as root must be root's alone: hb's tree and hb.toml, as sudocheck judges
+    them (tests/test_sudocheck.py)."""
 
-    def setUp(self):
-        self.enterContext(mock.patch.object(fb, "ROOT_UIDS", {0, os.getuid()}))
-        self.root = tempfile.mkdtemp()                   # under /tmp: root's, sticky, safe above the tree
-        for rel, mode in (("hb", 0o755), ("tools/hb-fail2ban", 0o755), ("tools/hb-notify", 0o755),
-                          ("lib/hbkit/util.py", 0o644)):
-            write(os.path.join(self.root, rel), "x\n", mode)
-        self.cfg = os.path.join(tempfile.mkdtemp(), "hb.toml")
-        write(self.cfg, "", 0o600)
-
-    def unsafe(self):
-        return fb.unsafe_path(self.root, self.cfg)
-
-    def test_a_tree_of_roots_is_safe(self):
-        self.assertIsNone(self.unsafe())
-
-    def test_anything_others_can_change_is_named(self):
-        cases = (("lib/hbkit/util.py", 0o664), ("tools/hb-notify", 0o757), ("lib", 0o775), ("lib/hbkit", 0o1777))
-        for rel, mode in cases:
-            p = os.path.join(self.root, rel)
-            before = stat.S_IMODE(os.stat(p).st_mode)
-            os.chmod(p, mode)
-            self.assertEqual(self.unsafe(), p, rel)                          # a sticky folder inside too
-            os.chmod(p, before)
-        os.chmod(self.cfg, 0o666)
-        self.assertEqual(self.unsafe(), self.cfg)
-        os.chmod(self.cfg, 0o600)
-        os.chmod(self.root, 0o777)
-        self.assertEqual(self.unsafe(), self.root)
-        os.chmod(self.root, 0o755)
-        self.assertIsNone(self.unsafe())
-
-    def test_links_lead_somewhere_safe(self):
-        out = tempfile.mkdtemp()
-        os.chmod(out, 0o777)
-        write(os.path.join(out, "evil.py"), "x\n")
-        link = os.path.join(self.root, "lib", "hbkit", "config.py")
-        os.symlink(os.path.join(out, "evil.py"), link)
-        self.assertEqual(self.unsafe(), link)                                # its folder isn't safe
-        os.chmod(out, 0o755)
-        self.assertIsNone(self.unsafe())
-        os.unlink(link)
-        os.symlink(out, link)
-        self.assertEqual(self.unsafe(), link)                                # a folder elsewhere: not walked, refused
-
-    def test_someone_elses_file(self):
-        with mock.patch.object(fb, "ROOT_UIDS", {0}):
-            self.assertIsNotNone(self.unsafe())
+    def test_its_own_tree_and_host_file(self):
+        # Codex review: the hooks run without HB_CONFIG, so the file it names isn't the one to judge
+        with mock.patch.object(fb.sudocheck, "hb_problems", return_value=["a", "b"]) as hb, \
+             mock.patch.dict(os.environ, HB_CONFIG="/srv/safe.toml"):
+            self.assertEqual(fb.unsafe_tree(), "a")
+        hb.assert_called_once_with(fb.util.HB_ROOT, ["/etc/hb/hb.toml"])
+        with mock.patch.object(fb.sudocheck, "hb_problems", return_value=[]):
+            self.assertIsNone(fb.unsafe_tree())
 
 
 class LoginsTest(FakeBoxTest):
@@ -866,9 +827,11 @@ class VerdictTest(FakeBoxTest):
         rc, line = fb.verdict(cfg(enabled=False))
         self.assertEqual(rc, 1)
         self.assertIn(f"warn: fail2ban.enabled is false, but {fb.JAIL_FILE} and {fb.ACTION_FILE} still set", line)
-        fb.unsafe_path = lambda: "/home/you/hardening-base/hb"
-        self.assertEqual(fb.verdict(cfg(enabled=False))[0], 2)
-        fb.unsafe_path = lambda: None
+        fb.unsafe_tree = lambda: "/home/you is you's"
+        rc, line = fb.verdict(cfg(enabled=False))
+        self.assertEqual(rc, 2)
+        self.assertIn(f"runs hb from {fb.util.HB_ROOT} as root, and /home/you is you's: sudo hb fail2ban apply", line)
+        fb.unsafe_tree = lambda: None
         self.assertEqual(fb.do_remove(apply=False), 1)
         self.assertTrue(os.path.exists(fb.JAIL_FILE))
         self.box.test_rc = 1                              # the files without hb's don't pass -t: hb's come back
